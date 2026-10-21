@@ -1,0 +1,2519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Chapter 24 of Inside the Linux Kernel: io_uring — the shared submission and completion rings, the setup/enter/register system calls, the request lifecycle, submission-queue polling, the io-wq async worker pool, registered buffers and files, provided buffers, multi-shot and zero-copy operations, and io_uring security in Linux 7.0.12.">
+  <meta property="og:title" content="Chapter 24: io_uring — Inside the Linux Kernel">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <title>Chapter 24: io_uring — Inside the Linux Kernel</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+</head>
+<body>
+<progress class="chapter-progress" max="100" value="0" aria-hidden="true"></progress>
+<nav class="chapter-nav">
+  <a class="book-title" href="index.html" title="Table of Contents">Inside the Linux Kernel</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-23.html">&larr; Chapter 23</a>
+  <span class="nav-sep">|</span>
+  <a href="#top">Chapter 24</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-25.html">Chapter 25 &rarr;</a>
+</nav>
+<a href="#top" class="back-to-top" aria-label="Back to top">&uarr;</a>
+<div class="book-container" id="top" style="margin-top: 3.5rem;">
+<header class="chapter-header">
+  <div class="chapter-number">Chapter 24</div>
+  <h1 class="chapter-title" style="border:none; margin-top:0.5rem;">io_uring</h1>
+  <p class="chapter-subtitle">How Linux 7.0.12 does high-performance asynchronous I/O through shared memory rings — the submission and completion queues, the setup, enter, and register system calls, the request lifecycle, submission-queue polling and the async worker pool, registered buffers and files, and the multi-shot and zero-copy operations that make it the fastest I/O interface the kernel offers.</p>
+</header>
+
+<main class="chapter-body">
+<nav class="toc">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#whatis">What io_uring Is</a>
+  <ul class="toc-sub">
+    <li><a href="#problem">1.1 The Cost of Synchronous and Legacy Asynchronous I/O</a></li>
+    <li><a href="#ring-idea">1.2 The Shared-Ring Idea</a></li>
+  </ul>
+</li>
+<li><a href="#rings">The Submission and Completion Rings</a>
+  <ul class="toc-sub">
+    <li><a href="#setup">2.1 Setting Up and Mapping the Rings</a></li>
+    <li><a href="#sqe-cqe">2.2 The SQE and CQE</a></li>
+    <li><a href="#ordering">2.3 Heads, Tails, and Memory Ordering</a></li>
+  </ul>
+</li>
+<li><a href="#lifecycle">The Life of a Request</a>
+  <ul class="toc-sub">
+    <li><a href="#submit">3.1 Submission and Issue</a></li>
+    <li><a href="#complete">3.2 Completion and Task Work</a></li>
+    <li><a href="#enter">3.3 The enter System Call</a></li>
+  </ul>
+</li>
+<li><a href="#ops">Operations and Chaining</a>
+  <ul class="toc-sub">
+    <li><a href="#opcodes">4.1 The Range of Operations</a></li>
+    <li><a href="#linking">4.2 Linking, Draining, and Timeouts</a></li>
+    <li><a href="#misc">4.3 Ring Messaging, Futexes, and Cancellation</a></li>
+  </ul>
+</li>
+<li><a href="#nosyscall">Submitting Without System Calls</a>
+  <ul class="toc-sub">
+    <li><a href="#sqpoll">5.1 Submission-Queue Polling</a></li>
+    <li><a href="#iowq">5.2 The Async Worker Pool</a></li>
+  </ul>
+</li>
+<li><a href="#registered">Registered Resources</a>
+  <ul class="toc-sub">
+    <li><a href="#fixed">6.1 Registered Files and Buffers</a></li>
+    <li><a href="#provided">6.2 Provided Buffers and Buffer Selection</a></li>
+  </ul>
+</li>
+<li><a href="#advanced">Advanced Completion and Networking</a>
+  <ul class="toc-sub">
+    <li><a href="#multishot">7.1 Multi-Shot Operations</a></li>
+    <li><a href="#lowlatency">7.2 Polled and Deferred Completion</a></li>
+    <li><a href="#zerocopy">7.3 Networking, Zero-Copy, and Command Passthrough</a></li>
+  </ul>
+</li>
+<li><a href="#security">Security and Containment</a>
+  <ul class="toc-sub">
+    <li><a href="#attack-surface">8.1 Attack Surface and Controls</a></li>
+    <li><a href="#restrict">8.2 Restricting an Instance</a></li>
+  </ul>
+</li>
+<li><a href="#chapter-summary">Summary</a></li>
+</ol>
+</nav>
+
+<p class="chapter-intro">
+Every I/O interface in this book so far has, at bottom, made the same bargain: a
+process asks the kernel to do one thing—read this, write that—by making a system
+call, and waits, or arranges to be told later, that the one thing is done. That
+model has served Unix for fifty years, but on modern hardware it has become the
+bottleneck. A single NVMe drive can service millions of operations per second and
+a fast network card can deliver millions of packets, and at those rates the cost
+of <em>the system call itself</em>—crossing into the kernel, and crossing back,
+once per operation—comes to dominate the cost of the I/O. <span class="key-term">io_uring</span>,
+introduced in Linux 5.1, is the kernel's
+answer. It replaces the per-operation system call with a pair of
+<span class="key-term">shared-memory ring buffers</span>: user space writes I/O
+requests into one ring and reads results from another, and the kernel reads and
+writes the same rings from its side, so that many operations can be submitted and
+completed with few system calls—or, in its most aggressive mode, with none at all.
+</p>
+
+<p>
+The result is not merely a faster <code>read</code>; it is a different shape for
+the whole relationship between an application and the kernel's I/O machinery.
+io_uring is genuinely asynchronous, so a program can have thousands of operations
+in flight at once; it is general, covering not just file reads and writes but
+networking, timeouts, filesystem operations, and even arbitrary device commands
+through one uniform interface; and it is extensible, with new operation types and
+completion modes added in nearly every kernel release. This chapter builds it up
+from the rings outward: the shared queues and the data structures that flow
+through them, the life of a single request from submission to completion, the
+range of operations and the ways they are ordered, chained and cancelled, the two
+mechanisms—submission-queue polling and an async worker pool—that let it run
+without blocking the submitter, the registered and provided resources that shave
+the last overheads away, the advanced completion modes that power high-performance
+networking, and finally the security machinery that so powerful an interface
+requires—including the restrictions and filters with which a program can confine
+a ring to the few operations it actually needs.
+</p>
+
+<hr>
+<h2 id="whatis">What io_uring Is</h2>
+
+<p class="chapter-intro">
+Before the rings themselves comes the problem io_uring solves, stated precisely,
+because its design is a direct response to the shortcomings of everything
+that came before it. io_uring is among the newest subsystems this book describes—only sched_ext, from
+Chapter 7, is younger—and it is easily the fastest-growing. It was merged in Linux
+5.1 in early 2019, more than a decade after Linux
+2.6.11, and it has been extended in almost every release since, which is why a
+chapter on it is as much a snapshot of work in progress as a description of a
+finished design. The pace shows in the shape of the source tree. io_uring began as
+a single file, <code class="file-path">fs/io_uring.c</code>, and outgrew it so
+thoroughly that in Linux 6.0 it was promoted to a top-level directory of its own;
+in 7.0.12 that directory holds some forty C files and around twenty-six thousand
+lines, with roughly one file per family of operations. It was created by Jens Axboe, the maintainer of the block layer,
+together with Christoph Hellwig (see the copyright header of
+<code class="file-path">io_uring/io_uring.c</code>), originally to give the storage
+stack an asynchronous interface that actually worked, and it has since grown to
+cover networking, timers, and much else. Today it underlies the I/O paths of
+high-performance databases, network proxies, and storage engines, and it is
+increasingly the interface a program reaches for when the standard system calls
+cannot keep a fast device or network link busy. This section looks first at why
+both synchronous system calls and Linux's earlier asynchronous-I/O interface fall
+short on modern hardware, and then at the shared-ring idea that answers them.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 540" role="img" aria-labelledby="fig24-1-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig24-1-title">Figure 24-1. The Software Architecture of io_uring</title>
+<defs><marker id="e221" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="828" height="508" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-1. The Software Architecture of io_uring</text>
+
+<!-- user space band -->
+<rect x="40" y="64" width="780" height="86" rx="12" fill="#eff6ff" stroke="#93c5fd" stroke-dasharray="6 4"/>
+<text x="58" y="84" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#2563eb">user space</text>
+<rect x="120" y="94" width="280" height="46" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="260" y="114" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">application code</text><text x="260" y="130" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">builds requests, reaps results</text>
+<rect x="460" y="94" width="280" height="46" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="600" y="114" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">liburing (optional)</text><text x="600" y="130" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">wraps the rings and syscalls</text>
+
+<!-- syscall strip -->
+<rect x="40" y="166" width="780" height="34" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+<text x="430" y="188" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">system calls: io_uring_setup( ) &#183; io_uring_enter( ) &#183; io_uring_register( )</text>
+
+<!-- shared memory band -->
+<rect x="40" y="216" width="780" height="80" rx="12" fill="#fef9c3" stroke="#ca8a04"/>
+<text x="58" y="236" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#a16207">shared memory (mmap): visible to both sides</text>
+<rect x="80" y="244" width="200" height="42" rx="7" fill="#feffe0" stroke="#ca8a04"/><text x="180" y="262" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">SQ ring</text><text x="180" y="277" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">indices into the SQE array</text>
+<rect x="330" y="244" width="200" height="42" rx="7" fill="#fffef0" stroke="#ca8a04"/><text x="430" y="262" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">SQE array</text><text x="430" y="277" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">operation descriptors</text>
+<rect x="580" y="244" width="200" height="42" rx="7" fill="#fffef0" stroke="#ca8a04"/><text x="680" y="262" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">CQ ring</text><text x="680" y="277" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">completion results (CQEs)</text>
+
+<!-- kernel core -->
+<rect x="40" y="312" width="780" height="86" rx="12" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="58" y="332" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#6d28d9">io_uring core (kernel)</text>
+<rect x="80" y="342" width="220" height="46" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="190" y="362" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">request objects</text><text x="190" y="377" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">struct io_kiocb per SQE</text>
+<rect x="320" y="342" width="220" height="46" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="430" y="362" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">opcode dispatch</text><text x="430" y="377" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">io_issue_defs[ ] table</text>
+<rect x="560" y="342" width="220" height="46" rx="7" fill="#f5f3ff" stroke="#7c3aed"/><text x="670" y="362" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">task work &amp; completion</text><text x="670" y="377" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">fills CQEs, advances tail</text>
+
+<!-- execution backends -->
+<rect x="40" y="414" width="780" height="48" rx="10" fill="#fee2e2" stroke="#dc2626"/>
+<text x="58" y="432" font-family="Inter,sans-serif" font-size="10" font-weight="700" fill="#b91c1c">execution</text>
+<rect x="150" y="424" width="180" height="30" rx="6" fill="#fff5f5" stroke="#dc2626"/><text x="240" y="443" text-anchor="middle" font-family="Inter,sans-serif" font-size="9.5" font-weight="700">inline issue</text>
+<rect x="360" y="424" width="180" height="30" rx="6" fill="#fff5f5" stroke="#dc2626"/><text x="450" y="443" text-anchor="middle" font-family="Inter,sans-serif" font-size="9.5" font-weight="700">SQPOLL thread</text>
+<rect x="570" y="424" width="180" height="30" rx="6" fill="#fff5f5" stroke="#dc2626"/><text x="660" y="443" text-anchor="middle" font-family="Inter,sans-serif" font-size="9.5" font-weight="700">io-wq worker pool</text>
+
+<!-- kernel subsystems -->
+<rect x="40" y="476" width="780" height="38" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+<text x="430" y="500" text-anchor="middle" font-family="Inter,sans-serif" font-size="10.5" font-weight="700">kernel subsystems: VFS &amp; block layer &#183; network stack &#183; timers, poll, futex</text>
+
+<g stroke="#334155" stroke-width="1.3">
+<line x1="430" y1="150" x2="430" y2="166" marker-end="url(#e221)"/>
+<line x1="430" y1="200" x2="430" y2="216" marker-end="url(#e221)"/>
+<line x1="430" y1="296" x2="430" y2="312" marker-end="url(#e221)"/>
+<line x1="430" y1="398" x2="430" y2="414" marker-end="url(#e221)"/>
+<line x1="430" y1="462" x2="430" y2="476" marker-end="url(#e221)"/>
+</g>
+<text x="430" y="530" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">the rings straddle the boundary as shared memory; the kernel core turns each SQE into a request, dispatches it, and posts a CQE</text>
+</svg>
+<figcaption>Figure 24-1. The software architecture of io_uring — an application, optionally through the liburing helper library, communicates with the kernel through three system calls and through the submission and completion rings, which live in shared memory that straddles the user/kernel boundary. Inside the kernel, a small core turns each submission queue entry into a request object (struct io_kiocb), dispatches it through the per-opcode table, and posts a completion. Requests are carried out by inline execution, the SQPOLL thread, or the io-wq worker pool, all of which ultimately drive the same VFS, block, and networking subsystems described elsewhere in this book.</figcaption>
+</figure>
+
+<p>
+Figure 24-1 gathers into a single picture the pieces this chapter examines. An
+application, optionally through the liburing helper library, reaches the kernel
+through three system calls; the submission and completion rings straddle the
+user/kernel boundary as shared memory; and inside the kernel a small core turns
+each SQE into a request object, dispatches it through a per-operation table, and
+posts the result—drawing on inline execution, the polling thread, or the worker
+pool underneath, and ultimately on the same VFS, block, and networking subsystems
+the rest of this book has described. Chapter 10 (Section 9) has already looked at
+io_uring from the system-call boundary—its three calls and what seccomp, tracing,
+and audit can no longer see—so this chapter takes the calls as given and
+concentrates on the machinery behind them. The rest of the chapter works down this
+stack: the two subsections below first motivate the design, and the sections that
+follow detail the rings and everything built on them.
+</p>
+
+<h3 id="problem">The Cost of Synchronous and Legacy Asynchronous I/O</h3>
+
+<p>
+The traditional I/O calls—<code>read</code>, <code>write</code>, and their
+relatives from Chapter 16—are <span class="key-term">synchronous</span>: the
+calling thread issues one, and the kernel does not return until the operation is
+done (or, for a non-blocking descriptor, until it determines the operation would
+block). Each call is a full user-to-kernel round trip, and each moves the data for
+exactly one operation. When a program must perform many small I/Os, the round
+trips dominate: the CPU spends more time entering and leaving the kernel than
+doing useful work, and modern mitigations for CPU speculation vulnerabilities have
+only made each crossing more expensive. Worse, true overlap is hard to achieve—to
+keep many operations in flight a program must resort to many threads, each blocked
+in its own synchronous call, paying the cost of all those threads.
+</p>
+
+<p>
+Linux did have an asynchronous interface before io_uring—the kernel's native AIO,
+implemented in <code class="file-path">fs/aio.c</code>, set up with
+<code>io_setup</code> and driven by <code>io_submit</code>, and normally reached
+through the libaio wrapper library—but it was widely regarded as a disappointment.
+(It should not be confused with POSIX AIO, the <code>aio_read</code> and
+<code>aio_write</code> family, which glibc emulates entirely in user space with a
+pool of threads and which the kernel knows nothing about.) It worked well only for
+<span class="key-term">direct</span> I/O that bypassed the page cache; for
+ordinary buffered file I/O it silently fell back to blocking, defeating its
+purpose. It still required a system call per submission and per completion
+reaping. And it covered only a narrow slice of operations—reads and writes, but
+not the <code>open</code>, <code>accept</code>, <code>recv</code>, and dozens of
+other operations a real application interleaves with them. The lesson the kernel
+developers drew, and built io_uring around, was that a general asynchronous
+interface must be truly async for <em>all</em> I/O, must cover the full range of
+operations, and must not require a system call for every request. Meeting all
+three at once is what the shared rings make possible.
+</p>
+
+<p>
+The first of those requirements is the subtle one, because the rings do not supply
+it. Shared memory removes system calls; it does nothing to stop a read from
+sleeping once the kernel has picked it up, and a thread asleep on the page cache is
+exactly what the older interface was faulted for. The answer lies elsewhere in the
+design, in a division of labour that &sect;3.1 sets out in full: io_uring never
+asks whether an operation <em>will</em> block, it attempts the operation in a mode
+that forbids blocking and treats the refusal as information. A cached read
+succeeds outright; one that must wait for the disk is rejected with
+<code>-EAGAIN</code> before any sleeping happens, leaving the request to be parked
+on a poll wait or moved to a thread that is allowed to sleep. The consequence
+matters more than the mechanism, and it is the one thing native AIO could never
+manage: buffered file I/O becomes genuinely asynchronous to the application
+without anyone having to pretend that reading from a disk is a non-blocking
+operation.
+</p>
+
+<p>
+io_uring is easily confused with the <span class="key-term">readiness</span>
+model that programs have long used to juggle many connections. The
+<code>select</code>, <code>poll</code>, and <code>epoll</code> family of Chapter 16
+tells an application <em>when</em> a descriptor is ready—when a socket has data to
+read or space to write—but it does not do the I/O; the application must still issue
+a <code>read</code> or <code>write</code> system call afterward, and each of those
+is a separate kernel crossing. Readiness notification also does not extend cleanly
+to storage, where a regular file is essentially always &ldquo;ready&rdquo; yet a
+read may still block while the disk is consulted. io_uring instead follows a
+<span class="key-term">completion</span> model: the application asks for the
+operation itself to be performed and is told when it has <em>finished</em>, with
+the result in hand, so there is no second syscall and no distinction between the
+socket and the disk. In effect io_uring folds the &ldquo;wait until ready&rdquo;
+and &ldquo;now do it&rdquo; steps that <code>epoll</code> keeps separate into a
+single asynchronous request, which is why it can express not just reads and writes
+but a whole graph of interdependent operations, as later sections show.
+</p>
+
+<h3 id="ring-idea">The Shared-Ring Idea</h3>
+
+<p>
+The central idea of io_uring is to move the submission and reaping of I/O out of
+system calls and into memory that user space and the kernel
+<span class="key-term">share</span>. When an application sets up an io_uring
+instance, the kernel allocates two circular buffers—a
+<span class="key-term">submission queue</span> (SQ) and a
+<span class="key-term">completion queue</span> (CQ)—and maps them into the
+application's address space, so that both sides can read and write them directly
+without a system call in between. To submit work, the application writes a
+<span class="key-term">submission queue entry</span> (SQE) describing an operation
+into the SQ and advances the queue's tail; to collect results, it reads
+<span class="key-term">completion queue entries</span> (CQEs) from the CQ. The
+kernel does the mirror image: it consumes SQEs from the SQ and produces CQEs into
+the CQ. Figure 24-2 shows the arrangement.
+</p>
+
+<figure>
+<svg viewBox="0 0 820 360" role="img" aria-labelledby="fig24-2-title" style="max-width:720px; width:100%; height:auto;">
+<title id="fig24-2-title">Figure 24-2. The Two Shared Rings of io_uring</title>
+<defs><marker id="e222" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="780" height="320" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="410" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-2. The Two Shared Rings of io_uring</text>
+
+<rect x="60" y="76" width="700" height="54" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-dasharray="5 3"/>
+<text x="410" y="96" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#2563eb">application (user space)</text>
+<text x="410" y="118" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">writes SQEs, advances SQ tail &#183; reads CQEs, advances CQ head</text>
+
+<rect x="120" y="176" width="260" height="60" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+<text x="250" y="200" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">submission queue (SQ)</text>
+<text x="250" y="220" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">user produces &#8594; kernel consumes</text>
+<rect x="440" y="176" width="260" height="60" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+<text x="570" y="200" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">completion queue (CQ)</text>
+<text x="570" y="220" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">kernel produces &#8594; user consumes</text>
+
+<rect x="60" y="286" width="700" height="42" rx="10" fill="#fef2f2" stroke="#fca5a5" stroke-dasharray="5 3"/>
+<text x="410" y="306" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#dc2626">kernel</text>
+<text x="410" y="322" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">consumes SQEs, performs the I/O, posts CQEs</text>
+
+<g stroke="#334155" stroke-width="1.4">
+<line x1="250" y1="130" x2="250" y2="176" marker-end="url(#e222)"/>
+<line x1="250" y1="236" x2="250" y2="286" marker-end="url(#e222)"/>
+<line x1="570" y1="286" x2="570" y2="236" marker-end="url(#e222)"/>
+<line x1="570" y1="176" x2="570" y2="130" marker-end="url(#e222)"/>
+</g>
+<text x="196" y="160" font-family="Inter,sans-serif" font-size="8" fill="#64748b">submit</text>
+<text x="580" y="160" font-family="Inter,sans-serif" font-size="8" fill="#64748b">reap</text>
+<text x="430" y="360" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic" opacity="0"> </text>
+</svg>
+<figcaption>Figure 24-2. The two shared rings of io_uring — the application writes submission queue entries (SQEs) into the submission queue and reads completion queue entries (CQEs) from the completion queue; the kernel consumes SQEs, performs the I/O, and posts CQEs. Because both queues live in memory shared between the application and the kernel, many operations can be submitted and completed with few system calls, or in the polling modes of &sect;5 with none.</figcaption>
+</figure>
+
+<p>
+Two properties of this arrangement give io_uring its power. First, because the
+rings are shared, a single system call can submit a whole <em>batch</em> of
+queued SQEs and reap a whole batch of CQEs, amortizing the cost of the kernel
+crossing over many operations instead of paying it per operation. Second, because
+submission is decoupled from completion, the interface is inherently
+<span class="key-term">asynchronous</span>: the application deposits a request and
+moves on, and the corresponding completion may appear in the CQ much later,
+identified by a <code>user_data</code> value the application chose when it
+submitted. From these two properties everything else in the chapter follows—the
+polling modes that remove even the batching system call, the linked operations
+that express dependencies, and the registered resources that strip away the
+remaining per-operation setup.
+</p>
+
+<p>
+Three system calls set this machinery in motion, and they are the only ones
+io_uring adds. <code>io_uring_setup</code> creates an instance and returns a file
+descriptor; the application then maps the ring memory through that descriptor.
+<code>io_uring_enter</code> is the workhorse that submits queued SQEs and waits for
+completions—and the call that the polling modes of &sect;5 can eliminate. And
+<code>io_uring_register</code> pins the long-lived resources of &sect;6. Because
+the queues live in memory that both sides mutate concurrently, every access to a
+shared field is made with <code>READ_ONCE</code> and <code>WRITE_ONCE</code> and
+paired acquire/release barriers, as the long comment at the head of
+<code class="file-path">io_uring/io_uring.c</code> spells out; getting this
+coordination exactly right is delicate, which is why almost no program drives the
+rings by hand. Instead most use <span class="key-term">liburing</span>, the
+companion user-space library maintained alongside the kernel by the same authors,
+which wraps the raw ring memory and the three system calls in a small,
+correct API. This chapter describes the kernel interface that liburing sits on top
+of; a real application usually sees io_uring through that library.
+</p>
+
+<p>
+That the count has stayed at three is itself a design decision. On x86-64 the
+calls occupy system call numbers 425, 426, and 427, and no fourth has been added in
+the seven years since—over a period in which the capability of the interface has
+grown several times over. io_uring expands by extending tables rather than by
+adding entry points: the opcode field of a submission queue entry selects from the
+operation table of &sect;4.1, and the first argument of
+<code>io_uring_register</code> selects from a separate table of registration
+commands that now runs to nearly forty, the newest of which appears in &sect;8.2.
+A new operation therefore costs a table row rather than a fresh system call and a
+fresh ABI commitment, which is how the subsystem absorbed networking, timers,
+futexes, and command passthrough without disturbing its three doors. The price is
+paid on the other side: a program cannot assume the kernel it happens to be running
+on understands the operations it was compiled against, which is why the interface
+also has to be able to describe itself, as &sect;4.1 shows.
+</p>
+
+<hr>
+<h2 id="rings">The Submission and Completion Rings</h2>
+
+<p class="chapter-intro">
+With the idea in hand, we can look at how the rings are actually built and used:
+how an application creates an io_uring instance and maps its rings into memory,
+what the entries that flow through them contain, and the careful protocol of
+indices and memory barriers by which two concurrent parties—an application and the
+kernel—share a queue without locks. This section covers those three concerns in
+turn.
+</p>
+
+<p>
+One thing should be said at the outset: the rings, the entry structures, and the
+offsets that locate them are io_uring's <span class="key-term">application binary
+interface</span>: they are defined in
+<code class="file-path">include/uapi/linux/io_uring.h</code>, the kernel's public
+UAPI header, and are guaranteed stable across kernel versions so that a program
+compiled today keeps working on the kernels of years hence. Everything in this
+section is therefore not an implementation detail but a contract. The sizes are
+always powers of two so that the head and tail can be wrapped with a single mask
+rather than a division, and the shared structures are laid out with cache-line
+alignment in mind, because the application and the kernel touch them from different
+CPUs and false sharing between the two would cost exactly the overhead the design
+exists to avoid.
+</p>
+
+<h3 id="setup">Setting Up and Mapping the Rings</h3>
+
+<p>
+An application creates an io_uring instance with the first of the interface's
+three system calls, <code>io_uring_setup</code>
+(<code class="file-path">io_uring/io_uring.c</code>). It passes the number of
+submission entries it wants and a <code>struct io_uring_params</code>
+(<code class="file-path">include/uapi/linux/io_uring.h</code>) carrying setup flags
+and receiving, in return, the exact sizes the kernel chose and—crucially—a set of
+<span class="key-term">offsets</span>. The call returns a file descriptor
+representing the instance, unless the application asked with
+<code>IORING_SETUP_REGISTERED_FD_ONLY</code> for an index into the ring's own
+registered-descriptor table instead, which keeps the instance out of the file
+descriptor table altogether. The application then calls <code>mmap</code> on the
+ring memory through that descriptor and uses the returned <code>struct io_sqring_offsets</code>
+and <code>struct io_cqring_offsets</code> to locate, within the mapped region, each
+field it needs: the head and tail indices, the ring mask and entry count, and the
+arrays of entries themselves. After this one setup call and a couple of memory
+mappings, the application holds direct pointers into the shared rings and needs no
+further system call merely to <em>reach</em> them.
+</p>
+
+<p>
+The <code>struct io_uring_params</code> passed to the call repays unpacking,
+because it is both an input and an output. On input the application fills in the
+<code>flags</code> that select the instance's mode—the polling and low-latency
+setup flags of the later sections—and, for a polling instance, the
+<code>sq_thread_cpu</code> and <code>sq_thread_idle</code> fields that place and
+tune the poll thread. On return the kernel fills in <code>sq_entries</code> and
+<code>cq_entries</code> with the sizes it actually chose (both rounded up to a
+power of two, with the completion ring defaulting to twice the submission ring so
+that completions rarely have nowhere to go), the two offset structures, and a
+<code>features</code> bitmask reporting which optional behaviors this kernel
+supports. That last field is how a program negotiates with the running kernel:
+before relying on a capability it checks the corresponding
+<code>IORING_FEAT_</code> bit—<code>IORING_FEAT_NODROP</code> for guaranteed
+completion delivery, <code>IORING_FEAT_SINGLE_MMAP</code> for the combined mapping
+described next, <code>IORING_FEAT_SUBMIT_STABLE</code> for the promise that SQE
+data may be reused as soon as submission returns, and fifteen others, eighteen bits
+in all as of 7.0.12—so that one binary can adapt to the feature set of whatever
+kernel it finds itself on. The list only ever grows, and each bit marks a point at
+which the interface acquired a guarantee it had not previously made. The
+full structure is shown below, and Table 24-1 describes each field and the
+direction in which it is passed.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/uapi/linux/io_uring.h */
+struct io_uring_params {
+	__u32 sq_entries;	/* in/out: submission ring size */
+	__u32 cq_entries;	/* in/out: completion ring size */
+	__u32 flags;		/* in:  IORING_SETUP_* flags */
+	__u32 sq_thread_cpu;	/* in:  CPU for the SQPOLL thread */
+	__u32 sq_thread_idle;	/* in:  SQPOLL idle timeout (ms) */
+	__u32 features;		/* out: IORING_FEAT_* supported */
+	__u32 wq_fd;		/* in:  fd of ring to share workers with */
+	__u32 resv[3];
+	struct io_sqring_offsets sq_off;	/* out: SQ field offsets */
+	struct io_cqring_offsets cq_off;	/* out: CQ field offsets */
+};</code></pre></div>
+
+<table>
+<caption>Table 24-1. Fields of struct io_uring_params</caption>
+<thead>
+<tr><th>Field</th><th>Direction</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sq_entries</code></td><td>in / out</td><td>Requested number of submission slots on input; the actual power-of-two count the kernel allocated on return.</td></tr>
+<tr><td><code>cq_entries</code></td><td>out (in with <code>IORING_SETUP_CQSIZE</code>)</td><td>Size of the completion ring; defaults to twice <code>sq_entries</code> unless the application sizes it explicitly.</td></tr>
+<tr><td><code>flags</code></td><td>in</td><td><code>IORING_SETUP_*</code> flags selecting the instance's mode (SQPOLL, IOPOLL, DEFER_TASKRUN, SQE128, and the rest).</td></tr>
+<tr><td><code>sq_thread_cpu</code></td><td>in</td><td>CPU to pin the SQPOLL thread to; valid only with <code>IORING_SETUP_SQ_AFF</code>.</td></tr>
+<tr><td><code>sq_thread_idle</code></td><td>in</td><td>Milliseconds the SQPOLL thread stays awake with no work before sleeping and setting <code>IORING_SQ_NEED_WAKEUP</code>.</td></tr>
+<tr><td><code>features</code></td><td>out</td><td>Bitmask of <code>IORING_FEAT_*</code> capabilities this kernel supports, used for feature negotiation.</td></tr>
+<tr><td><code>wq_fd</code></td><td>in</td><td>File descriptor of an existing ring whose io-wq worker pool this instance should share, with <code>IORING_SETUP_ATTACH_WQ</code>.</td></tr>
+<tr><td><code>resv[3]</code></td><td>—</td><td>Reserved; must be zero.</td></tr>
+<tr><td><code>sq_off</code></td><td>out</td><td><code>struct io_sqring_offsets</code>: byte offsets of the SQ head, tail, ring mask, entry count, flags, dropped counter, and index array within the mapped ring.</td></tr>
+<tr><td><code>cq_off</code></td><td>out</td><td><code>struct io_cqring_offsets</code>: byte offsets of the CQ head, tail, ring mask, entry count, overflow counter, CQE array, and flags.</td></tr>
+</tbody>
+</table>
+
+<p>
+The mapping itself reflects the ring layout, which is really
+<span class="key-term">three regions</span>, each selected on the instance's file
+descriptor by a fixed magic offset:
+</p>
+
+<ul>
+<li><span class="key-term">The submission ring</span> (<code>IORING_OFF_SQ_RING</code>) — the SQ header (head, tail, mask, flags) together with the array of <code>u32</code> indices, but not the entries themselves.</li>
+<li><span class="key-term">The SQE array</span> (<code>IORING_OFF_SQES</code>) — a flat, contiguous array of the actual <code>struct io_uring_sqe</code> entries the indices point into.</li>
+<li><span class="key-term">The completion ring</span> (<code>IORING_OFF_CQ_RING</code>) — the CQ header together with the array of <code>struct io_uring_cqe</code> entries, held directly.</li>
+</ul>
+
+<p>
+A fourth magic offset, <code>IORING_OFF_PBUF_RING</code>, maps the provided-buffer
+rings of &sect;6.2, with the buffer group encoded above
+<code>IORING_OFF_PBUF_SHIFT</code> so that one offset space serves any number of
+groups. The three regions above are the ones every instance has; the buffer rings
+are mapped only by applications that use them.
+</p>
+
+<p>
+Historically an application performed two or three <code>mmap</code> calls to map
+these regions. On modern kernels the submission and completion rings occupy one
+contiguous region—the kernel signals this by setting
+<code>IORING_FEAT_SINGLE_MMAP</code>—so a program maps the rings with a single call
+and the SQE array with a second. The direction of the mapping can even be
+reversed. With <code>IORING_SETUP_NO_MMAP</code> the application allocates the ring
+memory itself and passes its address to <code>io_uring_setup</code>, which pins
+those pages rather than providing its own; a program that wants its rings backed by
+huge pages, or placed on a particular NUMA node, can arrange it that way and simply
+hand the result to the kernel. Nor are the sizes settled forever: an instance using
+the deferred completion mode of &sect;7.2 can grow or shrink both rings at runtime
+with the <code>IORING_REGISTER_RESIZE_RINGS</code> operation, which takes a fresh
+<code>struct io_uring_params</code> and migrates any entries still outstanding. The kernel side of what these calls expose is one
+allocation described by <code>struct io_rings</code>
+(<code class="file-path">include/linux/io_uring_types.h</code>), which holds both
+rings' heads and tails, the constant ring masks and entry counts, the dropped- and
+overflow-event counters of &sect;2.3, and the completion-entry array itself.
+Finally, because the instance is represented by an ordinary file descriptor backed
+by an anonymous inode, it is a first-class kernel object: it can be passed to
+<code>epoll</code> or <code>poll</code> to wait for completions in a classic event
+loop, inherited across <code>fork</code>, and torn down simply by closing it, which
+releases the rings and cancels any operations still in flight. An io_uring instance
+is thus both an exotic shared-memory construct and an ordinary file—which is why
+the whole of &sect;8.1 can be framed around who is allowed to open one.
+</p>
+
+<p>
+One indirection on the submission side is easy to stumble over, and it is the
+reason the SQ ring is not simply a queue of entries. The submission ring does not contain SQEs directly; it contains an
+<span class="key-term">array of <code>u32</code> indices</span> into the separate
+SQE array. This turns the SQE array into an application-managed
+<span class="key-term">memory pool</span>: a program can prepare several SQEs
+concurrently and out of order, hold each one next to its own per-request
+bookkeeping in whatever data structure suits it, and then—only when an entry is
+ready—push that entry's integer index onto the submission ring. It can even point
+two ring slots at the same SQE to submit it twice. In practice many applications
+forgo the flexibility and fill the SQE array and the index array in
+lockstep, which makes the indirection pure overhead; for them a ring created with
+<code>IORING_SETUP_NO_SQARRAY</code> omits the index array entirely, and the kernel
+reads the SQE at the head position directly. The indirection remains the default,
+and remains available to those who want it. The completion
+ring, by contrast, needs no such flexibility and holds CQEs directly, because the
+kernel is the sole producer and simply appends each result to the next slot. Two
+setup flags can widen the entries: <code>IORING_SETUP_SQE128</code> doubles the
+SQE to 128 bytes for operations that need more parameters (such as the command
+passthrough of &sect;7.3), and <code>IORING_SETUP_CQE32</code> doubles the CQE for
+operations that return extra data.
+</p>
+
+<p>
+Those two flags size an entire ring, which is a blunt instrument: an application
+that needs a 128-byte SQE for one operation in a thousand pays double the
+submission memory and double the write traffic for all of them. Recent kernels
+therefore let the two sizes coexist. With
+<code>IORING_SETUP_SQE_MIXED</code> a ring accepts both 64- and 128-byte
+submissions, the wide ones identified by the opcode itself, so a program can spend
+the extra cache line only where an operation genuinely needs it; with
+<code>IORING_SETUP_CQE_MIXED</code> the completion ring likewise carries
+both 16- and 32-byte entries, each wide one marking itself with
+<code>IORING_CQE_F_32</code> in its flags so the application knows how far to
+advance. Both arrived during the 7.0 development cycle and are the newest
+additions to the layout described here—a reminder that even the parts of io_uring
+presented as fixed ABI are still gaining room to move.
+</p>
+
+<h3 id="sqe-cqe">The SQE and CQE</h3>
+
+<p>
+The two entry types are the vocabulary of the interface. A
+submission queue entry,
+<code>struct io_uring_sqe</code>
+(<code class="file-path">include/uapi/linux/io_uring.h</code>), describes one
+operation. Its layout is a fixed frame with large unions, because a single
+structure must serve every operation type: the same fields mean different things
+for a read than for a socket accept. The opening fields are common—an
+<code>opcode</code> selecting the operation, per-request <code>flags</code>, an
+I/O priority, and the file descriptor <code>fd</code> to act on—followed by unions
+holding an offset, an address (of a buffer or an array of buffers), a length, and
+an operation-specific flags word. Two fields are the application's own: the
+64-bit <code>user_data</code>, copied verbatim into the matching CQE so the
+application can identify which request completed, and a buffer index or group used
+by the registered- and provided-buffer machinery of &sect;6.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/uapi/linux/io_uring.h (abridged) */
+struct io_uring_sqe {
+	__u8	opcode;		/* type of operation (IORING_OP_*) */
+	__u8	flags;		/* IOSQE_* per-request flags */
+	__u16	ioprio;		/* I/O priority */
+	__s32	fd;		/* file descriptor to operate on */
+	union { __u64 off; __u64 addr2; /* ... */ };   /* offset / 2nd address */
+	union { __u64 addr; __u64 splice_off_in; /* ... */ }; /* buffer / iovecs */
+	__u32	len;		/* buffer size or iovec count */
+	union { __u32 rw_flags; __u32 msg_flags; __u32 timeout_flags; /* ... */ };
+	__u64	user_data;	/* copied back into the CQE */
+	union { __u16 buf_index; __u16 buf_group; /* ... */ };
+	/* ... personality, splice_fd_in, further op-specific fields ... */
+};</code></pre></div>
+
+<p>
+The union-heavy shape is deliberate, and its reasons explain a good deal of how
+the interface behaves. An SQE is a fixed
+64-byte frame—one cache line, a size the kernel asserts at build time with a
+<code>BUILD_BUG_ON</code>—so that producing one is a single aligned write and
+the kernel can fetch it in one memory access; the 128-byte
+<code>IORING_SETUP_SQE128</code> variant of &sect;2.1 simply spans two lines for
+the few operations that need more room. Within that frame the unions let the same
+bytes carry a file offset for a read, a second address for a vectored operation, or
+a command word for passthrough, and let one flags slot mean
+<code>rw_flags</code> for I/O, <code>msg_flags</code> for a socket send, or
+<code>timeout_flags</code> for a timer, so that a single structure covers the whole
+opcode table of &sect;4 without growing. Two of the tail fields deserve names: the
+<code>personality</code> field selects a registered set of credentials under which
+the operation should run—so that a privileged server can perform an operation with
+the identity of a less-privileged client, subject to the LSM check of &sect;8.1—and
+<code>splice_fd_in</code> supplies the second descriptor for the splice and tee
+operations. The <code>flags</code> byte carries the per-request
+<code>IOSQE_</code> modifiers—fixed-file, drain, and the link bits—covered with
+chaining in &sect;4.2. Table 24-2 lists the entry's fields, giving for each union
+the member that names it and the alternatives it stands in for.
+</p>
+
+<table>
+<caption>Table 24-2. Fields of struct io_uring_sqe</caption>
+<thead>
+<tr><th>Field (representative union member)</th><th>Type</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>opcode</code></td><td><code>__u8</code></td><td>The operation to perform, one of the <code>IORING_OP_*</code> values (&sect;4.1).</td></tr>
+<tr><td><code>flags</code></td><td><code>__u8</code></td><td>Per-request <code>IOSQE_*</code> modifiers: fixed-file, drain, and the link bits (&sect;4.2).</td></tr>
+<tr><td><code>ioprio</code></td><td><code>__u16</code></td><td>I/O priority for the request; a few operations reuse it for op-specific flags.</td></tr>
+<tr><td><code>fd</code></td><td><code>__s32</code></td><td>File descriptor to act on, or an index into the registered-file table when <code>IOSQE_FIXED_FILE</code> is set (&sect;6.1).</td></tr>
+<tr><td><code>off</code> (<code>addr2</code>, <code>cmd_op</code>)</td><td><code>__u64</code></td><td>File offset for a read or write; overloaded as a second address, or as the command opcode for <code>uring_cmd</code> passthrough.</td></tr>
+<tr><td><code>addr</code> (<code>splice_off_in</code>, <code>level</code>/<code>optname</code>)</td><td><code>__u64</code></td><td>Pointer to the data buffer or iovec array; per operation, a splice input offset or a socket-option level and name instead.</td></tr>
+<tr><td><code>len</code></td><td><code>__u32</code></td><td>Buffer size in bytes, or the number of iovecs for a vectored operation.</td></tr>
+<tr><td><code>rw_flags</code> (<code>msg_flags</code>, <code>timeout_flags</code>, &hellip;)</td><td><code>__u32</code></td><td>Operation-specific flags word; the active member follows the opcode (<code>rw_flags</code> for I/O, <code>msg_flags</code> for send/recv, <code>timeout_flags</code> for timers, and so on).</td></tr>
+<tr><td><code>user_data</code></td><td><code>__u64</code></td><td>Opaque value copied verbatim into the completion so the application can match a result to its request.</td></tr>
+<tr><td><code>buf_index</code> (<code>buf_group</code>)</td><td><code>__u16</code></td><td>Registered-buffer index for <code>READ_FIXED</code>/<code>WRITE_FIXED</code>, or the buffer-group id under <code>IOSQE_BUFFER_SELECT</code> (&sect;6).</td></tr>
+<tr><td><code>personality</code></td><td><code>__u16</code></td><td>Registered credentials id under which to run the operation, subject to the LSM check of &sect;8.1.</td></tr>
+<tr><td><code>splice_fd_in</code> (<code>file_index</code>, <code>optlen</code>, &hellip;)</td><td><code>__s32</code></td><td>Second descriptor for splice and tee; overloaded as the target slot for a direct-descriptor install, an option length, or an address length.</td></tr>
+<tr><td><code>addr3</code> (<code>optval</code>, <code>cmd[]</code>)</td><td><code>__u64</code></td><td>A third address or extra op-specific data; with <code>IORING_SETUP_SQE128</code> this region becomes 80 bytes of arbitrary command data for passthrough (&sect;7.3).</td></tr>
+</tbody>
+</table>
+
+<p>
+A <span class="key-term">completion queue entry</span>,
+<code>struct io_uring_cqe</code>, is far simpler. It carries back the
+<code>user_data</code> the application supplied, a result <code>res</code>—which
+holds exactly what the equivalent synchronous system call would have returned, a
+non-negative value on success or a negative error code on failure—and a
+<code>flags</code> field conveying out-of-band information such as which provided
+buffer was used (<code>IORING_CQE_F_BUFFER</code>) or whether more completions for
+this request are still coming (<code>IORING_CQE_F_MORE</code>, the multi-shot flag
+of &sect;7.1). Because the result mirrors the synchronous return value, porting code to
+io_uring is largely a matter of moving the same arguments into an SQE and reading
+the same result out of a CQE.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/uapi/linux/io_uring.h */
+struct io_uring_cqe {
+	__u64	user_data;	/* the sqe-&gt;user_data value passed back */
+	__s32	res;		/* result: like a system-call return value */
+	__u32	flags;		/* IORING_CQE_F_* */
+	__u64	big_cqe[];	/* extra 16 bytes when SETUP_CQE32 */
+};</code></pre></div>
+
+<p>
+The <code>flags</code> field, small as it is, is what lets a single completion
+carry more than a return value. Beyond the buffer identifier and the multi-shot
+<code>IORING_CQE_F_MORE</code> bit already mentioned, it can report that a socket
+still has data waiting (<code>IORING_CQE_F_SOCK_NONEMPTY</code>, a hint that a
+follow-up receive will succeed immediately), that this CQE is the zero-copy
+send <em>notification</em> rather than the send result
+(<code>IORING_CQE_F_NOTIF</code>, &sect;7.3), or that more data will follow for a
+buffer-ring completion (<code>IORING_CQE_F_BUF_MORE</code>). When a provided buffer
+is used, the buffer's identifier is packed into the high bits of the same field,
+above <code>IORING_CQE_BUFFER_SHIFT</code>. This is why a completion is worth more
+than the equivalent synchronous return: it can convey, in one word alongside the
+result, the out-of-band information that the older interfaces could only obtain
+through additional calls. Table 24-3 lists the entry's fields.
+</p>
+
+<table>
+<caption>Table 24-3. Fields of struct io_uring_cqe</caption>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>user_data</code></td><td><code>__u64</code></td><td>The <code>user_data</code> value from the submitting SQE, passed back unchanged so the application can identify which request completed.</td></tr>
+<tr><td><code>res</code></td><td><code>__s32</code></td><td>Result of the operation, exactly like a synchronous system-call return: a non-negative value on success, or a negative <code>errno</code> on failure.</td></tr>
+<tr><td><code>flags</code></td><td><code>__u32</code></td><td>Out-of-band <code>IORING_CQE_F_*</code> bits (BUFFER, MORE, SOCK_NONEMPTY, NOTIF, BUF_MORE, SKIP, and <code>F_32</code> marking a wide entry on a mixed ring) with the selected provided-buffer id packed above <code>IORING_CQE_BUFFER_SHIFT</code>.</td></tr>
+<tr><td><code>big_cqe[]</code></td><td><code>__u64[]</code></td><td>An extra 16 bytes of result data, present when the ring was created with <code>IORING_SETUP_CQE32</code>, or per entry on an <code>IORING_SETUP_CQE_MIXED</code> ring.</td></tr>
+</tbody>
+</table>
+
+<p>
+Figure 24-3 draws the two entry types in their rings and highlights the asymmetry
+between them. On the submission side the ring does not hold SQEs at all: it holds
+an array of <em>indices</em> into a separate SQE array—one level of indirection, so
+that the order in which entries are submitted is independent of where they sit in
+the array (an index the kernel reads with <code>io_get_sqe</code>, bumping
+<code>sq_dropped</code> if it is out of range, unless the ring opts out of the
+indirection with <code>IORING_SETUP_NO_SQARRAY</code>). The completion side has no
+such indirection: the completion ring stores CQEs directly, because the kernel,
+being the producer, simply writes each result into the next slot.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 430" role="img" aria-labelledby="fig24-3-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig24-3-title">Figure 24-3. SQE Indirection and Direct CQEs</title>
+<defs><marker id="e223" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="848" height="398" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-3. SQE Indirection and Direct CQEs</text>
+
+<!-- column headings -->
+<text x="230" y="72" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#2563eb">submission: application produces</text>
+<text x="630" y="72" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#16a34a">completion: application consumes</text>
+
+<!-- SQ ring (indices) -->
+<text x="230" y="100" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">SQ ring &#8212; array of indices (sq_off.array)</text>
+<g font-family="Inter,sans-serif" font-size="12" font-weight="700" text-anchor="middle">
+<rect x="70" y="122" width="64" height="40" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="102" y="147">2</text>
+<rect x="134" y="122" width="64" height="40" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="166" y="147">0</text>
+<rect x="198" y="122" width="64" height="40" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="230" y="147">4</text>
+<rect x="262" y="122" width="64" height="40" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="294" y="147">1</text>
+<rect x="326" y="122" width="64" height="40" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="358" y="147">3</text>
+</g>
+
+<!-- SQE array -->
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="70" y="212" width="64" height="42" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="102" y="238">SQE 0</text>
+<rect x="134" y="212" width="64" height="42" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="166" y="238">SQE 1</text>
+<rect x="198" y="212" width="64" height="42" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="230" y="238">SQE 2</text>
+<rect x="262" y="212" width="64" height="42" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="294" y="238">SQE 3</text>
+<rect x="326" y="212" width="64" height="42" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="358" y="238">SQE 4</text>
+</g>
+<text x="230" y="272" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">SQE array &#8212; struct io_uring_sqe (IORING_OFF_SQES)</text>
+
+<!-- CQ ring (direct) -->
+<text x="630" y="100" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">CQ ring &#8212; CQEs stored directly (cq_off.cqes)</text>
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="470" y="122" width="64" height="40" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="502" y="147">CQE</text>
+<rect x="534" y="122" width="64" height="40" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="566" y="147">CQE</text>
+<rect x="598" y="122" width="64" height="40" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="630" y="147">CQE</text>
+<rect x="662" y="122" width="64" height="40" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="694" y="147">CQE</text>
+<rect x="726" y="122" width="64" height="40" rx="5" fill="#dcfce7" stroke="#16a34a"/><text x="758" y="147">CQE</text>
+</g>
+<text x="630" y="212" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" fill="#475569" font-style="italic">no indirection: each slot is a struct io_uring_cqe</text>
+
+<!-- user/kernel boundary -->
+<line x1="32" y1="312" x2="848" y2="312" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="7 4"/>
+<text x="40" y="306" font-family="Inter,sans-serif" font-size="9" font-weight="700" fill="#ef4444">user space (shared rings mapped here)</text>
+<text x="40" y="326" font-family="Inter,sans-serif" font-size="9" font-weight="700" fill="#ef4444">kernel</text>
+
+<!-- kernel boxes -->
+<rect x="70" y="336" width="320" height="48" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+<text x="230" y="357" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">kernel consumes SQEs</text>
+<text x="230" y="373" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">io_get_sqe &#8594; prep &#8594; issue</text>
+<rect x="470" y="336" width="320" height="48" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+<text x="630" y="357" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">kernel produces CQEs</text>
+<text x="630" y="373" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">fill CQE &#183; advance CQ tail</text>
+
+<!-- flow arrows -->
+<g stroke="#334155" stroke-width="1.4" fill="none">
+<line x1="230" y1="106" x2="230" y2="121" marker-end="url(#e223)"/>
+<line x1="230" y1="254" x2="230" y2="336" marker-end="url(#e223)"/>
+<line x1="630" y1="336" x2="630" y2="163" marker-end="url(#e223)"/>
+<line x1="630" y1="121" x2="630" y2="106" marker-end="url(#e223)"/>
+</g>
+<!-- indirection arrows (indices point into SQE array) -->
+<g stroke="#7c3aed" stroke-width="1.2" fill="none" stroke-dasharray="3 2">
+<line x1="102" y1="164" x2="222" y2="210" marker-end="url(#e223)"/>
+<line x1="166" y1="164" x2="106" y2="210" marker-end="url(#e223)"/>
+<line x1="294" y1="164" x2="170" y2="210" marker-end="url(#e223)"/>
+</g>
+<text x="330" y="192" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#7c3aed" font-style="italic">index &#8594; SQE</text>
+<text x="243" y="292" font-family="Inter,sans-serif" font-size="8" fill="#64748b">read SQE</text>
+<text x="643" y="292" font-family="Inter,sans-serif" font-size="8" fill="#64748b">post CQE</text>
+<text x="440" y="402" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">the SQ ring holds indices into a separate SQE array (one indirection); the CQ ring holds CQEs directly</text>
+</svg>
+<figcaption>Figure 24-3. SQE indirection and direct CQEs — on the submission side the SQ ring holds an array of indices (dashed arrows) into a separate SQE array of struct io_uring_sqe, so the submission order is independent of an entry's slot; the kernel reads an index with io_get_sqe, then the SQE it names, and issues the operation. On the completion side there is no indirection: the kernel writes each struct io_uring_cqe straight into the next slot of the CQ ring, which the application then reads. Both rings are shared memory mapped into the application; the application produces SQEs and consumes CQEs, while the kernel consumes SQEs and produces CQEs.</figcaption>
+</figure>
+
+<h3 id="ordering">Heads, Tails, and Memory Ordering</h3>
+
+<p>
+Each ring is a classic circular buffer addressed by two monotonically increasing
+indices, a <span class="key-term">head</span> and a <span class="key-term">tail</span>,
+masked by the ring size to wrap around. The essential discipline is that for each
+ring one party owns the tail and the other owns the head, so that the queue is a
+single-producer, single-consumer channel that needs no lock. For the submission
+queue the application is the producer: it writes new SQEs and advances the tail,
+while the kernel advances the head as it consumes them. For the completion queue
+the roles reverse: the kernel produces, advancing the tail, and the application
+consumes, advancing the head. Each side can tell whether the queue is empty or
+full simply by comparing the head and tail it can see. Because the entry count is
+always a power of two, mapping one of these ever-growing indices to an actual slot
+is a single bitwise AND with the ring mask (<code>entries - 1</code>)—the slot is
+<code>index &amp; mask</code>—rather than a modulo.
+</p>
+
+<p>
+What makes this safe without locks is <span class="key-term">memory ordering</span>.
+When the application publishes a new SQE it must ensure the kernel cannot observe
+the advanced tail before the SQE's contents are visible, and symmetrically the
+kernel must ensure a CQE's contents are visible before it advances the tail the
+application reads. Both sides achieve this with acquire/release barriers—the
+producer uses a release store to publish the new tail after writing the entry, and
+the consumer uses an acquire load to read the tail before reading the entry—so
+that seeing the updated index guarantees seeing the data it refers to. This is the
+same store-release/load-acquire pattern Chapter 5 described for lockless
+communication, applied across the user/kernel boundary, and it is documented in
+detail at the top of <code class="file-path">io_uring/io_uring.c</code>. Getting
+this protocol right is the whole reason the shared rings can be used concurrently
+by two parties at full speed with no system call to serialize them.
+</p>
+
+<p>
+Put concretely, each side runs a fixed produce/consume cycle, and the two rings
+are mirror images. To submit, the application fills an SQE in the array, writes
+that entry's index into the submission ring at <code>sq_tail &amp; mask</code>, and
+advances <code>sq_tail</code> with a release store (<code>smp_store_release</code>);
+the kernel reads <code>sq_tail</code> with a matching acquire load
+(<code>smp_load_acquire</code>), consumes indices beginning at
+<code>sq_head &amp; mask</code>, and advances <code>sq_head</code> to free those
+slots. To complete, the kernel writes the CQE into the completion ring at
+<code>cq_tail &amp; mask</code> and advances <code>cq_tail</code> with a release
+store; the application reads <code>cq_tail</code> with an acquire load, consumes
+CQEs beginning at <code>cq_head &amp; mask</code>, and advances <code>cq_head</code>
+to tell the kernel those slots may be reused. In each direction the producer's
+release store of the tail pairs with the consumer's acquire load of it, which—with
+the <code>READ_ONCE</code> and <code>WRITE_ONCE</code> that guard every shared
+access—are the exact primitives the header comment in
+<code class="file-path">io_uring/io_uring.c</code> prescribes. Figure 24-4 draws
+one such ring, with its head and tail dividing the circular buffer into occupied
+and free slots.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 470" role="img" aria-labelledby="fig24-4-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig24-4-title">Figure 24-4. A Ring Buffer with Head and Tail</title>
+<defs><marker id="e224" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="848" height="438" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-4. A Ring Buffer with Head and Tail</text>
+
+<!-- ring band: full circle (free) + occupied arc -->
+<circle cx="230" cy="252" r="110" fill="none" stroke="#e2e8f0" stroke-width="26"/>
+<path d="M340,252 A110,110 0 0 1 120,252" fill="none" stroke="#93c5fd" stroke-width="26"/>
+
+<!-- slot numbers on the band -->
+<g font-family="Inter,sans-serif" font-size="12" font-weight="700" text-anchor="middle" fill="#334155">
+<text x="230" y="146">0</text>
+<text x="308" y="176">1</text>
+<text x="340" y="256">2</text>
+<text x="308" y="332">3</text>
+<text x="230" y="364">4</text>
+<text x="152" y="332">5</text>
+<text x="120" y="256">6</text>
+<text x="152" y="176">7</text>
+</g>
+
+<!-- center label -->
+<g font-family="Inter,sans-serif" text-anchor="middle" fill="#475569">
+<text x="230" y="240" font-size="11" font-weight="700" fill="#334155">circular ring</text>
+<text x="230" y="258" font-size="9">entries: power of 2</text>
+<text x="230" y="272" font-size="9">slot = index &amp; mask</text>
+</g>
+
+<!-- occupied / free labels -->
+<text x="230" y="118" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700" fill="#64748b">free slots</text>
+<text x="230" y="400" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700" fill="#2563eb">occupied entries</text>
+
+<!-- head and tail arrows -->
+<g stroke="#334155" stroke-width="1.5" fill="none">
+<line x1="405" y1="252" x2="357" y2="252" marker-end="url(#e224)"/>
+<line x1="55" y1="252" x2="103" y2="252" marker-end="url(#e224)"/>
+</g>
+<text x="410" y="257" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#16a34a">head</text>
+<text x="50" y="257" text-anchor="end" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#2563eb">tail</text>
+
+<!-- advance direction -->
+<path d="M300,150 A80,80 0 0 1 330,196" fill="none" stroke="#7c3aed" stroke-width="1.3" marker-end="url(#e224)"/>
+<text x="336" y="150" font-family="Inter,sans-serif" font-size="8.5" fill="#7c3aed" font-style="italic">both advance</text>
+<text x="336" y="162" font-family="Inter,sans-serif" font-size="8.5" fill="#7c3aed" font-style="italic">this way</text>
+
+<!-- legend -->
+<rect x="470" y="120" width="376" height="250" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="490" y="146" font-family="Inter,sans-serif" font-size="12" font-weight="700">single-producer, single-consumer</text>
+<circle cx="496" cy="176" r="4" fill="#2563eb"/>
+<text x="510" y="180" font-family="Inter,sans-serif" font-size="10" font-weight="700">producer</text>
+<text x="510" y="196" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">writes an entry at tail &amp; mask, then advances</text>
+<text x="510" y="210" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">tail with smp_store_release</text>
+<circle cx="496" cy="238" r="4" fill="#16a34a"/>
+<text x="510" y="242" font-family="Inter,sans-serif" font-size="10" font-weight="700">consumer</text>
+<text x="510" y="258" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">reads tail with smp_load_acquire, processes</text>
+<text x="510" y="272" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">from head &amp; mask, then advances head</text>
+<line x1="490" y1="292" x2="826" y2="292" stroke="#e2e8f0" stroke-width="1"/>
+<text x="490" y="312" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">&#183; head and tail only ever increase; the mask</text>
+<text x="502" y="326" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">(entries - 1) wraps them onto the ring</text>
+<text x="490" y="346" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">&#183; occupied = tail - head; empty when equal;</text>
+<text x="502" y="360" font-family="Inter,sans-serif" font-size="9.5" fill="#475569">no lock is taken on either side</text>
+</svg>
+<figcaption>Figure 24-4. A ring buffer with head and tail — the ring is a power-of-two circular buffer in which the producer writes at the slot tail &amp; mask and advances the tail with a release store, while the consumer reads at head &amp; mask and advances the head with an acquire load; the slots between head and tail (blue) hold pending entries and the rest are free. Both indices only ever increase and are wrapped onto the ring by masking, so the queue needs no lock. The same structure serves the submission ring (application produces, kernel consumes) and the completion ring (kernel produces, application consumes).</figcaption>
+</figure>
+
+
+<p>
+A handful of other shared fields round out the protocol, all of them written by one
+side and only read by the other. Two are error counters. <code>sq_dropped</code>
+counts submission entries the kernel had to discard because the application wrote
+an out-of-range index into the submission array—a programming error the
+application can detect by watching the counter rise. <code>cq_overflow</code>
+counts completions that could not be posted because the completion ring was full;
+a modern kernel does not drop these but holds them on an internal list until space
+frees up, the no-drop behavior detailed in &sect;3.2, so the counter merely records
+that the application let the ring back up. The rings also carry two runtime flag
+words in shared memory. The kernel writes <code>sq_flags</code> to raise
+<code>IORING_SQ_NEED_WAKEUP</code> when a sleeping poll thread must be woken
+(&sect;5.1), <code>IORING_SQ_TASKRUN</code> when deferred completion work is
+waiting, and <code>IORING_SQ_CQ_OVERFLOW</code> when completions are being held
+back on the overflow list—so an application can learn of the backlog by reading
+a word of memory rather than by watching the counter climb. In the other direction
+the application writes <code>cq_flags</code>, whose single defined bit,
+<code>IORING_CQ_EVENTFD_DISABLED</code>, suppresses the eventfd notification while
+it is reaping completions it already knows about. Because the poll-thread wakeup decision
+turns on the application updating the submission tail and <em>then</em> reading
+these flags, that particular check needs a full memory barrier between the two, a
+subtlety the header comment in <code class="file-path">io_uring/io_uring.c</code>
+calls out explicitly. These counters and flags are the small amount of shared
+state, beyond the entries themselves, that keeps the two sides in agreement about
+the health and mode of the rings.
+</p>
+
+<p>
+One recent option abandons the circular discipline on the submission side
+altogether. A ring created with <code>IORING_SETUP_SQ_REWIND</code>—a
+non-circular submission queue, added during the 7.0 cycle and requiring
+<code>IORING_SETUP_NO_SQARRAY</code>—has the kernel ignore the submission head and
+tail entirely and take entries from index zero on every submission. The
+application places the batch it wants at the start of the SQE memory, calls into
+the kernel, and never touches the indices at all, which suits a program that
+assembles a complete batch each time round its loop and has no use for a queue that
+persists between iterations. It cannot be combined with the poll thread of
+&sect;5.1, which by its nature needs a standing queue to watch.
+</p>
+
+<hr>
+<h2 id="lifecycle">The Life of a Request</h2>
+
+<p class="chapter-intro">
+Having seen the rings and the entries, we can follow a single request through the
+kernel: from the moment the application publishes an SQE, through the kernel's
+consumption and issuing of the operation, to the posting of a CQE the application
+eventually reaps. Understanding this path—especially where it runs synchronously
+and where the kernel must defer work—explains both io_uring's speed and the
+mechanisms of the later sections. This section traces the submission side, the
+completion side, and the <code>io_uring_enter</code> system call that drives both.
+</p>
+
+<p>
+The theme to watch for is that io_uring runs at <span class="key-term">two
+speeds</span>. Whenever it can, the kernel carries a request all the way to
+completion inline, in the submitting thread, touching no other context—this is the
+fast path that makes io_uring cheap. Only when an operation would block does it
+fall back to one of the deferral mechanisms, and even then it never blocks the
+submitter. The unit that flows along both paths is a single kernel object, the
+request (<code>struct io_kiocb</code>), created when an SQE is consumed and
+destroyed when its CQE has been posted; following that object from birth to death
+is the clearest way to understand the subsystem. Figure 24-5 traces the journey
+the three subsections below describe.
+</p>
+
+<figure>
+<svg viewBox="0 0 900 592" role="img" aria-labelledby="fig24-5-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig24-5-title">Figure 24-5. The Life of a Request</title>
+<defs><marker id="e225" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="868" height="560" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="450" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-5. The Life of a Request</text>
+
+<!-- box 1: publish SQE (user) -->
+<rect x="180" y="66" width="240" height="46" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="300" y="86" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">application publishes SQE</text>
+<text x="300" y="102" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">writes SQE, advances SQ tail (user space)</text>
+
+<!-- box 2: submit / alloc / prep -->
+<rect x="180" y="126" width="240" height="50" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="300" y="146" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">io_submit_sqes</text>
+<text x="300" y="162" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">io_get_sqe &#183; alloc io_kiocb &#183; prep()</text>
+
+<!-- box 3: issue -->
+<rect x="180" y="190" width="240" height="44" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="300" y="210" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">issue()</text>
+<text x="300" y="225" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">with IO_URING_F_NONBLOCK</text>
+
+<!-- diamond: would block? -->
+<polygon points="300,250 392,296 300,342 208,296" fill="#fef9c3" stroke="#ca8a04"/>
+<text x="300" y="292" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">completes</text>
+<text x="300" y="306" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">inline?</text>
+
+<!-- inline box (yes) -->
+<rect x="190" y="372" width="220" height="48" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+<text x="300" y="392" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">inline completion</text>
+<text x="300" y="408" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">fast path &#8212; submitting thread</text>
+
+<!-- async box (no) -->
+<rect x="520" y="250" width="344" height="112" rx="8" fill="#fee2e2" stroke="#dc2626"/>
+<text x="692" y="272" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">cannot complete inline (&#8722;EAGAIN)</text>
+<text x="536" y="296" font-family="Inter,sans-serif" font-size="9" fill="#334155" font-weight="700">&#8226; arm poll (io_arm_poll_handler)</text>
+<text x="548" y="310" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">wait for readiness, then re-issue</text>
+<text x="536" y="332" font-family="Inter,sans-serif" font-size="9" fill="#334155" font-weight="700">&#8226; or punt to io-wq worker</text>
+<text x="548" y="346" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">run in a context allowed to block</text>
+
+<!-- completion box -->
+<rect x="120" y="440" width="360" height="52" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="300" y="461" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">post completion</text>
+<text x="300" y="478" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">fill CQE (io_fill_cqe_req) &#183; task work &#183; advance CQ tail</text>
+
+<!-- reap box (user) -->
+<rect x="190" y="514" width="220" height="46" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="300" y="534" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">application reaps CQE</text>
+<text x="300" y="550" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">reads res and flags (user space)</text>
+
+<!-- arrows -->
+<g stroke="#334155" stroke-width="1.4" fill="none">
+<line x1="300" y1="112" x2="300" y2="126" marker-end="url(#e225)"/>
+<line x1="300" y1="176" x2="300" y2="190" marker-end="url(#e225)"/>
+<line x1="300" y1="234" x2="300" y2="250" marker-end="url(#e225)"/>
+<line x1="300" y1="342" x2="300" y2="372" marker-end="url(#e225)"/>
+<line x1="392" y1="296" x2="520" y2="296" marker-end="url(#e225)"/>
+<line x1="300" y1="420" x2="300" y2="440" marker-end="url(#e225)"/>
+<line x1="692" y1="362" x2="692" y2="466"/>
+<line x1="692" y1="466" x2="480" y2="466" marker-end="url(#e225)"/>
+<line x1="300" y1="492" x2="300" y2="514" marker-end="url(#e225)"/>
+</g>
+<text x="312" y="362" font-family="Inter,sans-serif" font-size="9" font-weight="700" fill="#16a34a">yes</text>
+<text x="404" y="288" font-family="Inter,sans-serif" font-size="9" font-weight="700" fill="#dc2626">no</text>
+<text x="450" y="590" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">a request completes inline on the fast path, or is deferred by a poll or an io-wq worker; both paths end by posting a CQE</text>
+</svg>
+<figcaption>Figure 24-5. The life of a request — the application publishes an SQE, and io_submit_sqes consumes it, allocates a struct io_kiocb, and runs the opcode's prep() and then issue() with the non-blocking flag set. If the operation completes without blocking it finishes inline on the fast path; otherwise the handler returns -EAGAIN and the request is deferred, either by arming a poll and re-issuing when the file is ready or by punting it to an io-wq worker that may block. Both paths converge on posting a completion: filling the CQE, running it as task work, and advancing the CQ tail, after which the application reaps the CQE.</figcaption>
+</figure>
+
+<h3 id="submit">Submission and Issue</h3>
+
+<p>
+When the kernel is told there are new SQEs to process—because the application
+called <code>io_uring_enter</code>, or because the polling thread of &sect;5.1 noticed
+the tail advance—it runs <code>io_submit_sqes</code>
+(<code class="file-path">io_uring/io_uring.c</code>), which consumes the queued
+entries one by one. For each, it allocates and initializes an internal request
+object, <code>struct io_kiocb</code>
+(<code class="file-path">include/linux/io_uring_types.h</code>)—the kernel's
+representation of an in-flight operation, belonging to the instance's
+<code>struct io_ring_ctx</code>—and dispatches it to the handler for its opcode.
+The dispatch goes through a per-operation table, <code>io_issue_defs</code>
+(<code class="file-path">io_uring/opdef.c</code>), which gives each opcode a
+<code>prep</code> function that validates and unpacks the SQE and an
+<code>issue</code> function that performs the operation. This table is the seam
+along which io_uring's many operation types are organized: adding an operation
+means adding an entry to it. There are in fact two tables, and the reason for the
+split is itself instructive. Everything the hot path touches lives in
+<code>io_issue_defs</code>; everything it does not—the opcode's name for
+<code class="file-path">/proc</code> output, and the <code>cleanup</code> and
+<code>fail</code> callbacks invoked only when a request is torn down or rejected
+—lives in a parallel <code>io_cold_defs</code> array indexed by the same opcode. A
+single combined structure would work, but it would push the frequently read fields
+further apart in memory, and the subsystem is built on the principle that the
+common path should touch as few cache lines as possible.
+</p>
+
+<p>
+The <code>struct io_kiocb</code> that flows through this machinery is a compact,
+reused object rather than a fresh allocation per operation. It carries a back
+pointer to its <code>struct io_ring_ctx</code>, the resolved <code>file</code> it
+acts on, the owning task, a reference count, per-request <code>REQ_F_</code> state
+flags, a link pointer for chained requests (&sect;4.2), an optional
+<code>async_data</code> block for operations that must save state when they are
+punted, and—tellingly—an embedded <code>struct io_uring_cqe</code>, so the result
+is built up inside the request and later copied into the ring. To keep the hot
+path off the memory allocator, requests are drawn from a per-context cache: the
+core refills it in bulk with <code>kmem_cache_alloc_bulk</code> and hands out
+objects from a free list on the submit state (<code>io_alloc_req</code> over
+<code>ctx-&gt;submit_state</code>), returning each request to the same list when it
+completes. The submission loop also brackets the batch it is issuing in a
+block-layer <span class="key-term">plug</span> (<code>blk_start_plug_nr_ios</code>,
+the mechanism of Chapter 14, told in advance how many operations to expect), so
+that a run of queued storage reads and writes is
+handed to the device together rather than one at a time—another way batching at the
+ring level turns into batching all the way down.
+</p>
+
+<p>
+Each entry in that table is more than a pair of function pointers; it also carries
+a set of one-bit properties (<code>struct io_issue_def</code>,
+<code class="file-path">io_uring/opdef.h</code>) that tell the core how to treat the
+opcode without knowing anything specific about it. Fourteen such bits are defined. <code>needs_file</code> says the operation acts on
+a file descriptor, so the core should resolve and pin it first;
+<code>buffer_select</code> that it may draw a provided buffer (&sect;6.2);
+<code>iopoll</code> that it can be completed by busy-polling (&sect;7.2);
+<code>pollin</code> and <code>pollout</code> which readiness condition to wait on;
+<code>unbound_nonreg_file</code> that a blocking instance should be treated as an
+unbounded worker, and <code>hash_reg_file</code> that writes to the same regular
+file should be serialized rather than run concurrently (both &sect;5.2). Others
+serve narrower purposes: <code>plug</code> marks the storage operations that should
+join the block-layer plug described above, <code>audit_skip</code> exempts
+high-frequency operations from audit logging, and <code>is_128</code> identifies
+the opcodes that use a 128-byte SQE on the mixed-size rings of &sect;2.1. Two
+non-bit members complete the picture: <code>async_size</code> gives the amount of
+state the operation must save if it is punted, and
+<code>filter_pdu_size</code>, with its companion <code>filter_populate</code>
+callback, tells the BPF filter machinery of &sect;8.2 how much per-opcode context to
+present to a filter program. Together these let generic code make the right
+scheduling, resource, and security decisions for every opcode without knowing what
+any of them does. The two-phase
+split matters too: <code>prep</code> runs first and does all validation and
+unpacking of the SQE up front, so that once a request is accepted its
+<code>issue</code> handler can run without re-touching user memory, which both
+simplifies the fast path and closes a class of time-of-check/time-of-use bugs.
+</p>
+
+<p>
+The pivotal question for each request is whether it can complete
+<span class="key-term">without blocking</span>. The core resolves it concretely:
+it calls the opcode's <code>issue</code> handler with a non-blocking flag
+(<code>IO_URING_F_NONBLOCK</code>) set, asking it to do the work only if it can do
+so without sleeping. Many operations can: a read whose data is already in the page
+cache, a send into a socket with room in its buffer, a non-blocking poll—these
+complete immediately, inline, in the submitting context, which is io_uring's fast
+path and the reason it can be so much faster than a thread-per-request design. When
+the operation <em>would</em> block, its handler returns <code>-EAGAIN</code>
+instead of sleeping, and the core takes over: it first tries to
+<span class="key-term">arm a poll</span> (<code>io_arm_poll_handler</code>), so that
+the request waits, without a thread, until the file signals readiness and is then
+re-issued; and only if the file cannot be polled does it hand the request to the
+worker pool of &sect;5.2 to run in a context where blocking is allowed. State
+flags on the request (the <code>REQ_F_</code> bits, such as
+<code>REQ_F_FORCE_ASYNC</code> to skip the inline attempt and
+<code>REQ_F_POLLED</code> to mark a poll-armed request) record which path it took.
+Either way the submission call returns promptly, and the completion is delivered
+later.
+</p>
+
+<h3 id="complete">Completion and Task Work</h3>
+
+<p>
+However a request finishes, its result reaches the application the same way: the
+kernel posts a CQE. Internally this means filling a completion entry with the
+request's <code>user_data</code>, result, and flags and advancing the completion
+ring's tail (<code>io_fill_cqe_req</code> and relatives,
+<code class="file-path">io_uring/io_uring.c</code>). A subtlety arises when a
+completion becomes ready in a context where it cannot be finalized directly—for
+instance in interrupt context, or on a different CPU than the one that owns the
+ring. io_uring handles this with <span class="key-term">task work</span>
+(<code class="file-path">io_uring/tw.c</code>): the completion is queued to run in
+the context of the task that owns the io_uring instance, and is finalized the next
+time that task runs kernel code, typically when it next calls
+<code>io_uring_enter</code>. Running completions in the owner's task context keeps
+the completion path cheap and cache-friendly, and it is the mechanism the
+low-overhead completion modes of &sect;7.2 tune.
+</p>
+
+<p>
+Two refinements of this mechanism matter here, because the setup flags of
+&sect;7.2 select between them. In the default scheme the kernel queues the
+completion with the generic task-work facility of Chapter 4
+(<code>io_req_task_work_add</code> raising a <code>TWA_SIGNAL</code> notification),
+which interrupts the owner task promptly to run it. When a ring is created with
+<code>IORING_SETUP_DEFER_TASKRUN</code>, io_uring instead keeps a private,
+lock-light list of pending completion work and runs it only when the application
+asks for completions, avoiding the signal and running the work in bigger batches—a
+large saving for a single-threaded server, at the cost of promising that only one
+task will wait on the ring. Either way, when several requests have finished, their
+CQEs are posted together: <code>__io_submit_flush_completions</code>
+(<code class="file-path">io_uring/io_uring.c</code>) fills a run of completion
+entries and advances the tail once under a single lock acquisition, so that the
+per-completion cost falls as the batch grows. Batched, task-context completion is
+as central to io_uring's efficiency as batched submission.
+</p>
+
+<p>
+Posting a completion is also where a request's life usually ends. Because the CQE
+is embedded in the <code>io_kiocb</code>, finalizing a request is a matter of
+copying that entry into the next ring slot and then dropping the request's last
+reference; rather than freeing it to the allocator, the core returns it to the
+per-context cache of &sect;3.1 for the next operation to reuse. The reference count
+matters because a request is not always owned by one path alone—a poll waiter, a
+timeout linked to it, and the issuing context may all hold references—and the
+request is finalized only when the last is dropped. One important case defies the
+usual one-CQE-then-freed rule: a multi-shot request
+(&sect;7.1) posts its CQE with the <code>IORING_CQE_F_MORE</code> flag set and is
+<em>not</em> freed; it stays armed and will post again on the next event, so a
+single accept or receive request can yield a stream of completions before it is
+finally torn down.
+</p>
+
+<p>
+One more case must be handled: the completion queue can <span class="key-term">fill
+up</span> if the application submits faster than it reaps. When there is no room
+for a new CQE, the kernel does not drop the completion—doing so would lose an I/O
+result—but records it on an internal overflow list and flushes it into the ring
+once space appears. This no-drop guarantee (advertised to applications as the
+<code>IORING_FEAT_NODROP</code> feature) means an application can, if it chooses,
+size its completion ring smaller than the number of requests it keeps in flight
+and rely on the kernel to hold the surplus, at some cost in efficiency when
+overflow occurs.
+</p>
+
+<h3 id="enter">The enter System Call</h3>
+
+<p>
+The engine that drives submission and completion in the default mode is the second
+of the three system calls, <code>io_uring_enter</code>
+(<code class="file-path">io_uring/io_uring.c</code>). Its cleverness is that one
+call does both jobs at once: the application tells it how many newly queued SQEs
+to submit and how many completions to wait for, and the kernel submits the batch,
+then—if asked—blocks until the requested number of CQEs is available before
+returning. A common high-throughput loop is therefore a single
+<code>io_uring_enter</code> per iteration that submits everything queued since the
+last call and waits for a batch of results, so that even in the syscall-using
+mode the ratio of operations to system calls can be very high. Eight flags select its behavior. <code>IORING_ENTER_GETEVENTS</code> asks it to
+wait for completions; <code>IORING_ENTER_SQ_WAKEUP</code> nudges a sleeping poll
+thread and <code>IORING_ENTER_SQ_WAIT</code> waits for room in a full submission
+queue (both &sect;5.1); <code>IORING_ENTER_REGISTERED_RING</code> names the ring by
+a registered index rather than a file descriptor, shaving the descriptor lookup off
+even this call; and <code>IORING_ENTER_NO_IOWAIT</code> asks that the sleep not be
+accounted as iowait, which otherwise inflates the idle statistics of a machine
+whose threads are merely waiting on a ring. The remaining three concern the
+extended argument described below. It is the one system call an ordinary io_uring workload makes on
+its hot path—and the polling modes of &sect;5 remove even that.
+</p>
+
+<p>
+The call's full signature shows how it fuses the two roles:
+<code>io_uring_enter(fd, to_submit, min_complete, flags, arg, argsz)</code>. The
+<code>to_submit</code> count says how many newly queued SQEs to consume, and the
+call returns the number it actually submitted; <code>min_complete</code>, together
+with <code>IORING_ENTER_GETEVENTS</code>, says how many completions to wait for
+before returning. Passing <code>to_submit</code> of zero with a non-zero
+<code>min_complete</code> turns the call into a pure wait, and the reverse into a
+pure submit, so the one entry point serves a submit-only producer, a wait-only
+consumer, or the combined loop equally. The final two arguments carry a signal
+mask to atomically install for the duration of the wait—closing the classic
+select/pselect race—and, when <code>IORING_ENTER_EXT_ARG</code> is set, point
+instead to a <code>struct io_uring_getevents_arg</code>
+(<code class="file-path">include/uapi/linux/io_uring.h</code>) that bundles the
+signal mask together with a wait timeout, so an
+application can block for completions but no longer than a bounded time without a
+separate timer operation. <code>IORING_ENTER_ABS_TIMER</code> makes that timeout an
+absolute deadline rather than a relative interval, so that a loop which waits
+repeatedly does not drift. These options make a single <code>io_uring_enter</code>
+expressive enough to be the whole of a server's interaction with the kernel on the
+hot path.
+</p>
+
+<p>
+That structure carries one more field, <code>min_wait_usec</code>, which turns the
+wait into a two-stage affair and is the kernel's answer to a tension this chapter
+has so far left implicit. Waiting for a single completion gives the lowest latency
+for that one operation but the worst throughput, since the application is woken for
+every result; waiting for a large batch reverses the trade, and risks waiting a
+long time if the batch never fills. A non-zero <code>min_wait_usec</code> asks the
+kernel to sleep for that window <em>even if enough completions are already
+available</em>, letting a batch accumulate, and only then to reconsider. When the
+window expires the waiter is released if anything arrived during it; otherwise it
+falls back to the ordinary timeout, but now waking on the very next completion
+rather than on a full batch (<code class="file-path">io_uring/wait.c</code>). The
+effect is to spend a bounded, explicitly chosen amount of latency—tens of
+microseconds, typically—to buy a larger batch, while guaranteeing that a quiet ring
+still returns promptly. The capability is advertised as
+<code>IORING_FEAT_MIN_TIMEOUT</code>.
+</p>
+
+<p>
+A last refinement removes the copying that all of this implies. Every
+<code>io_uring_enter</code> that passes an extended argument must copy that
+structure in from user space, which is a small cost but one paid on a path whose
+entire purpose is to be cheap. With
+<code>IORING_ENTER_EXT_ARG_REG</code> the application instead registers a region of
+wait arguments with the kernel once, as an array of
+<code>struct io_uring_reg_wait</code>, and thereafter passes only an index into it;
+the kernel reads the timeout, the signal mask, and the minimum wait from memory it
+already has mapped. It is the same move as the registered files and buffers of
+&sect;6 and the registered ring descriptor above, applied to the last remaining
+per-call copy, and it is characteristic of how the interface has evolved: once the
+system calls themselves were amortized away, what remained to optimize was
+everything they still had to touch.
+</p>
+
+<p>
+One consequence of this fused design deserves emphasis, because it differs from an
+ordinary system call: the return value of <code>io_uring_enter</code> reports only
+how the <em>submission</em> went—the number of SQEs accepted, or an error if the
+call itself could not proceed—and <em>not</em> whether the operations succeeded.
+Each operation's own success or failure comes back later in its CQE's
+<code>res</code> field. A single malformed or failing SQE therefore does not abort
+the batch or fail the system call: the kernel marks that request failed and posts a
+completion carrying the negative error code for it (if it was the head of a link,
+the rest of the chain is cancelled, &sect;4.2), while the other submitted requests
+proceed normally. An application must accordingly check two things—that
+<code>io_uring_enter</code> submitted what it expected, and then each CQE's
+<code>res</code>—rather than treating a successful call as a successful operation.
+</p>
+
+<hr>
+<h2 id="ops">Operations and Chaining</h2>
+
+<p class="chapter-intro">
+So far a request has been an abstract &ldquo;operation.&rdquo; This section makes
+it concrete: the breadth of operation types io_uring supports, which is what lets
+an application drive nearly all of its I/O through the single interface, and the
+mechanisms for expressing <em>ordering</em> among operations—linking one request
+to depend on another, draining the queue as a barrier, and attaching timeouts.
+These two themes are complementary: the wide opcode set means almost anything a
+program does can become an SQE, and the ordering flags mean those SQEs can encode
+not just a bag of independent operations but a small program of dependent ones,
+submitted and run without the application mediating each step. A third subsection
+then collects the operations that act on neither a file nor a socket—passing a
+message to another ring, waiting on a futex, reaping a child process, and
+cancelling a request already in flight.
+</p>
+
+<h3 id="opcodes">The Range of Operations</h3>
+
+<p>
+The <code>opcode</code> in each SQE selects from a large and growing set of
+operations—sixty-five in this kernel, enumerated by <code>enum io_uring_op</code>
+(<code class="file-path">include/uapi/linux/io_uring.h</code>) and implemented
+through the <code>io_issue_defs</code> table. Their range is what distinguishes
+io_uring from its narrow predecessor: it is not a file-I/O interface with a few
+extras but a general asynchronous-operation interface. Table 24-4 groups the
+principal families. Crucially, because every operation shares the SQE/CQE
+mechanism, an application can <em>interleave</em> them freely—accept a connection,
+read from a file, send the data on a socket, set a timeout, all as independent
+entries in the same submission queue—which is precisely what a server event loop
+needs and what older interfaces forced it to assemble from several unrelated
+system calls.
+</p>
+
+<table>
+<caption>Table 24-4. Principal families of io_uring operations</caption>
+<thead>
+<tr><th>Family</th><th>Representative opcodes</th></tr>
+</thead>
+<tbody>
+<tr><td>File read/write</td><td><code>IORING_OP_READ</code>, <code>WRITE</code>, <code>READV</code>, <code>WRITEV</code>, <code>READ_FIXED</code>, <code>WRITE_FIXED</code>, <code>READV_FIXED</code>, <code>WRITEV_FIXED</code>, <code>READ_MULTISHOT</code></td></tr>
+<tr><td>File sync and metadata</td><td><code>FSYNC</code>, <code>SYNC_FILE_RANGE</code>, <code>FALLOCATE</code>, <code>FTRUNCATE</code>, <code>STATX</code>, <code>FADVISE</code>, <code>MADVISE</code></td></tr>
+<tr><td>File lifecycle</td><td><code>OPENAT</code>, <code>OPENAT2</code>, <code>CLOSE</code>, <code>RENAMEAT</code>, <code>UNLINKAT</code>, <code>MKDIRAT</code>, <code>SYMLINKAT</code>, <code>LINKAT</code>, <code>PIPE</code></td></tr>
+<tr><td>Extended attributes</td><td><code>GETXATTR</code>, <code>SETXATTR</code>, <code>FGETXATTR</code>, <code>FSETXATTR</code></td></tr>
+<tr><td>Networking</td><td><code>SEND</code>, <code>RECV</code>, <code>SENDMSG</code>, <code>RECVMSG</code>, <code>ACCEPT</code>, <code>CONNECT</code>, <code>SEND_ZC</code>, <code>SENDMSG_ZC</code>, <code>RECV_ZC</code></td></tr>
+<tr><td>Socket and descriptor setup</td><td><code>SOCKET</code>, <code>BIND</code>, <code>LISTEN</code>, <code>SHUTDOWN</code>, <code>FIXED_FD_INSTALL</code>, <code>FILES_UPDATE</code></td></tr>
+<tr><td>Readiness and timing</td><td><code>POLL_ADD</code>, <code>POLL_REMOVE</code>, <code>EPOLL_CTL</code>, <code>EPOLL_WAIT</code>, <code>TIMEOUT</code>, <code>TIMEOUT_REMOVE</code>, <code>LINK_TIMEOUT</code></td></tr>
+<tr><td>Processes and synchronization</td><td><code>WAITID</code>, <code>FUTEX_WAIT</code>, <code>FUTEX_WAKE</code>, <code>FUTEX_WAITV</code></td></tr>
+<tr><td>Data movement between descriptors</td><td><code>SPLICE</code>, <code>TEE</code></td></tr>
+<tr><td>Control and passthrough</td><td><code>NOP</code>, <code>NOP128</code>, <code>ASYNC_CANCEL</code>, <code>PROVIDE_BUFFERS</code>, <code>REMOVE_BUFFERS</code>, <code>MSG_RING</code>, <code>URING_CMD</code>, <code>URING_CMD128</code></td></tr>
+</tbody>
+</table>
+
+<p>
+Because the set grows from release to release, the opcode enumeration is
+open-ended: new operations are appended before the sentinel
+<code>IORING_OP_LAST</code>, and existing numbers never change, so a program built
+against an older header keeps working while newer opcodes simply have larger
+values it may not know. An application cannot assume a given opcode exists on the
+kernel it is running on, and io_uring provides a way to ask: the
+<code>IORING_REGISTER_PROBE</code> operation of <code>io_uring_register</code>
+returns a <code>struct io_uring_probe</code>
+(<code class="file-path">include/uapi/linux/io_uring.h</code>) reporting the highest
+supported opcode and a per-opcode &ldquo;supported&rdquo; flag, so a program can
+probe once at startup and fall back gracefully where an operation is missing. The
+simplest opcode, <code>IORING_OP_NOP</code>, does nothing and completes
+immediately; it is useful for measuring ring overhead, warming the machinery, or
+serving as a placeholder in a chain. The important point is that this table is the
+whole surface through which io_uring keeps absorbing new roles—each new capability,
+from zero-copy send to command passthrough, arrives as one more opcode rather than
+a new system call.
+</p>
+
+<p>
+Two things about the current list are more revealing than its length. The first is
+how far it has drifted from file descriptors. <code>IORING_OP_WAITID</code> reaps a
+child process and the futex operations wait on a word of user memory, both
+covered in &sect;4.3;
+<code>IORING_OP_SOCKET</code>, <code>BIND</code>, and <code>LISTEN</code> mean a
+server can now build a listening socket, accept on it, read, write, and close
+without a single system call other than <code>io_uring_enter</code>; and
+<code>IORING_OP_EPOLL_WAIT</code> lets a program wait on an epoll set from inside
+the ring, folding the interface of Chapter 19 into the one that was meant to
+replace it. Several of these have no <code>fd</code> in any meaningful sense, which
+is why the <code>needs_file</code> bit of &sect;3.1 exists rather than the core
+simply assuming a descriptor. The second is the pair
+<code>IORING_OP_NOP128</code> and <code>IORING_OP_URING_CMD128</code>: these are
+duplicate opcodes whose only distinction is that they occupy a 128-byte SQE, and
+they exist so that the mixed-size rings of &sect;2.1 can tell a wide entry from a
+narrow one by opcode alone. They are the concrete users of the
+<code>is_128</code> property bit.
+</p>
+
+<h3 id="linking">Linking, Draining, and Timeouts</h3>
+
+<p>
+Independent operations are the common case, but applications often need one
+operation to follow another—write a buffer, then fsync it; connect a socket, then
+send on it. io_uring expresses such dependencies with the per-SQE
+<code>flags</code> introduced in &sect;2.2. Setting <code>IOSQE_IO_LINK</code> on an SQE
+<span class="key-term">links</span> it to the next: the linked chain executes in
+order, each request starting only when its predecessor completes successfully, and
+a failure breaks the chain so the dependents are cancelled rather than run on bad
+state. This lets a multi-step sequence be submitted as one batch yet execute in
+the right order, without the application waiting for each step in turn.
+</p>
+
+<p>
+Several refinements tune this behavior. <code>IOSQE_IO_HARDLINK</code> is a stronger
+link that holds the chain together even when a request fails, so the successor runs
+regardless of its predecessor's result—useful when the steps are ordered but not
+conditional. The protection covers failures at execution; it does not extend to a
+request the kernel rejects before running it at all. If <code>prep</code> refuses
+an SQE—a malformed argument, an unsupported flag—the core downgrades the hard link
+to an ordinary one and fails the whole chain, on the reasoning that a sequence
+built on an entry the kernel could not even parse is not a sequence the kernel
+will try to salvage. Two other per-SQE flags often accompany links.
+<code>IOSQE_CQE_SKIP_SUCCESS</code> suppresses the completion for a request that
+succeeds, so a long chain need not flood the completion queue with intermediate
+results the application does not care about—only the final step, or a failing one,
+posts a CQE. <code>IOSQE_ASYNC</code> forces a request onto the asynchronous worker
+path from the start, skipping the inline non-blocking attempt of &sect;3.1, which
+is occasionally worthwhile for an operation known to block. Internally a chain is
+recorded by <code>REQ_F_LINK</code> (and <code>REQ_F_HARDLINK</code>) state flags on
+the head request, which the submission code assembles as it walks the linked SQEs.
+</p>
+
+<p>
+Two related mechanisms round this out. <code>IOSQE_IO_DRAIN</code> marks an SQE as
+a <span class="key-term">barrier</span>: it will not start until all previously
+submitted operations have completed, and later operations wait for it, which lets
+an application insert a synchronization point into the stream. And a special
+operation, <code>IORING_OP_LINK_TIMEOUT</code>, attaches a
+<span class="key-term">timeout</span> to the request it is linked to, cancelling
+that request if it does not complete in time—the idiomatic way to bound the
+duration of an otherwise open-ended operation such as a socket receive. The
+standalone <code>IORING_OP_TIMEOUT</code> is more flexible still: its
+<code>timeout_flags</code> choose between a relative and an absolute deadline
+(<code>IORING_TIMEOUT_ABS</code>), select the clock to measure against
+(<code>IORING_TIMEOUT_BOOTTIME</code> or <code>IORING_TIMEOUT_REALTIME</code>), and
+can even re-arm repeatedly (<code>IORING_TIMEOUT_MULTISHOT</code>) to fire at an
+interval. Two further flags matter to a program that must adjust a deadline it has
+already set: <code>IORING_TIMEOUT_UPDATE</code>, and
+<code>IORING_LINK_TIMEOUT_UPDATE</code> for the linked variety, turn the operation
+into a request to modify an armed timeout in place rather than to arm a new one,
+so a server can extend or shorten a pending deadline without the
+cancel-and-resubmit race that would otherwise be needed. A third,
+<code>IORING_TIMEOUT_ETIME_SUCCESS</code>, reports an expiry as a success rather
+than as <code>-ETIME</code>, which spares an application from treating its own
+intended timeout as an error. Together, linking, draining, and timeouts let an application express
+ordering, synchronization, and deadlines entirely within the submission queue,
+keeping even complex I/O sequences off the system-call path. Figure 24-6 contrasts
+the three arrangements—independent operations, a linked chain, and a drain
+barrier.
+</p>
+
+<figure>
+<svg viewBox="0 0 900 470" role="img" aria-labelledby="fig24-6-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig24-6-title">Figure 24-6. Independent, Linked, and Drained Operations</title>
+<defs><marker id="e226" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="868" height="438" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="450" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-6. Independent, Linked, and Drained Operations</text>
+
+<!-- Row 1: independent -->
+<text x="40" y="96" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#2563eb">Independent (default)</text>
+<text x="40" y="112" font-family="Inter,sans-serif" font-size="9" fill="#475569">no flags &#8212; may run concurrently, complete in any order</text>
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="300" y="82" width="110" height="40" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="355" y="106">SQE A</text>
+<rect x="450" y="82" width="110" height="40" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="505" y="106">SQE B</text>
+<rect x="600" y="82" width="110" height="40" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="655" y="106">SQE C</text>
+</g>
+
+<!-- Row 2: linked -->
+<text x="40" y="196" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#16a34a">Linked (IOSQE_IO_LINK)</text>
+<text x="40" y="212" font-family="Inter,sans-serif" font-size="9" fill="#475569">run in order; each waits for</text>
+<text x="40" y="224" font-family="Inter,sans-serif" font-size="9" fill="#475569">the previous to succeed</text>
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="300" y="182" width="110" height="40" rx="7" fill="#dcfce7" stroke="#16a34a"/><text x="355" y="200">SQE A</text><text x="355" y="214" font-size="8" font-weight="400" fill="#475569">IO_LINK</text>
+<rect x="450" y="182" width="110" height="40" rx="7" fill="#dcfce7" stroke="#16a34a"/><text x="505" y="200">SQE B</text><text x="505" y="214" font-size="8" font-weight="400" fill="#475569">IO_LINK</text>
+<rect x="600" y="182" width="110" height="40" rx="7" fill="#dcfce7" stroke="#16a34a"/><text x="655" y="206">SQE C</text>
+</g>
+<g stroke="#16a34a" stroke-width="1.6" fill="none">
+<line x1="410" y1="202" x2="450" y2="202" marker-end="url(#e226)"/>
+<line x1="560" y1="202" x2="600" y2="202" marker-end="url(#e226)"/>
+</g>
+<text x="740" y="198" font-family="Inter,sans-serif" font-size="8.5" fill="#dc2626" font-weight="700">if A or B fails,</text>
+<text x="740" y="210" font-family="Inter,sans-serif" font-size="8.5" fill="#dc2626">the rest is cancelled</text>
+
+<!-- Row 3: drain -->
+<text x="40" y="316" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#a16207">Drain barrier (IOSQE_IO_DRAIN)</text>
+<text x="40" y="332" font-family="Inter,sans-serif" font-size="9" fill="#475569">D waits for all earlier ops;</text>
+<text x="40" y="344" font-family="Inter,sans-serif" font-size="9" fill="#475569">later ops wait for D</text>
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="300" y="300" width="90" height="40" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="345" y="324">A, B</text>
+<rect x="430" y="300" width="130" height="40" rx="7" fill="#fef9c3" stroke="#ca8a04"/><text x="495" y="318">SQE D</text><text x="495" y="332" font-size="8" font-weight="400" fill="#475569">IO_DRAIN barrier</text>
+<rect x="600" y="300" width="90" height="40" rx="7" fill="#dbeafe" stroke="#2563eb"/><text x="645" y="324">E, F</text>
+</g>
+<g stroke="#ca8a04" stroke-width="1.6" fill="none">
+<line x1="390" y1="320" x2="430" y2="320" marker-end="url(#e226)"/>
+<line x1="560" y1="320" x2="600" y2="320" marker-end="url(#e226)"/>
+</g>
+
+<!-- separators -->
+<line x1="40" y1="146" x2="860" y2="146" stroke="#e2e8f0" stroke-width="1"/>
+<line x1="40" y1="256" x2="860" y2="256" stroke="#e2e8f0" stroke-width="1"/>
+<text x="450" y="392" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">without flags, submitted operations are independent; IOSQE_IO_LINK orders them into a failure-breakable chain; IOSQE_IO_DRAIN makes one a barrier</text>
+</svg>
+<figcaption>Figure 24-6. Independent, linked, and drained operations — by default the SQEs in a submission are independent and may run concurrently and complete in any order (top). Setting IOSQE_IO_LINK on each SQE but the last chains them so they run strictly in order, each starting only after its predecessor succeeds and the remainder cancelled if one fails (middle); IOSQE_IO_HARDLINK is the variant that continues the chain even on failure. Setting IOSQE_IO_DRAIN marks an SQE as a barrier that waits for all earlier operations and that all later operations wait on (bottom).</figcaption>
+</figure>
+
+<h3 id="misc">Ring Messaging, Futexes, and Cancellation</h3>
+
+<p>
+A few further operations show how far the ring model has been stretched.
+<code>IORING_OP_MSG_RING</code> (<code class="file-path">io_uring/msg_ring.c</code>)
+lets one io_uring instance post a completion directly into
+<em>another</em>'s completion queue, giving threads a fast, kernel-mediated way to
+pass messages or hand off work between their rings without a separate IPC
+mechanism. It has two modes: posting a data word as a CQE into the target ring,
+and transferring a registered file descriptor from one ring's table to another's,
+which lets an acceptor thread hand connections to worker threads entirely through
+io_uring. Two flags tune the handoff:
+<code>IORING_MSG_RING_CQE_SKIP</code> suppresses the completion in the
+<em>target</em> ring, which is what a sender uses when the file descriptor itself
+is the whole message and a notification would only add work, and
+<code>IORING_MSG_RING_FLAGS_PASS</code> lets the sender choose the CQE flags the
+target sees, so a protocol can be carried in the flag bits rather than in a second
+message.
+</p>
+
+<p>
+<span class="key-term">Futex</span> operations
+(<code class="file-path">io_uring/futex.c</code>) let a request wait on a futex
+(Chapter 19) asynchronously—<code>IORING_OP_FUTEX_WAIT</code> and
+<code>FUTEX_WAKE</code>, and the vectored <code>FUTEX_WAITV</code> that waits on
+several at once—so that waiting for a lock can be folded into the same completion
+loop as I/O rather than blocking a thread. <code>IORING_OP_WAITID</code> does the
+same for process reaping: the classic <code>waitid</code> blocks a thread until a
+child changes state, and a server that supervises child processes has
+traditionally had to dedicate a thread or a signal handler to the job. As a ring
+operation it becomes one more completion among the rest.
+</p>
+
+<p>
+<code>IORING_OP_ASYNC_CANCEL</code> (<code class="file-path">io_uring/cancel.c</code>)
+lets an application cancel a previously submitted request by its
+<code>user_data</code>—essential for a server that must abandon operations when a
+connection closes or a deadline passes. Its flags widen the match beyond a single
+key: <code>IORING_ASYNC_CANCEL_ALL</code> cancels every request that matches rather
+than the first, <code>IORING_ASYNC_CANCEL_FD</code> matches by file descriptor
+(so closing a connection can cancel all of its outstanding operations at once),
+<code>IORING_ASYNC_CANCEL_OP</code> matches by opcode, and
+<code>IORING_ASYNC_CANCEL_ANY</code> matches everything and is for that reason
+rejected in combination with the descriptor or opcode criteria, since a match that
+already ignores every key cannot also be narrowed by one.
+<code>IORING_ASYNC_CANCEL_FD_FIXED</code> is the
+registered-descriptor form of the file-descriptor match, needed because a direct
+descriptor (&sect;6.1) is an index into the ring's own table rather than a number the
+task's descriptor table would recognize, and
+<code>IORING_ASYNC_CANCEL_USERDATA</code> restores the key match that the others
+displace: matching on <code>user_data</code> is the default, but naming a
+descriptor or an opcode silently turns it off, so an application that wants both
+criteria applied has to ask for the first one back. Cancellation
+is also available outside the ring: <code>IORING_REGISTER_SYNC_CANCEL</code>
+performs the same matching synchronously through
+<code>io_uring_register</code>, waiting for the outcome rather than reporting it
+as a completion, which suits teardown paths that must know the request is gone
+before they release the memory it referenced. These operations, none of
+them classic &ldquo;I/O,&rdquo; illustrate the trajectory of the whole subsystem:
+the shared ring began as a way to submit disk reads and has become a general
+mechanism for asking the kernel to do work asynchronously, of almost any kind.
+</p>
+
+<hr>
+<h2 id="nosyscall">Submitting Without System Calls</h2>
+
+<p class="chapter-intro">
+Batching already reduces io_uring to roughly one system call per group of
+operations, but the interface can go further and eliminate the submission system
+call entirely, and it must also cope with operations that genuinely have to
+block. Two complementary mechanisms address these: a dedicated thread that polls the
+submission queue so the application never calls into the kernel to submit, and a
+pool of worker threads that carry out operations that cannot complete inline.
+Figure 24-7 shows how both fit into the submission path. This section describes
+both.
+</p>
+
+<p>
+The two mechanisms sit on different axes and are independent of each other. SQPOLL
+attacks the <em>submission</em> cost, removing the system call that hands queued
+SQEs to the kernel; io-wq attacks the <em>blocking</em> problem, giving the kernel
+somewhere to run operations that cannot finish inline. A ring may use either, both,
+or neither: a latency-sensitive server might enable SQPOLL and rarely touch io-wq,
+while a program doing large buffered reads might lean on io-wq without ever polling.
+Understanding them together completes the picture of how a request reaches the
+kernel and how it runs once there.
+</p>
+
+<h3 id="sqpoll">Submission-Queue Polling</h3>
+
+<p>
+In its most aggressive mode, io_uring removes the submission system call
+altogether. When an instance is created with the
+<code>IORING_SETUP_SQPOLL</code> flag, the kernel spawns a dedicated thread,
+<code>io_sq_thread</code> (<code class="file-path">io_uring/sqpoll.c</code>), that
+<span class="key-term">polls</span> the submission queue's tail and picks up new
+SQEs as the application writes them—so the application submits work merely by
+writing an SQE and advancing the tail in shared memory, with no
+<code>io_uring_enter</code> call at all. On a busy ring this drives the per-operation
+system-call cost to zero, the ultimate expression of the shared-ring idea. The
+obvious risk—a thread spinning forever—is managed by an idle timeout: after
+<code>sq_thread_idle</code> milliseconds without new work—one second if the
+application asks for zero—the poll thread sleeps,
+and it sets the <code>IORING_SQ_NEED_WAKEUP</code> flag in the shared ring to tell
+the application it has done so. The application checks that flag and, only when it
+is set, makes one <code>io_uring_enter</code> call with
+<code>IORING_ENTER_SQ_WAKEUP</code> to wake the thread—so the syscall reappears
+only when the ring has gone idle, never on the hot path. The thread can be pinned
+to a chosen CPU, and several rings can share one poll thread with
+<code>IORING_SETUP_ATTACH_WQ</code>, naming an existing ring through the
+<code>wq_fd</code> field, to avoid dedicating a core to each; a shared thread takes
+the <em>largest</em> idle timeout of the rings it serves, so the most patient ring
+sets the sleep threshold for all of them. The flag's name is a historical artifact:
+it once attached the worker pool of &sect;5.2 as well, but because that pool is now
+per-task and therefore shared among a task's rings automatically, the flag governs
+only the poll thread. Passing it without <code>IORING_SETUP_SQPOLL</code> does
+nothing but validate the descriptor, a check retained so that old programs still
+receive the errors they expect.
+</p>
+
+<p>
+A few details fill in how the thread is managed, and the first corrects a natural
+assumption: it is not a kernel thread in the usual sense. It is created by
+<code>create_io_thread</code> (<code class="file-path">kernel/fork.c</code>), which
+clones the calling task with <code>CLONE_VM</code>, <code>CLONE_FS</code>,
+<code>CLONE_FILES</code>, <code>CLONE_SIGHAND</code>, and <code>CLONE_THREAD</code>
+and marks the result <code>PF_IO_WORKER</code>. The poll thread is therefore a
+<em>thread of the submitting process</em>—sharing its address space, its file
+table, and its credentials—that simply never returns to user mode. That is not a
+detail of bookkeeping: it is the whole reason such a thread can issue a request on
+the application's behalf and have the result be identical to one the application
+issued itself, a property &sect;5.2 relies on again for the worker pool. It appears
+in the thread list as <code>iou-sqp-&lt;pid&gt;</code> and loops polling one or
+more rings, calling <code>cond_resched</code> so it does not monopolize its CPU and
+honoring signals so it can be stopped. The shared state for
+a poll thread is a <code>struct io_sq_data</code>
+(<code class="file-path">io_uring/sqpoll.h</code>): it holds a reference count, the
+list of rings the thread serves, the thread pointer, and the target CPU, so that
+<code>IORING_SETUP_ATTACH_WQ</code> is implemented simply by having a second ring
+join an existing <code>io_sq_data</code> rather than create its own thread.
+Operations that must reconfigure or tear down the ring &ldquo;park&rdquo; the poll
+thread first (<code>io_sq_thread_park</code>/<code>io_sq_thread_unpark</code>),
+stopping it at a safe point so the ring is not being polled while it changes. Pinning
+the thread to a CPU (<code>sq_thread_cpu</code>, valid only with
+<code>IORING_SETUP_SQ_AFF</code>) keeps it off the application's own cores; without
+that flag <code>sq_thread_cpu</code> is -1 and the thread is left free to run on
+any online CPU, migrating like any other thread rather than favoring one core by
+default. Because a
+poll thread is a standing thread that can busy-wait, creating an SQPOLL ring
+is gated by the <code>security_uring_sqpoll</code> LSM hook of &sect;8.1, and the
+mode is best reserved for workloads busy enough to justify a core spinning on their
+behalf—on a lightly loaded ring the thread mostly sleeps and the polling buys
+nothing.
+</p>
+
+<p>
+One poll thread can serve several rings at once, and the loop that drives it
+(<code>io_sq_thread</code>) is written to keep any one of them from starving the
+rest. Each pass walks every ring the thread serves and, whenever more than one
+ring is attached, caps the number of SQEs it will pull from a single ring's queue
+in that pass to eight (<code>IORING_SQPOLL_CAP_ENTRIES_VALUE</code>)—a ring
+that has queued a thousand operations is drained eight at a time, interleaved
+with its neighbors, rather than monopolizing the thread until it is empty. The
+same pass also runs the thread's own pending task work, again capped, this time
+at thirty-two entries per iteration, and, for a ring configured with the busy-poll
+receive path of &sect;7.3, calls <code>io_napi_sqpoll_busy_poll</code> to poll its
+registered NAPI IDs for incoming network completions—so the one thread that
+polls the submission queue also ends up polling the receive side for any ring
+that asked for it, rather than leaving that to a second mechanism. Requests are
+issued under the credentials captured when the ring was created
+(<code>ctx-&gt;sq_creds</code>), overridden for the duration of each pass if they
+differ from the poll thread's own, so a ring's operations run with the identity
+of whoever set it up even if the descriptor is later handed to another process.
+</p>
+
+<h3 id="iowq">The Async Worker Pool</h3>
+
+<p>
+Polling removes the submission syscall, but some operations still cannot complete
+without blocking, and something must run them without stalling the submitter. That
+something is <span class="key-term">io-wq</span>
+(<code class="file-path">io_uring/io-wq.c</code>), io_uring's own pool of worker
+threads. When the kernel determines a request must block and cannot be
+handled by a readiness poll, it hands the request to io-wq, whose workers execute
+it—blocking as needed in their own context—and post its completion when it
+finishes. The pool creates workers <span class="key-term">on demand</span> and
+retires them when idle, so a program that never blocks spawns none. It separates
+workers into two accounts, <span class="key-term">bounded</span> and
+<span class="key-term">unbounded</span> (<code>IO_WQ_ACCT_BOUND</code> and
+<code>IO_WQ_ACCT_UNBOUND</code>): bounded work is I/O that will finish in a
+predictable time, such as a disk read, and its worker count is capped to prevent a
+flood of slow disk operations from spawning unlimited threads; unbounded work is
+open-ended, such as waiting on a network receive, and is allowed more workers. The
+choice between them is not a guess but a property of the request, decided in
+<code>io_prep_async_work</code>: a request on a regular file is bounded, and a
+request on anything else is marked unbounded when its entry in the operation table
+of &sect;3.1 sets <code>unbound_nonreg_file</code>—the bit exists precisely so that
+a read from a socket and a read from a file, which share an opcode, can land in
+different accounts. The
+pool belongs not to a process but to a single <em>task</em>—a
+<code>struct io_uring_task</code> hangs off <code>task_struct-&gt;io_uring</code>,
+one per thread that has ever used io_uring, and a request's <code>tctx</code> field
+is set to <code>current-&gt;io_uring</code> at the moment it is prepared for
+submission. That distinction matters on an SQPOLL ring: submission there happens
+inside the poll thread, not the application thread, so a request punted to io-wq
+from an SQPOLL ring runs through the <em>poll thread's own</em> worker pool, entirely
+separate from any pool the application's thread would use if it also issued io_uring
+calls directly. <code>IORING_REGISTER_IOWQ_AFF</code> and
+<code>IORING_REGISTER_IOWQ_MAX_WORKERS</code> account for this transparently: on an
+SQPOLL ring both operations park the poll thread first, look up its task, and
+apply the change to its pool instead of the calling process's—so an
+application configuring an SQPOLL ring's worker limits is, without needing to know
+it, reaching into a different thread's task context to do so. Between
+SQPOLL removing the submission syscall and io-wq absorbing the operations that must
+block, io_uring can keep a program's own threads entirely free of I/O waits.
+</p>
+
+<p>
+The pool's size and placement are tunable, because unbounded worker growth would
+itself be a problem. Each account has a <code>max_workers</code> cap that bounds
+how many workers it will create (<code>nr_workers</code> tracked against it in
+<code class="file-path">io_uring/io-wq.c</code>). The two defaults are chosen on
+different principles. The bounded cap is the smaller of the ring's queue depth and
+four times the number of online CPUs, on the reasoning that a ring can never have
+more work outstanding than it has submission slots, and that beyond a few workers
+per CPU more threads only add contention. The unbounded cap is the calling task's
+<code>RLIMIT_NPROC</code>, which is to say the pool declines to invent a new limit
+and reuses the one the administrator already set on the process. An application can
+raise or lower both with the <code>IORING_REGISTER_IOWQ_MAX_WORKERS</code>
+operation of <code>io_uring_register</code>, passing a two-element array whose
+entries are clamped to <code>RLIMIT_NPROC</code> and which is rewritten with the
+previous values, so that passing zeroes queries the current caps without changing
+them. <code>IORING_REGISTER_IOWQ_AFF</code> restricts which CPUs the workers may
+run on. A worker (shown as <code>iou-wrk-&lt;pid&gt;</code>) is created on
+demand by <code>create_io_worker</code> when work arrives and no idle worker is
+free, and reclaimed after it sits idle. It is built by the same
+<code>create_io_thread</code> that produces the poll thread of &sect;5.1, and so is
+likewise a thread of the submitting process rather than a kernel thread. That is
+what allows a worker to run the operation in the <em>submitting task's</em>
+context—its memory map, its credentials, its file table—so that a blocking read or
+an <code>openat</code> punted to io-wq resolves relative paths, checks permissions,
+and consumes resource limits exactly as it would have had the owning task made
+the call itself. Requests reach the pool
+through <code>io_wq_enqueue</code>, either because the core could not poll the file
+for readiness or because the application set <code>IOSQE_ASYNC</code> (&sect;4.2) to
+force the async path from the outset.
+</p>
+
+<p>
+One more behavior of the pool matters for correctness rather than performance.
+Workers run independently, so nothing would otherwise stop two buffered writes to
+the same file from executing at once and interleaving—an outcome the write path
+of Chapter 12 does not permit when the calls are made directly. io-wq solves this
+by <em>hashing</em>: a request whose operation-table entry sets
+<code>hash_reg_file</code> is stamped with a hash of its target inode, and the pool
+guarantees that only one item of a given hash runs at a time, queueing the rest
+behind it while unhashed work continues to run freely. The serialization is skipped
+where the filesystem does not need it—a direct-I/O write to a file whose
+operations advertise <code>FOP_DIO_PARALLEL_WRITE</code> is left unhashed and may
+proceed in parallel—and it is applied unconditionally on an
+<code>IORING_SETUP_IOPOLL</code> ring. This is the missing half of the
+<code>hash_reg_file</code> property bit: the table marks the operation, and io-wq
+enforces what the mark means.
+</p>
+
+<figure>
+<svg viewBox="0 0 820 400" role="img" aria-labelledby="fig24-7-title" style="max-width:740px; width:100%; height:auto;">
+<title id="fig24-7-title">Figure 24-7. The Submission and Async Paths</title>
+<defs><marker id="e227" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="780" height="360" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="410" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 24-7. The Submission and Async Paths</text>
+
+<rect x="300" y="76" width="220" height="44" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="410" y="94" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">application writes SQE</text><text x="410" y="110" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">advances SQ tail in shared memory</text>
+
+<rect x="190" y="168" width="200" height="52" rx="8" fill="#ede9fe" stroke="#7c3aed"/><text x="290" y="188" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">SQPOLL thread</text><text x="290" y="204" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">polls the tail; no syscall</text>
+<rect x="430" y="168" width="200" height="52" rx="8" fill="#fef9c3" stroke="#ca8a04"/><text x="530" y="188" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">io_uring_enter</text><text x="530" y="204" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">default: one call submits a batch</text>
+
+<rect x="300" y="256" width="220" height="44" rx="8" fill="#f1f5f9" stroke="#64748b"/><text x="410" y="274" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">issue the operation</text><text x="410" y="290" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">via the per-opcode table</text>
+
+<rect x="120" y="256" width="150" height="44" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="195" y="274" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">inline complete</text><text x="195" y="289" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">non-blocking fast path</text>
+<rect x="560" y="256" width="180" height="44" rx="8" fill="#fee2e2" stroke="#dc2626"/><text x="650" y="274" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">io-wq worker</text><text x="650" y="289" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">runs blocking work</text>
+
+<rect x="300" y="340" width="220" height="30" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="410" y="359" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">post CQE</text>
+
+<g stroke="#334155" stroke-width="1.3" fill="none">
+<line x1="330" y1="120" x2="330" y2="144"/>
+<line x1="330" y1="144" x2="290" y2="144"/>
+<line x1="290" y1="144" x2="290" y2="168" marker-end="url(#e227)"/>
+<line x1="490" y1="120" x2="490" y2="144"/>
+<line x1="490" y1="144" x2="530" y2="144"/>
+<line x1="530" y1="144" x2="530" y2="168" marker-end="url(#e227)"/>
+<line x1="290" y1="220" x2="290" y2="238"/>
+<line x1="290" y1="238" x2="360" y2="238"/>
+<line x1="360" y1="238" x2="360" y2="256" marker-end="url(#e227)"/>
+<line x1="530" y1="220" x2="530" y2="238"/>
+<line x1="530" y1="238" x2="460" y2="238"/>
+<line x1="460" y1="238" x2="460" y2="256" marker-end="url(#e227)"/>
+<line x1="300" y1="278" x2="270" y2="278" marker-end="url(#e227)"/>
+<line x1="520" y1="278" x2="560" y2="278" marker-end="url(#e227)"/>
+<line x1="195" y1="300" x2="195" y2="325"/>
+<line x1="195" y1="325" x2="360" y2="325"/>
+<line x1="360" y1="325" x2="360" y2="340" marker-end="url(#e227)"/>
+<line x1="650" y1="300" x2="650" y2="325"/>
+<line x1="650" y1="325" x2="460" y2="325"/>
+<line x1="460" y1="325" x2="460" y2="340" marker-end="url(#e227)"/>
+</g>
+<text x="410" y="394" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">submission reaches the kernel via SQPOLL (no syscall) or io_uring_enter; blocking work is punted to an io-wq worker</text>
+</svg>
+<figcaption>Figure 24-7. The submission and async paths — an application publishes an SQE into shared memory, from where either a polling thread (SQPOLL) picks it up with no system call, or a single io_uring_enter submits a batch. Each operation is issued through the per-opcode table; one that can complete without blocking finishes inline on the fast path, while one that must block is handed to an io-wq worker thread. Both paths end by posting a CQE.</figcaption>
+</figure>
+
+<hr>
+<h2 id="registered">Registered Resources</h2>
+
+<p class="chapter-intro">
+Even with batching and polling, each operation still carries small per-call
+overheads: looking up a file descriptor, pinning a user buffer's pages so the
+kernel can do I/O into it, choosing where a received packet should land. For
+applications that reuse the same files and buffers across millions of operations,
+io_uring lets these costs be paid <em>once</em>, in advance, through the third
+system call, <code>io_uring_register</code>. This section covers the two forms:
+resources the application pre-registers, and buffers it provides for the kernel to
+choose among.
+</p>
+
+<p>
+<code>io_uring_register(fd, opcode, arg, nr_args)</code> is a multiplexed call: its
+<code>opcode</code> selects among a long menu of registration operations—for files,
+buffers, the ring descriptor, an eventfd, worker limits, buffer rings, and
+more—each acting on the instance named by <code>fd</code>. What the registrations
+have in common is that they move a recurring per-operation cost to a
+<em>one-time</em> setup cost, trading a little rigidity (the resources must be
+declared and are pinned in advance) for a large per-I/O saving. The internal
+bookkeeping is shared: registered resources are held as reference-counted resource
+nodes (<code>struct io_rsrc_node</code>, <code class="file-path">io_uring/rsrc.c</code>)
+so that an in-flight operation keeps the file or buffer it uses alive even if the
+table is updated underneath it.
+</p>
+
+<h3 id="fixed">Registered Files and Buffers</h3>
+
+<p>
+The <code>io_uring_register</code> call
+(<code class="file-path">io_uring/register.c</code>, <code class="file-path">rsrc.c</code>)
+lets an application hand the kernel a set of resources to hold ready.
+<span class="key-term">Registered files</span> (<code>IORING_REGISTER_FILES</code>)
+install a fixed table of file descriptors in the instance; an SQE then refers to a
+file by its <em>index</em> in that table, with the <code>IOSQE_FIXED_FILE</code>
+flag set, and the kernel skips the descriptor lookup and reference counting it
+would otherwise do on every operation. <span class="key-term">Registered
+buffers</span> (<code>IORING_REGISTER_BUFFERS</code>) pin a set of user memory
+buffers once, so that the fixed-variant operations <code>READ_FIXED</code> and
+<code>WRITE_FIXED</code> can do I/O directly into them without the kernel pinning
+and unpinning pages (the <code>pin_user_pages()</code> work of Chapter 9, Section 11) on each
+call, up to 16,384 buffers and 1 GiB apiece in this kernel
+(<code>IORING_MAX_REG_BUFFERS</code>, <code>io_validate_user_buf_range</code>); a
+fixed-file table holds up to 1,048,576 entries
+(<code>IORING_MAX_FIXED_FILES</code>). Because pinning locks memory, the total is
+charged against <code>RLIMIT_MEMLOCK</code>—but against the calling
+<em>user</em>, not the process: <code>__io_account_mem</code> tracks pinned pages
+in <code>user-&gt;locked_vm</code>, keyed by the real UID the ring was created
+under, so two processes running as the same user draw on one shared budget rather
+than each getting the limit to themselves, and nothing here checks
+<code>CAP_IPC_LOCK</code> to waive it. A second counter,
+<code>mm_account-&gt;pinned_vm</code> on the creating process's own
+<code>mm_struct</code>, is updated alongside purely so the pinning shows up in
+that process's <code>/proc/pid/status</code> the same way an ordinary
+<code>mlock</code> would, even though the enforced limit lives with the user. The
+internal bookkeeping is a set of resource nodes
+and mapped-buffer descriptors (<code>struct io_rsrc_node</code>,
+<code>struct io_mapped_ubuf</code>, <code class="file-path">io_uring/rsrc.c</code>).
+The interface also allows the ring descriptor itself to be registered
+(<code>IORING_REGISTER_RING_FDS</code>), removing the descriptor lookup from
+<code>io_uring_enter</code>, and an eventfd to be registered
+(<code>IORING_REGISTER_EVENTFD</code>) so a classic poll loop can be notified when
+completions arrive. Registration turns the recurring per-operation setup into a
+one-time cost, which for a busy server is a substantial saving.
+</p>
+
+<p>
+The fixed-file table is more than a lookup cache; it enables
+<span class="key-term">direct descriptors</span>, file references that live only
+inside io_uring and never occupy a slot in the process's ordinary descriptor
+table. An <code>openat</code> or <code>accept</code> submitted with a
+<code>file_index</code> installs its result straight into a fixed-table slot
+instead of returning a number, and passing the sentinel
+<code>IORING_FILE_INDEX_ALLOC</code> asks the kernel to choose a free slot and
+report it—so a server can accept a connection and use it in later operations
+without ever holding a normal file descriptor for it, sidestepping the per-process
+descriptor limit and the cost of installing into the fd table. Automatic
+allocation can be confined to part of the table with
+<code>IORING_REGISTER_FILE_ALLOC_RANGE</code>, which takes a
+<code>struct io_uring_file_index_range</code> and restricts the kernel's choice to
+a half-open span of slots, letting an application reserve the rest for indices it
+assigns itself. When a direct descriptor must eventually become an ordinary one—
+to hand to a library that knows nothing of io_uring—<code>IORING_OP_FIXED_FD_INSTALL</code>
+(&sect;4.1) installs it into the descriptor table on demand. Registered tables
+are also <span class="key-term">dynamic</span>: an application need not re-register
+the whole set to change it. The update operations
+(<code>IORING_REGISTER_FILES_UPDATE</code>, and the versioned
+<code>_FILES2</code>/<code>_BUFFERS2</code> and their updates) replace individual
+slots in place, a table may be created <span class="key-term">sparse</span> with
+<code>IORING_RSRC_REGISTER_SPARSE</code> and filled in later, and each entry can
+carry a <em>tag</em> whose completion notifies the application when an updated
+resource is finally free to reuse. This lets a long-running server rotate files
+and buffers through a fixed table without tearing it down. A related operation
+avoids duplicated work between rings: <code>IORING_REGISTER_CLONE_BUFFERS</code>
+copies a range of registered buffers from another ring, named by
+<code>src_fd</code> in a <code>struct io_uring_clone_buffers</code>, into this
+one's table, so a process that runs a ring per thread pins the underlying pages
+once rather than once per ring—the pages are not pinned a second time, only
+the resource nodes are duplicated and the existing ones' reference counts rise.
+Two flags refine the copy: <code>IORING_REGISTER_SRC_REGISTERED</code> says
+<code>src_fd</code> is itself a registered ring descriptor rather than an
+ordinary one, letting the source be named the same way this section's own
+<code>IORING_REGISTER_RING_FDS</code> names this ring; <code>IORING_REGISTER_DST_REPLACE</code>
+permits the destination table to already hold entries, which without the flag is
+an error, so that cloning into a table only ever populates empty slots unless the
+caller explicitly asks to overwrite them.
+</p>
+
+<h3 id="provided">Provided Buffers and Buffer Selection</h3>
+
+<p>
+Registered buffers solve the pinning cost but not a subtler problem specific to
+<em>receiving</em> data: when a server posts many concurrent receives, it does not
+know which will complete first, so committing a distinct buffer to each ties up
+memory in proportion to the number of outstanding receives. io_uring's answer is
+<span class="key-term">provided buffers</span>. The application hands the kernel a
+pool of buffers—through the <code>IORING_OP_PROVIDE_BUFFERS</code> operation, or,
+more efficiently, a ring-mapped buffer pool registered with
+<code>IORING_REGISTER_PBUF_RING</code>—and submits its receives with the
+<code>IOSQE_BUFFER_SELECT</code> flag but <em>no</em> assigned buffer. The kernel
+then <span class="key-term">picks a buffer from the pool at completion time</span>,
+only when data has actually arrived (<code>io_buffer_select</code>,
+<code class="file-path">io_uring/kbuf.c</code>), and reports which buffer it used in
+the CQE's <code>flags</code> via <code>IORING_CQE_F_BUFFER</code>. A server can
+thus keep thousands of receives outstanding backed by a modest shared pool,
+because a buffer is consumed only by a receive that actually completes. This is a
+decisive optimization for high-connection-count network servers, and it is the
+kind of refinement—matching the interface to the real access pattern—that
+distinguishes io_uring's networking support from a mechanical port of the socket
+calls.
+</p>
+
+<p>
+The ring-mapped form is how modern code uses this feature, and its protocol is
+the one already familiar from the submission queue. <code>IORING_REGISTER_PBUF_RING</code> sets up, per buffer group, a
+<span class="key-term">buffer ring</span>—a small shared ring of
+<code>struct io_uring_buf</code> descriptors (a buffer group's ring is itself
+mapped by <code>mmap</code>, at an offset derived from
+<code>IORING_OFF_PBUF_RING</code> and the group id, when the application asks the
+kernel to allocate it with <code>IOU_PBUF_RING_MMAP</code>; otherwise the
+application supplies the memory, just as <code>IORING_SETUP_NO_MMAP</code> lets it
+supply the main rings in &sect;2.1). The application fills this
+ring with addresses and lengths of buffers it owns and advances the ring's tail;
+the kernel consumes an entry when it needs a landing buffer for a completing
+receive, exactly as in the SQ/CQ protocol of &sect;2.3, so replenishing buffers no
+longer costs a system call or an SQE. When the operation completes, the CQE's
+<code>flags</code> carry <code>IORING_CQE_F_BUFFER</code> and the chosen buffer's
+id in the high bits above <code>IORING_CQE_BUFFER_SHIFT</code>; the application
+reads the data from that buffer and, when done, returns it to the ring for reuse.
+A buffer group registered with <code>IOU_PBUF_RING_INC</code> is consumed
+<em>incrementally</em>, which inverts the usual relationship between buffers and
+completions: rather than each completion claiming a whole buffer, successive
+completions fill one buffer from where the last left off, and the kernel sets
+<code>IORING_CQE_F_BUF_MORE</code> to say that the buffer named in this CQE is
+only partly used and will appear again. The application does not need to be told
+separately how much of the buffer is left: <code>io_kbuf_commit</code> advances
+the buffer-ring entry's <code>addr</code> and shrinks its <code>len</code> in
+place after every completion, so the same entry the application already has
+mapped simply describes a smaller remaining span each time it is consulted, until
+it is exhausted and the ring moves on to the next buffer. A registration can also
+set a floor, <code>min_left</code>, below which the kernel retires a buffer early
+rather than trying to land one more small completion in an impractically small
+remainder—a buffer with a hundred bytes free and a
+<code>min_left</code> of a hundred is abandoned for the next one instead of being
+offered for a read that would almost certainly need splitting again. A server
+reading a stream therefore stops
+wasting the tail of a large buffer on a small arrival. An application can also ask where the
+kernel has reached in a group with <code>IORING_REGISTER_PBUF_STATUS</code>, which
+returns that ring's <code>head</code>; since the application owns the tail, the
+difference tells it how many buffers are still unconsumed, which is what a
+replenishment loop needs and cannot otherwise discover. Because a multi-shot receive (&sect;7.1) draws
+from the group for each arriving message, buffer rings and multi-shot together let
+a server absorb bursty input with almost no per-message bookkeeping. It is the clearest example in the chapter of io_uring co-designing the
+data path and the control path for one workload.
+</p>
+
+<hr>
+<h2 id="advanced">Advanced Completion and Networking</h2>
+
+<p class="chapter-intro">
+The features so far make io_uring fast; the ones in this section make it fast for
+the hardest workloads—accepting thousands of connections, polling many sockets,
+sending data without copying it, and driving devices directly. They fall into
+three groups: completion modes that let one submission yield many completions,
+modes that minimize completion overhead for latency-critical work, and the
+networking and passthrough operations that exploit them. This section surveys each.
+Where the earlier sections made the <em>common</em> path cheap, these features
+target the extremes—the highest connection counts, the lowest storage latencies,
+and the largest transfers—so not every application needs them, but the ones that
+live at those extremes need them badly.
+</p>
+
+<h3 id="multishot">Multi-Shot Operations</h3>
+
+<p>
+Ordinarily one SQE yields one CQE: the request completes and is done. For
+operations an application repeats in a tight loop—accepting connection after
+connection, or waiting for a socket to become readable again and again—resubmitting
+an SQE per occurrence is wasteful. <span class="key-term">Multi-shot</span>
+operations remove that waste: a single SQE stays armed and produces a
+<em>stream</em> of CQEs, one per occurrence, until it is cancelled or errors. A
+multi-shot <code>POLL_ADD</code> reports every readiness transition—or every
+readiness <em>state</em>, if the application sets
+<code>IORING_POLL_ADD_LEVEL</code> to ask for level-triggered rather than the
+default edge-triggered semantics, the same distinction epoll draws—a multi-shot <code>ACCEPT</code> (<code>IORING_ACCEPT_MULTISHOT</code>) posts a
+CQE for every incoming connection, and a multi-shot <code>RECV</code> delivers
+each arriving message—each from one submission. The kernel signals that a multi-shot request
+remains armed by setting <code>IORING_CQE_F_MORE</code> in each CQE's flags; when
+that flag is finally clear, the request is finished. The same flag, and the same
+re-arming logic, also drive <code>READ_MULTISHOT</code> (&sect;4.1), the
+recurring timeout of &sect;4.2, a multi-shot <code>IORING_OP_URING_CMD</code>
+(&sect;7.3), and the zero-copy receive path (&sect;7.3)—accept, poll, and
+recv are only the operations an application is most likely to reach for first. A
+multi-shot receive is not optional about provided buffers: preparing one without
+<code>IOSQE_BUFFER_SELECT</code> is rejected outright, since the kernel has
+nowhere to land a message it cannot predict the size or timing of. Multi-shot
+pairs naturally
+with the provided buffers of &sect;6.2—a multi-shot receive draws a fresh buffer from
+the pool for each message—and together they let a server run its entire accept and
+receive loop with almost no resubmission at all. A plain multi-shot
+<code>RECV</code> (not <code>RECVMSG</code>) can additionally be given a total
+byte budget in the SQE's <code>optlen</code> field: each completion counts
+against it, and once the running total is exhausted the stream ends on its own,
+which is a way to bound how much a single armed receive is allowed to deliver
+without the application having to watch the count itself.
+</p>
+
+<p>
+Multi-shot is enabled per operation by a flag in the SQE's operation-specific word:
+<code>IORING_POLL_ADD_MULTI</code> for poll, <code>IORING_RECV_MULTISHOT</code> for
+receive, <code>IORING_ACCEPT_MULTISHOT</code> for accept. Underneath, its
+efficiency rests on io_uring's <span class="key-term">fast-poll</span> machinery
+(advertised as <code>IORING_FEAT_FAST_POLL</code>): rather than occupying a worker
+thread while waiting, an armed request registers interest in the file's readiness
+and is re-issued cheaply each time the file becomes ready, so a thousand idle
+multi-shot receives cost a thousand poll registrations, not a thousand threads. The
+trade-off is that a multi-shot stream is not unconditional. It ends—clearing
+<code>IORING_CQE_F_MORE</code>—not only on error but also when it cannot proceed,
+most commonly when a multi-shot receive's provided-buffer pool runs dry; the
+application must then replenish buffers and re-arm the request. A second, less
+obvious limit protects the rest of the ring: the completion-ring slot a
+multi-shot request writes into for each occurrence is filled through a helper
+(<code>io_req_post_cqe</code>) that, unlike an ordinary completion, does
+<em>not</em> fall back to the overflow list of &sect;2.3 when the ring is full. If
+posting fails, the stream does not lose that occurrence's result—it is
+instead delivered as the final, ordinary completion, which does get the overflow
+protection, and the multi-shot flag is simply left clear. So a fast producer
+racing ahead of a slow reaper does not corrupt or drop data, but it does convert a
+long-running stream back into a single completion the application must notice
+and explicitly re-arm; multi-shot trades resubmission cost for a duty to keep
+reaping. A receive that keeps finding more data ready on every retry is also
+capped against monopolizing one task-work pass: after thirty-two consecutive
+retries without yielding, the kernel forces the request to requeue rather than
+loop indefinitely, so one saturated socket cannot starve the rest of the ring's
+completions. Used with the buffer-pool and reaping limits in mind, multi-shot is
+the single most effective
+tool for a high-connection server.
+</p>
+
+<h3 id="lowlatency">Polled and Deferred Completion</h3>
+
+<p>
+For the lowest-latency workloads, io_uring offers completion modes that trade
+generality for speed, chosen by setup flags. <code>IORING_SETUP_IOPOLL</code> turns
+off interrupt-driven completion for direct block I/O and instead has the kernel
+<span class="key-term">busy-poll</span> the device for completions; on a fast NVMe
+drive this removes interrupt latency and overhead entirely, at the cost of a CPU
+spinning, and is how io_uring reaches the highest storage IOPS the hardware can
+sustain. That cost is the flag's whole drawback, and
+<code>IORING_SETUP_HYBRID_IOPOLL</code> exists to soften it: instead of spinning
+from the moment the request is issued, the kernel first sleeps for an estimate of
+how long the device will take and only then begins to poll. The estimate is
+learned rather than configured—<code>io_uring_hybrid_poll</code>
+(<code class="file-path">io_uring/rw.c</code>) measures how long each polled request
+actually ran and keeps the smallest figure it has seen, so a ring spanning devices
+of different speeds settles on the fastest one's latency and does not oversleep
+the others. The result recovers most of polling's latency benefit while returning
+the CPU to other work for the bulk of each request. A second group tunes the task-work completion path of &sect;3.2.
+<code>IORING_SETUP_COOP_TASKRUN</code> and <code>IORING_SETUP_DEFER_TASKRUN</code>
+control when and how deferred completions are run, batching them and running them
+only when the application asks for completions rather than interrupting it, which
+cuts the per-completion overhead for a single-threaded server. That last mode
+pairs with <code>IORING_SETUP_SINGLE_ISSUER</code>, a promise that only one task
+will submit to the ring, which lets the kernel drop synchronization it would
+otherwise need. These flags do not change what io_uring does, only how cheaply it
+delivers completions—but for a program bound by completion overhead, that is the
+whole game.
+</p>
+
+<p>
+A few operational details make these modes usable. <code>IORING_SETUP_IOPOLL</code>
+applies only to direct (O_DIRECT) block I/O on
+devices that support polled completion, and the restriction is enforced at
+submission time, not just in how completions are reaped: an opcode whose
+operation-table entry does not advertise polled completion is rejected outright
+on such a ring, so an IOPOLL instance cannot fall back to running an unsupported
+operation the ordinary, interrupt-driven way—it is a ring for polled I/O
+specifically, not a general-purpose ring with polling as an option. For
+operations it does accept, it changes how completions are reaped:
+instead of waiting for an interrupt, <code>io_uring_enter</code> with a
+<code>min_complete</code> actively polls the device, so the same call that would
+block for events instead spins until they arrive. The task-work flags form a
+spectrum of increasing commitment. <code>IORING_SETUP_COOP_TASKRUN</code> runs
+deferred completion work at the next natural kernel transition instead of forcing
+it with an inter-processor interrupt, cutting the disturbance to the running task.
+<code>IORING_SETUP_DEFER_TASKRUN</code> goes further, holding completions until the
+application explicitly asks for them (and thus requires
+<code>IORING_SETUP_SINGLE_ISSUER</code>, since only the one waiting task may run
+that work). To keep the application from missing deferred completions,
+<code>IORING_SETUP_TASKRUN_FLAG</code> makes the kernel raise
+<code>IORING_SQ_TASKRUN</code> in the shared flags (&sect;2.3) whenever such work is
+pending, so a program can cheaply check whether it must enter the kernel to reap.
+Together these let a carefully written single-threaded server pay almost nothing
+per completion beyond copying the CQE.
+</p>
+
+<h3 id="zerocopy">Networking, Zero-Copy, and Command Passthrough</h3>
+
+<p>
+Networking is where io_uring's advanced features come together
+(<code class="file-path">io_uring/net.c</code>). Beyond ordinary
+<code>send</code>/<code>recv</code> and <code>sendmsg</code>/<code>recvmsg</code>,
+it offers <span class="key-term">zero-copy send</span>
+(<code>IORING_OP_SEND_ZC</code>, <code>SENDMSG_ZC</code>): the kernel transmits
+directly from the application's buffer without copying it into a socket buffer
+first, a large saving for bulk transfers. Because the buffer must stay untouched
+until the network card has actually sent it, a zero-copy send produces a second,
+<span class="key-term">notification</span> completion—flagged
+<code>IORING_CQE_F_NOTIF</code> (<code class="file-path">io_uring/notif.c</code>)—that
+tells the application when the buffer is free to reuse. A matching zero-copy
+<em>receive</em> path (<code class="file-path">io_uring/zcrx.c</code>) and NAPI
+busy-poll integration (<code class="file-path">io_uring/napi.c</code>) push
+networking performance further still.
+</p>
+
+<p>
+Zero-copy send needs care over its two-completion protocol, because it is
+easy to misuse. The first CQE for a <code>SEND_ZC</code> reports the send's result
+as usual, but the application must <em>not</em> reuse or free the buffer yet: the
+kernel has only handed the pages to the network stack, which may still be
+transmitting from them. Only the second, <code>IORING_CQE_F_NOTIF</code> completion
+signals that the last reference to the buffer has been dropped and it is safe to
+touch again. This makes zero-copy send a win for large, long-lived buffers where
+the saved copy outweighs the extra completion, and a loss for small sends where it
+does not—so it is opt-in per operation. There is a further subtlety the name hides:
+asking for a zero-copy send does not guarantee one. The network stack may decide
+it must copy after all, and it does so silently, leaving the application paying for
+the two-completion protocol without receiving anything in return. Setting
+<code>IORING_SEND_ZC_REPORT_USAGE</code> makes the kernel report the outcome in the
+notification CQE's <code>res</code> field, where
+<code>IORING_NOTIF_USAGE_ZC_COPIED</code> means the data was copied at least in
+part—the only way to discover that an optimization is not being applied. A send
+that does not name a registered buffer still has to keep its pages resident until
+the notification fires, so the kernel pins them for the duration and charges them
+against the same per-user <code>RLIMIT_MEMLOCK</code> budget as the registered
+buffers of &sect;6.1 (<code>io_notif_account_mem</code>); naming a registered
+buffer with <code>IORING_RECVSEND_FIXED_BUF</code> skips this, since those pages
+are already pinned and accounted. A program that fires off many large zero-copy
+sends without registering its buffers can therefore hit the same limit a
+heavy user of registered buffers would, for a reason that has nothing to do with
+registration.
+</p>
+
+<p>
+Several more flags in the operation-specific word tune the rest of the network
+path.
+<code>IORING_RECVSEND_POLL_FIRST</code> tells the kernel to wait for readiness
+before even attempting the operation, avoiding a speculative copy;
+<code>IORING_RECVSEND_FIXED_BUF</code> directs the transfer at a registered buffer
+from &sect;6.1, naming it by index in <code>buf_index</code>; and
+<code>IORING_SEND_VECTORIZED</code> lets a send take a vector of segments rather
+than one flat range. The most interesting is
+<code>IORING_RECVSEND_BUNDLE</code>, which works with
+<code>IOSQE_BUFFER_SELECT</code> to let one operation claim <em>several</em>
+contiguous buffers from a group at once rather than one: the completion reports how
+many buffers were used and the id of the first, so a single send can drain a queue
+of small messages, or a single receive can absorb a burst, without one SQE and one
+CQE per buffer. Alongside these, the zero-copy <em>receive</em> path binds a
+registered interface queue so incoming packets land directly in application memory,
+and NAPI busy-polling lets a latency-sensitive receiver poll the NIC instead of
+waiting for its interrupt.
+</p>
+
+<p>
+The most open-ended operation is <span class="key-term">command passthrough</span>,
+<code>IORING_OP_URING_CMD</code> (<code class="file-path">io_uring/uring_cmd.c</code>).
+Rather than a fixed operation, it carries a device-specific command to a file's
+own <code>uring_cmd</code> handler, letting a subsystem expose arbitrary
+asynchronous operations through io_uring's rings. Its headline use is
+<span class="key-term">NVMe passthrough</span>, which sends raw NVMe commands to a
+drive—and the userspace-block-driver framework <code>ublk</code>, which implements
+block devices in user space—both riding io_uring's asynchronous, batched,
+low-overhead transport instead of inventing their own. Because the command can be
+large, this is the main user of the 128-byte SQE of &sect;2.1, and it composes with
+the rest of the interface: <code>IORING_URING_CMD_FIXED</code> lets a passthrough
+command target a registered buffer (&sect;6.1), and a multi-shot variant
+(<code>IORING_URING_CMD_MULTISHOT</code>) lets one command post repeated
+completions. Command passthrough turns io_uring from an I/O interface into a
+general asynchronous <em>request</em> transport, which is much of why it keeps
+absorbing new roles in the kernel.
+</p>
+
+<hr>
+<h2 id="security">Security and Containment</h2>
+
+<p class="chapter-intro">
+An interface this powerful—shared kernel memory, pools of worker threads,
+passthrough to devices—is also a large attack surface, and io_uring's history has
+made its security machinery a first-class concern. This closing section covers it
+at two scales. The first is the administrator's: the sysctl and the LSM hooks that
+decide who may create a ring at all, and which of its riskier capabilities they
+may use. The second is the application's, and it answers a question the rest of
+the chapter has been quietly accumulating. Every section so far has
+<em>widened</em> what a single ring can be asked to do; a program that needs only
+a fraction of that breadth has had no way to say so, and inherits the whole attack
+surface regardless. The mechanisms of &sect;8.2 let it hand the breadth back,
+which is the only form of <em>containment</em> that scales with an interface still
+growing this fast.
+</p>
+
+<h3 id="attack-surface">Attack Surface and Controls</h3>
+
+<p>
+io_uring's breadth and its asynchronous worker threads have made it the source of
+a notable run of kernel vulnerabilities, and some large operators have chosen to
+disable it outright on systems that do not need it. The kernel provides graduated
+controls for exactly this. The <code class="file-path">kernel.io_uring_disabled</code>
+sysctl (<code>sysctl_io_uring_disabled</code>,
+<code class="file-path">io_uring/io_uring.c</code>) can disable io_uring entirely,
+or permit it only to processes in a designated group
+(<code>sysctl_io_uring_group</code>), so an administrator can deny the interface to
+untrusted workloads. Creation of a ring is gated by an LSM hook,
+<code>security_uring_allowed</code>, and further hooks mediate its more sensitive
+capabilities—<code>security_uring_sqpoll</code> for creating a polling thread,
+<code>security_uring_cmd</code> for command passthrough, and
+<code>security_uring_override_creds</code> for the personality mechanism by which a
+request can run under different credentials—so a security module such as SELinux
+can permit io_uring while restricting its riskier features. A ring can also be
+created <span class="key-term">disabled</span> with
+<code>IORING_SETUP_R_DISABLED</code> and enabled only after its resources are
+registered, narrowing the window in which a partially configured ring is usable.
+Together these let io_uring's performance be adopted without forcing its full
+attack surface on systems that cannot accept it.
+</p>
+
+<p>
+Stated precisely, the controls are the knobs an administrator actually turns. The <code>io_uring_disabled</code> sysctl takes three
+values: <span class="key-term">0</span> allows io_uring for everyone,
+<span class="key-term">2</span> refuses every <code>io_uring_setup</code> with
+<code>-EPERM</code>, and <span class="key-term">1</span> is the middle ground—only
+processes with <code>CAP_SYS_ADMIN</code> or membership in the
+<code>io_uring_group</code> gid may create a ring. Whichever value is set, a
+successful check still falls through to the <code>security_uring_allowed</code> LSM
+hook, so a policy module has the final say. The <code>R_DISABLED</code> lifecycle
+completes the picture: a ring created disabled rejects all submission until the
+application calls <code>io_uring_register</code> with
+<code>IORING_REGISTER_ENABLE_RINGS</code> (<code>io_register_enable_rings</code>,
+<code class="file-path">io_uring/register.c</code>), the idiom being to create the
+ring, register its files and buffers and drop privileges, and only then enable
+submission—so an attacker who seizes the process later cannot register new
+resources. And because an instance is an ordinary file descriptor, the usual
+containment applies for free: it is confined by the process's namespaces and
+credentials, its pinned memory is charged to <code>RLIMIT_MEMLOCK</code>, and its
+worker threads run with the owner's credentials, not elevated ones.
+</p>
+
+<h3 id="restrict">Restricting an Instance</h3>
+
+<p>
+The controls of the previous subsection are an administrator's: they decide
+whether a process may use io_uring at all. A second set belongs to the
+application, and exists so that a program can confine <em>itself</em>. A server
+that will only ever read files and send on sockets still gets a ring that accepts
+every one of the sixty-five opcodes of &sect;4.1, including command passthrough
+to devices; if the process is later compromised, the attacker inherits all of it.
+<span class="key-term">Restrictions</span> let the program close that gap while it
+is still trustworthy. Registering <code>IORING_REGISTER_RESTRICTIONS</code>
+(<code>io_register_restrictions</code>,
+<code class="file-path">io_uring/register.c</code>) installs allow-lists of three
+kinds: which registration operations may be performed, which SQE opcodes may be
+submitted, and which SQE flags are permitted or required. The call is accepted
+only on a ring created with <code>IORING_SETUP_R_DISABLED</code>, and only once,
+which forces the sequence described above into its safe order: create the ring
+disabled, register the files and buffers the program will need, narrow the ring to
+the operations it will actually use, then enable submission. After that the
+restrictions cannot be widened, because there is no interface to widen them.
+</p>
+
+<p>
+Allow-listing opcodes is a blunt instrument, though: it can say that a program may
+call <code>IORING_OP_OPENAT</code> but not which files it may open, or that it may
+create sockets but not of which family. The newest of io_uring's controls answers
+exactly that, and does so by borrowing a mechanism from a neighbouring chapter.
+<code>IORING_REGISTER_BPF_FILTER</code>
+(<code class="file-path">io_uring/bpf_filter.c</code>) attaches a
+<span class="key-term">BPF filter</span> to an individual opcode. Before the
+request is issued, the filter runs on a small context
+(<code>struct io_uring_bpf_ctx</code>) holding the opcode, the SQE flags, the
+<code>user_data</code>, and—for the operations that define one—a few
+operation-specific fields: the family, type and protocol for a socket creation,
+the flags, mode and resolve settings for an open. A filter returns one to allow
+the request and zero to deny it, in which case the request fails with
+<code>-EACCES</code>; where several filters are attached to an opcode, every one
+of them must allow the request—a new registration is chained ahead of whatever
+is already there, but the check is a logical <em>and</em> across the whole
+chain, so a second filter can only narrow what an opcode permits, never restore
+permission an earlier one withheld. A registration flag,
+<code>IO_URING_BPF_FILTER_DENY_REST</code>, attaches a deny filter to every opcode
+left unmentioned, turning the whole arrangement from a deny-list into an
+allow-list in one step. Because each opcode's context struct grows over kernel
+versions as more operations gain filterable fields, a filter written against an
+older kernel may see a smaller <code>pdu_size</code> than the running kernel
+provides; by default the registration simply reports the kernel's actual size
+back to userspace and lets the filter run against its own, older layout, but a
+second flag, <code>IO_URING_BPF_FILTER_SZ_STRICT</code>, turns that mismatch into
+an outright <code>-EMSGSIZE</code> for a filter that would rather fail loudly
+than run against fields it was not written to expect. The mechanism is also not
+guaranteed to exist at all: it lives behind
+<code>CONFIG_IO_URING_BPF</code>, which depends on
+<code>CONFIG_BPF</code> and <code>CONFIG_NET</code>, so a minimal kernel built
+without networking or the BPF subsystem falls back to the coarser controls of
+&sect;8.1 and the opcode allow-list above.
+</p>
+
+<p>
+The resemblance to seccomp is not accidental, and it goes deeper than the idea.
+These filters are written in <em>classic</em> BPF and reach the kernel through
+<code>bpf_prog_create_from_user</code>, the same entry point
+<code class="file-path">kernel/seccomp.c</code> uses (Chapter 10), so the old
+two-register instruction set has acquired a third user-space entry point decades
+after eBPF displaced it—for the same reason seccomp still uses it, namely that a
+filter small enough to audit by eye is what a security check wants. The seccomp
+parallel extends to who may install one: like a seccomp filter, an io_uring filter
+may be set only by a process that has set <code>no_new_privs</code> or holds
+<code>CAP_SYS_ADMIN</code>, so an unprivileged program cannot use a filter to
+manipulate the behaviour of something it later executes.
+</p>
+
+<p>
+The validator passed to <code>bpf_prog_create_from_user</code> is io_uring's own,
+<code>io_uring_check_cbpf_filter()</code>, and it is the mirror image of seccomp's.
+Every <code>BPF_LD | BPF_W | BPF_ABS</code> load is rewritten into
+<code>BPF_LDX | BPF_W | BPF_ABS</code> after a check that its offset is four-byte
+aligned and lies inside <code>struct io_uring_bpf_ctx</code>, so the program can
+read nothing but the context and the run-time interpreter never needs a bounds
+check; a <code>BPF_LEN</code> load is folded into an immediate holding the size
+of that structure. Everything else must appear on an explicit list of returns,
+ALU operations, scratch-memory accesses and forward jumps, which leaves no packet
+access and no way to reach memory the context does not contain, and a program is
+limited to <code>BPF_MAXINSNS</code> instructions. As with seccomp, there is no
+operation to remove a filter once it is installed.
+</p>
+
+<p>
+Both mechanisms have a second, wider scope that is easy to overlook and is what
+makes them a real sandbox rather than a per-ring convenience. Registering either
+one with no ring at all—passing a file descriptor of -1, which
+<code class="file-path">io_uring/register.c</code> calls a blind registration—
+attaches it to the <em>task</em> instead
+(<code>io_register_restrictions_task</code>,
+<code>io_register_bpf_filter_task</code>), where it is held at
+<code>current-&gt;io_uring_restrict</code>. A task-scoped restriction applies to
+every ring the task creates afterwards, because <code>io_uring_setup</code> clones
+it into each new instance as the instance is built, so a program that has confined
+itself cannot escape by creating a fresh ring. It also survives the operations that
+start new programs: <code class="file-path">kernel/fork.c</code>'s
+<code>copy_process</code> calls <code>io_uring_fork</code>, which duplicates a
+private copy of the restriction set (<code>__io_uring_fork</code>,
+<code class="file-path">io_uring/tctx.c</code>) into every child, and nothing
+clears them on <code>execve</code>—so a launcher can confine a
+program before handing control to it whether or not that program knows io_uring
+exists. The gate is seccomp's rather than the ring's: the caller must have
+<code>no_new_privs</code> set or hold <code>CAP_SYS_ADMIN</code>, and a task that
+already carries restrictions may not replace them. Between the two scopes, io_uring has acquired something the
+rest of the chapter gave no reason to expect: a way to use the fastest I/O
+interface in the kernel while accepting only a chosen sliver of its surface.
+</p>
+
+<hr>
+<h2 id="chapter-summary">Summary</h2>
+
+<p class="chapter-intro">
+This chapter described io_uring, the
+high-performance asynchronous I/O interface Linux added in 5.1
+and has extended in nearly every release since. Its foundation is a pair of
+shared-memory <span class="key-term">ring buffers</span>—a submission queue the
+application fills with entries describing operations, and a completion queue the
+kernel fills with their results—coordinated by head and tail indices and
+acquire/release memory barriers rather than by locks or, on the hot path, by
+system calls. An application submits work by writing a <code>struct io_uring_sqe</code>
+and reaps results by reading a <code>struct io_uring_cqe</code> whose
+<code>res</code> mirrors the equivalent synchronous return value, all keyed by a
+<code>user_data</code> value the application controls. A single
+<code>io_uring_enter</code> can submit and reap a whole batch; submission-queue
+polling can eliminate even that call; and an internal worker pool absorbs the
+operations that must block, so a program's own threads need never wait for I/O. A
+theme recurs wherever the chapter looked closely at who actually owns a piece of
+this machinery: not the process the intuitive unit would suggest, but something
+narrower or wider depending on the mechanism—the async worker pool and a task's
+security restrictions belong to the individual thread that created them, while
+pinned memory is charged against the real user id and so is shared by every
+process running as that user. Getting this scope wrong is an easy mistake for a
+reader to make and, as the chapter's own history of imprecise language on the
+point shows, an easy one to write down as well.
+</p>
+
+<p>
+Around this core io_uring layers the machinery that makes it the fastest I/O path
+the kernel offers: <span class="key-term">linked chains</span> that order dependent
+operations within a single submission, <span class="key-term">registered</span>
+files and buffers that
+pay per-operation setup once, provided buffers the
+kernel assigns only to receives that complete, multi-shot
+operations that answer many events from one submission,
+<span class="key-term">polled</span> and <span class="key-term">deferred</span>
+completion modes for the lowest latency, <span class="key-term">zero-copy</span>
+networking, and command passthrough that carries
+arbitrary device operations over the same rings—balanced by controls and LSM hooks
+for an interface whose power is also a risk, and by restrictions and BPF filters
+with which a program can narrow a ring—or every ring it will ever create—to
+the operations it means to use, before it is in a position to be exploited. Table 24-5 collects the shift from the
+older model. The larger significance is that io_uring changes the fundamental unit
+of interaction with the kernel from the individual, synchronous system call to a
+stream of asynchronous requests flowing through shared memory—a change as much in
+kind as in speed, and one still reshaping how high-performance Linux software is
+written. It is also the clearest illustration of a pattern the last chapters keep
+returning to: the kernel's newest interfaces are not settled designs but ones
+still visibly in motion, gaining capabilities faster than the conventions for
+containing them—which is why io_uring spent its first years adding operations and
+its later ones learning how to give them back.
+</p>
+
+<table>
+<caption>Table 24-5. From synchronous I/O to io_uring</caption>
+<thead>
+<tr><th>Aspect</th><th>Synchronous / legacy AIO</th><th>io_uring</th></tr>
+</thead>
+<tbody>
+<tr><td>System calls</td><td>One per operation (or per submit and per reap)</td><td>One per batch, or none under SQPOLL</td></tr>
+<tr><td>Asynchrony</td><td>Blocking; libaio async only for direct I/O</td><td>Truly async for buffered and direct I/O alike</td></tr>
+<tr><td>Operation coverage</td><td>Read/write (libaio); one call per kind otherwise</td><td>65 opcodes: file, network, timers, passthrough</td></tr>
+<tr><td>Submission/completion</td><td>Syscall arguments and return value</td><td>Shared SQ/CQ rings with SQEs and CQEs</td></tr>
+<tr><td>Buffer/file setup</td><td>Repeated per operation</td><td>Registered once; provided buffers chosen at completion</td></tr>
+<tr><td>Keeping many I/Os in flight</td><td>One thread blocked per operation</td><td>Thousands of requests from one thread</td></tr>
+<tr><td>Batch completion of one request</td><td>One result per call</td><td>Multi-shot: many CQEs from one SQE</td></tr>
+</tbody>
+</table>
+
+<p class="source-trail-pointer">The kernel source files this chapter works from are collected by topic in <a href="source-trails.html#ch24">Source Trails</a>.</p>
+</main>
+
+<footer class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>v0.1</p>
+  <p>© 2026 Lianwei Wang. All rights reserved.</p>
+</footer>
+
+</div><!-- .book-container -->
+<script src="assets/progress.js" defer></script>
+</body>
+</html>
+
+
+

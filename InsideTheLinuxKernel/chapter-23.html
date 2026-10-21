@@ -1,0 +1,2923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Chapter 23 of Inside the Linux Kernel: The eBPF Subsystem — the in-kernel virtual machine and instruction set, the verifier, the JIT compiler, maps, program types and attach points, XDP, BTF, CO-RE, helpers, and kfuncs in Linux 7.0.12.">
+  <meta property="og:title" content="Chapter 23: The eBPF Subsystem — Inside the Linux Kernel">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <title>Chapter 23: The eBPF Subsystem — Inside the Linux Kernel</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+</head>
+<body>
+<progress class="chapter-progress" max="100" value="0" aria-hidden="true"></progress>
+<nav class="chapter-nav">
+  <a class="book-title" href="index.html" title="Table of Contents">Inside the Linux Kernel</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-22.html">&larr; Chapter 22</a>
+  <span class="nav-sep">|</span>
+  <a href="#top">Chapter 23</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-24.html">Chapter 24 &rarr;</a>
+</nav>
+<a href="#top" class="back-to-top" aria-label="Back to top">&uarr;</a>
+<div class="book-container" id="top" style="margin-top: 3.5rem;">
+<header class="chapter-header">
+  <div class="chapter-number">Chapter 23</div>
+  <h1 class="chapter-title" style="border:none; margin-top:0.5rem;">The eBPF Subsystem</h1>
+  <p class="chapter-subtitle">How Linux 7.0.12 runs sandboxed user-supplied programs safely inside the kernel — the eBPF virtual machine and instruction set, the verifier that proves each program safe, the JIT compiler, maps, the program types and attach points from XDP to tracing, and the BTF, CO-RE, helper, and kfunc machinery that make it all portable and extensible.</p>
+</header>
+
+<main class="chapter-body">
+<nav class="toc">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#whatis">What eBPF Is</a>
+  <ul class="toc-sub">
+    <li><a href="#from-cbpf">1.1 From Packet Filter to Universal Virtual Machine</a></li>
+    <li><a href="#model">1.2 The Load-Verify-Attach-Run Model</a></li>
+  </ul>
+</li>
+<li><a href="#vm">The eBPF Virtual Machine</a>
+  <ul class="toc-sub">
+    <li><a href="#isa">2.1 Registers and the Instruction Set</a></li>
+    <li><a href="#interp">2.2 The Interpreter, Stack, and Tail Calls</a></li>
+  </ul>
+</li>
+<li><a href="#verifier">The Verifier</a>
+  <ul class="toc-sub">
+    <li><a href="#proves">3.1 What the Verifier Proves</a></li>
+    <li><a href="#how-verify">3.2 How the Verifier Works</a></li>
+  </ul>
+</li>
+<li><a href="#jit">The JIT Compiler</a>
+  <ul class="toc-sub">
+    <li><a href="#jit-native">4.1 From Bytecode to Native Code</a></li>
+    <li><a href="#jit-arch">4.2 Hardening and Architecture Backends</a></li>
+  </ul>
+</li>
+<li><a href="#maps">Maps</a>
+  <ul class="toc-sub">
+    <li><a href="#map-model">5.1 The Map Abstraction</a></li>
+    <li><a href="#map-types">5.2 Map Types</a></li>
+    <li><a href="#map-share">5.3 Ring Buffers and Pinning</a></li>
+  </ul>
+</li>
+<li><a href="#programs">Programs and Attach Points</a>
+  <ul class="toc-sub">
+    <li><a href="#prog-types">6.1 Program Types and the bpf() System Call</a></li>
+    <li><a href="#attach">6.2 Attaching Programs: Links and Hooks</a></li>
+  </ul>
+</li>
+<li><a href="#obsnet">Observability and Networking Hooks</a>
+  <ul class="toc-sub">
+    <li><a href="#tracing">7.1 Tracing: kprobes, Tracepoints, and fentry/fexit</a></li>
+    <li><a href="#xdp">7.2 XDP: the Express Data Path</a></li>
+    <li><a href="#tc">7.3 Traffic Control and the Socket Layer</a></li>
+  </ul>
+</li>
+<li><a href="#policy">Programmable Kernel Policy</a>
+  <ul class="toc-sub">
+    <li><a href="#cgroup-hooks">8.1 cgroup Hooks</a></li>
+    <li><a href="#bpf-lsm">8.2 BPF LSM: Programmable Security</a></li>
+    <li><a href="#sched-ext">8.3 Scheduling with sched_ext</a></li>
+  </ul>
+</li>
+<li><a href="#btf">BTF and CO-RE</a>
+  <ul class="toc-sub">
+    <li><a href="#btf-format">9.1 BTF: the BPF Type Format</a></li>
+    <li><a href="#core">9.2 CO-RE: Compile Once, Run Everywhere</a></li>
+  </ul>
+</li>
+<li><a href="#extend">Extending BPF: Helpers and kfuncs</a>
+  <ul class="toc-sub">
+    <li><a href="#helpers">10.1 Helper Functions</a></li>
+    <li><a href="#kfuncs">10.2 kfuncs and struct_ops</a></li>
+  </ul>
+</li>
+<li><a href="#chapter-summary">Summary</a></li>
+</ol>
+</nav>
+
+<p class="chapter-intro">
+Nothing in this book has stretched the idea of an operating-system kernel further
+than the subsystem this chapter describes. <span class="key-term">eBPF</span>—the
+name is historical, from &ldquo;extended Berkeley Packet Filter,&rdquo; but the
+technology has long since outgrown it—lets user space load small programs
+<em>into the running kernel</em> and attach them to events: a packet arriving at a
+network card, a kernel function being called, a system call returning, a cgroup
+process opening a socket. Those programs then run, in kernel mode, at native
+speed, every time the event fires. This is a startling proposition. Running
+arbitrary user-supplied code in the kernel with no isolation is exactly the thing
+every other chapter has worked to prevent; a single bad pointer would corrupt the
+kernel, and an infinite loop would hang the machine. eBPF makes it safe not by
+sandboxing the code at run time, but by <em>proving</em>, before the program is
+ever allowed to run, that it cannot do any of those things. That proof—performed
+by the <span class="key-term">verifier</span>—is the intellectual heart of the
+subsystem and the reason the rest of it can exist.
+</p>
+
+<p>
+None of this existed in Linux 2.6.11. That kernel had only classic BPF: a tiny, two-register
+interpreter used to filter packets on a socket, useful but firmly confined to
+networking. The modern subsystem is a general-purpose, in-kernel execution
+environment with its own 64-bit virtual machine, a just-in-time compiler that
+turns programs into native code, a rich set of typed key/value stores called
+maps, dozens of program types attachable across the
+whole kernel, and a type system (BTF) that makes
+programs portable across kernel versions. It has become the standard way to extend
+Linux at run time—for observability, networking, security, and even scheduling—so
+much so that it is often described, only half in jest, as a second kernel growing
+inside the first. It has also stopped being a one-way arrangement: through the
+<code>struct_ops</code> mechanism the traffic now runs in both directions, with the
+kernel calling into eBPF to obtain a TCP congestion-control algorithm or an entire
+CPU scheduling policy. This chapter builds that picture up from its foundations:
+the virtual machine, the verifier, the JIT, and the maps; then the programs
+themselves and the two families of hooks they attach to—those that watch the
+kernel work and those that decide what it may do—and finally the type system and
+extension machinery that make a program portable and let the kernel call back into
+it.
+</p>
+
+<hr>
+<h2 id="whatis">What eBPF Is</h2>
+
+<p class="chapter-intro">
+Before examining any component, it helps to fix what kind of thing eBPF is and how
+its pieces relate. This section traces the leap from the packet filter of Linux 2.6 to today's general virtual machine, and then lays out the life cycle every
+eBPF program follows—compiled, loaded, verified, attached, and run—which is the
+skeleton the rest of the chapter fleshes out.
+</p>
+
+<p>
+One idea organizes everything else, and it is best stated plainly at the
+outset: eBPF makes the kernel <span class="key-term">programmable at run time</span>,
+and it does so by changing the kernel's relationship to the code it accepts. Every
+other extension mechanism in this book asks the kernel to <em>trust</em> the code
+it runs—a module (Appendix B) runs with full privilege because someone with
+<code>CAP_SYS_MODULE</code> vouched for it, and a bug in it can bring down the
+system. eBPF asks the kernel to trust <em>nothing</em>, and instead to
+<span class="key-term">prove</span> what it needs before running the code at all.
+That inversion—safety established by static proof rather than by privilege or
+run-time isolation—is what lets the kernel accept programs from less-privileged
+sources and run them in the most sensitive paths it has, and it is why eBPF has
+become the mechanism of choice for extending Linux where patching the source or
+loading a module would once have been the only options.
+</p>
+
+<p>
+A section titled in this way should also say what eBPF is not, because the
+enthusiasm surrounding it tends to blur the boundary. An eBPF program is not a
+thread and not a process: it has no existence of its own, cannot block or sleep
+except in the narrowly permitted cases, and cannot start anything. It cannot
+allocate memory, cannot take a kernel lock, cannot register a new system call,
+cannot own an interrupt, and cannot talk to hardware. Nothing in the subsystem
+lets a program drive a device, which is why a device driver is still a module and
+why Appendix B has not been made obsolete by this chapter. What eBPF offers
+instead is narrow and deep: the ability to interpose a small, fast, provably
+bounded computation at a point the kernel has chosen to expose, and to keep data
+across those computations in a map. Nearly everything the subsystem has grown
+—the program types, the maps, the helpers, the trampolines—is an elaboration
+of that one capability rather than a widening of it.
+</p>
+
+<h3 id="from-cbpf">From Packet Filter to Universal Virtual Machine</h3>
+
+<p>
+The ancestor of eBPF is <span class="key-term">classic BPF</span> (cBPF), the
+Berkeley Packet Filter: a small virtual machine, with two 32-bit registers and a
+handful of instructions, that user space could attach to a socket to decide which
+packets to accept—the mechanism behind <code>tcpdump</code>'s filter expressions.
+It was elegant and safe, because its programs were too simple to do harm, but it
+was narrow: it could inspect a packet and return a verdict, and little else.
+Linux still supports it, and in fact converts every classic filter into the modern
+instruction set on load—<code>bpf_convert_filter</code>
+(<code class="file-path">net/core/filter.c</code>) translates a
+<code>sock_filter</code> program into eBPF so that a single engine runs both.
+</p>
+
+<p>
+Several interfaces still take classic BPF from user space, which is why the old
+instruction set is not merely a historical note. A socket filter attached with
+<code>SO_ATTACH_FILTER</code> arrives as a <code>sock_fprog</code> array of
+classic instructions (<code>sk_attach_filter</code>,
+<code class="file-path">net/core/filter.c</code>), and so does a seccomp filter
+installed with <code>seccomp()</code> or <code>prctl()</code>
+(<code>seccomp_prepare_filter</code> calls
+<code>bpf_prog_create_from_user</code>, <code class="file-path">kernel/seccomp.c</code>).
+So, most recently, does an io_uring filter, which restricts the operations a ring
+will accept and reaches the kernel through the same
+<code>bpf_prog_create_from_user</code> path (Chapter 24). All are translated into
+eBPF the moment they enter the kernel and are thereafter executed, and
+JIT-compiled, by exactly the machinery this chapter describes. The classic
+instruction set therefore survives as a frozen ABI at a handful of entry points
+while having no independent implementation behind it—a reminder that a stable
+user-space interface and the code that implements it can part company completely.
+That the newest of those entry points was added long after eBPF had displaced it
+shows the appeal of the old format for the job: a filter small enough to audit,
+with no maps, no helpers and no loader, is exactly what a security check wants.
+</p>
+
+<p>
+Precision about how little that ancestor could do repays the space, because the
+distance travelled is the subject of the rest of the chapter. Classic BPF had no
+register file to speak of: an accumulator <code>A</code>, an index register
+<code>X</code>, and sixteen words of scratch memory
+(<code>BPF_MEMWORDS</code>, <code class="file-path">include/uapi/linux/filter.h</code>)
+that a program could spill into. Its jumps could only go forward, so a program was
+a finite straight-line walk toward one of two exits and could not loop even in
+principle. It could not call a function, could not keep anything between
+invocations, and could not touch memory other than the packet it was handed and
+its own sixteen scratch words. Its verdict was a number: how many bytes of the
+packet to keep, with zero meaning discard. Safety in such a machine needed no
+proof and no analysis—a few sanity checks on the instruction stream sufficed,
+because there was nothing dangerous to express. The whole design of eBPF is an
+answer to the question of how to keep that guarantee while removing every one of
+those restrictions, and the verifier of &sect;3 is the price of the answer.
+</p>
+
+<p>
+<span class="key-term">Extended BPF</span> generalized this idea along every axis.
+The register file grew to eleven 64-bit registers matching the calling convention
+of real hardware, so that programs could be JIT-compiled to native code. A large
+instruction set gained proper function calls, and programs gained access to
+maps for keeping state and to
+helper functions for asking the kernel to do things
+on their behalf. Crucially, the attach points multiplied: an eBPF program is no
+longer confined to a socket but can be hooked to tracepoints and kprobes, to the
+network stack's earliest and latest points, to cgroup events, to LSM security
+hooks, and more. The result is a single, uniform mechanism for running
+custom logic almost anywhere in the kernel—what began as a packet filter has
+become the kernel's general extension interface.
+</p>
+
+<p>
+This evolution was gradual, and its stages are easy to run together. Classic BPF dates from the
+early 1990s as a networking technology, and for two decades it stayed in that
+niche, though it did find one influential use outside it: the
+<span class="key-term">seccomp</span> system-call filtering of Chapter 20 is built
+on classic BPF programs that vet a process's syscalls, an early hint that a tiny
+verified virtual machine could safely make policy decisions in security-sensitive
+paths. Extended BPF arrived in 2014 as a ground-up redesign, and the reasons for
+it are exactly the limitations this section has named: the two-register 32-bit
+machine could not be efficiently JIT-compiled to modern hardware, had no way to
+keep state or call the kernel, and could attach only to sockets. Rebuilding it as
+a 64-bit machine with maps, helpers, and a general attach mechanism turned a
+special-purpose filter into a general-purpose execution environment—while keeping
+the one property that made classic BPF safe in the first place, that a program is
+checked before it is trusted. Everything distinctive about modern eBPF is a
+consequence of generalizing the old filter without giving up that guarantee.
+</p>
+
+<p>
+The last step in that progression has no precedent
+elsewhere in the kernel: the instruction set has stopped being a
+Linux implementation detail. What an eBPF instruction means used to be defined by
+whatever the interpreter in <code class="file-path">kernel/bpf/core.c</code>
+did with it. It is now the subject of a written specification developed in the
+IETF's BPF working group, and the kernel carries its own copy of the documents
+under <code class="file-path">Documentation/bpf/standardization/</code>—one for
+the instruction set and one for the binary conventions a portable program should
+follow. The practical consequence is that eBPF is no longer a single program
+running in a single kernel: the same bytecode is executed by runtimes outside
+Linux entirely, and a change to what an instruction means is now a change to a
+standard rather than a change to a function. For a mechanism that began as a way
+to avoid copying unwanted packets to user space, that is a considerable distance
+to have travelled.
+</p>
+
+<h3 id="model">The Load-Verify-Attach-Run Model</h3>
+
+<p>
+Every eBPF program passes through the same four-stage life cycle, and keeping it in
+mind makes the whole subsystem legible. First the program is
+<span class="key-term">loaded</span>: user space compiles source (usually
+restricted C, via clang/LLVM) into eBPF bytecode and hands it to the kernel through
+the <code>bpf()</code> system call with the <code>BPF_PROG_LOAD</code> command.
+Second it is <span class="key-term">verified</span>: before accepting the bytecode,
+the kernel runs it through the verifier, which statically proves the program safe
+or rejects it. Third it is <span class="key-term">attached</span> to a hook, and
+fourth, from then on, it <span class="key-term">runs</span> every time that hook
+fires, sharing state with user space and with other programs through maps.
+Figure 23-1 shows this pipeline and the user/kernel boundary it crosses.
+</p>
+
+<p>
+The figure draws verification and JIT compilation as separate boxes, yet neither
+is a separate step from user space's point of view.
+Both happen inside the single <code>BPF_PROG_LOAD</code> call, before it returns:
+the kernel verifies the bytecode, and if it passes, selects the runtime and
+compiles it, and only then hands back a file descriptor. A program object that
+exists at all is therefore one that has already been proved safe and, on most
+systems, already translated to machine code—there is no window in which an
+unverified program is reachable by anything. This is why loading is the expensive
+operation and running is the cheap one, and why trouble with eBPF is nearly always
+trouble at load time: by the time a program can be attached, everything that could
+have gone wrong with it already has.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 380" role="img" aria-labelledby="fig23-1-title" style="max-width:780px; width:100%; height:auto;">
+<title id="fig23-1-title">Figure 23-1. The eBPF Program Pipeline</title>
+<defs><marker id="e211" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="340" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 23-1. The eBPF Program Pipeline</text>
+
+<rect x="60" y="74" width="740" height="70" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-dasharray="5 3"/>
+<text x="80" y="94" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#2563eb">user space</text>
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<rect x="110" y="100" width="150" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="185" y="121">restricted C source</text>
+<rect x="330" y="100" width="150" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="405" y="121">clang/LLVM &#8594; bytecode</text>
+<rect x="560" y="100" width="180" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="650" y="115">bpf(BPF_PROG_LOAD)</text><text x="650" y="128" font-size="8" fill="#475569">+ bytecode + BTF</text>
+</g>
+
+<rect x="60" y="176" width="740" height="150" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="5 3"/>
+<text x="80" y="196" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#334155">kernel</text>
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<rect x="110" y="206" width="150" height="42" rx="6" fill="#fee2e2" stroke="#dc2626"/><text x="185" y="225" font-weight="700">verifier</text><text x="185" y="239" font-size="8" fill="#475569">prove safe or reject</text>
+<rect x="330" y="206" width="150" height="42" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="405" y="225" font-weight="700">JIT compiler</text><text x="405" y="239" font-size="8" fill="#475569">bytecode &#8594; native</text>
+<rect x="560" y="206" width="180" height="42" rx="6" fill="#fef9c3" stroke="#ca8a04"/><text x="650" y="225" font-weight="700">attach to a hook</text><text x="650" y="239" font-size="8" fill="#475569">via a bpf_link</text>
+<rect x="270" y="272" width="320" height="40" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="430" y="290" font-weight="700">run on every event</text><text x="430" y="303" font-size="8" fill="#475569">sharing state through maps</text>
+</g>
+
+<g stroke="#334155" stroke-width="1.3">
+<line x1="260" y1="117" x2="330" y2="117" marker-end="url(#e211)"/>
+<line x1="480" y1="117" x2="560" y2="117" marker-end="url(#e211)"/>
+<path d="M650,144 V160 H185 V206" fill="none" marker-end="url(#e211)"/>
+<line x1="260" y1="227" x2="330" y2="227" marker-end="url(#e211)"/>
+<line x1="480" y1="227" x2="560" y2="227" marker-end="url(#e211)"/>
+<path d="M650,248 V262 H430 V272" fill="none" marker-end="url(#e211)"/>
+</g>
+<text x="410" y="156" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#64748b" font-style="italic">syscall crosses into the kernel</text>
+</svg>
+<figcaption>Figure 23-1. The eBPF program pipeline — in user space, restricted C is compiled to bytecode and submitted through the bpf() system call. In the kernel the verifier proves the program safe (rejecting it otherwise), the JIT compiles it to native code, and it is attached to a hook through a bpf_link. Thereafter it runs on every occurrence of the event, sharing state with user space and other programs through maps.</figcaption>
+</figure>
+
+<p>
+One structural fact underlies this entire life cycle: every eBPF object the kernel
+creates—a loaded program, a map, a live attachment
+(<code>bpf_link</code>), a chunk of BTF—is referred to by a
+<span class="key-term">file descriptor</span>, backed by an anonymous inode. This
+is why the whole subsystem is driven through the single multiplexed
+<code>bpf()</code> system call
+(<code class="file-path">kernel/bpf/syscall.c</code>): its forty commands, a set
+still growing, create these objects and return descriptors, look them up, and
+connect them, and
+their lifetimes follow the ordinary rules for file descriptors—an object lives as
+long as a descriptor (or a bpffs pin) refers to it. In practice a programmer rarely
+issues these commands directly; a user-space library, <span class="key-term">libbpf</span>,
+takes a compiled object file, performs the CO-RE relocations of &sect;9.2, creates
+the maps, loads the program with its BTF, and sets up the links, hiding the raw
+syscall behind a convenient interface. Loading anything through it requires
+privilege, in the form of the <code>CAP_BPF</code> capability that &sect;6.1
+describes.
+</p>
+
+<p>
+Two consequences of the file-descriptor model deserve mention here because they
+shape how eBPF is used rather than how it is implemented. The first is that
+descriptors are private to a process, which would make it impossible to ask what
+is loaded on a machine; so every object also carries a small integer
+<span class="key-term">id</span>, and the commands
+<code>BPF_PROG_GET_NEXT_ID</code> and <code>BPF_PROG_GET_FD_BY_ID</code> (with
+equivalents for maps, links and BTF) let a sufficiently privileged process walk
+the whole set and obtain a descriptor to any of them. This is how
+<code>bpftool</code> can list every program and map in the system and show what
+each is attached to, even though it created none of them. The second is that a
+loaded program can be run deliberately rather than only by its event:
+<code>BPF_PROG_TEST_RUN</code> hands the kernel an input context, executes the
+program on it, and returns the program's verdict, the modified context, and how
+long it took. That command is the reason eBPF programs can be unit-tested at all,
+and it is what the kernel's own extensive BPF self-tests are built on.
+</p>
+
+<p>
+The privilege requirement collides awkwardly with containers, and the resolution
+echoes the namespace-relative capabilities of Chapter
+20. Historically the capability checks in <code>bpf()</code> were made against the
+initial user namespace, so <code>CAP_BPF</code> held inside a container counted
+for nothing and an unprivileged container could not use eBPF at all. The
+<span class="key-term">BPF token</span>
+(<code>BPF_TOKEN_CREATE</code>, <code class="file-path">kernel/bpf/token.c</code>)
+breaks the deadlock by letting privilege be delegated in advance and in pieces. An
+administrator mounts an instance of bpffs with delegation options
+—<code>delegate_cmds</code>, <code>delegate_maps</code>,
+<code>delegate_progs</code>, <code>delegate_attachs</code>—each a bitmask
+naming exactly which commands, map types, program types and attach types that
+mount is willing to hand out. A process that can open that mount derives a token
+from it, and passes the token's descriptor along with its subsequent
+<code>bpf()</code> calls; <code>bpf_token_capable</code> then performs the
+capability check in the user namespace that <em>owns the bpffs instance</em>
+rather than in the initial one. The result is that the host decides once, at mount
+time, what a container may do with eBPF, and the container may then do exactly
+that and nothing more—a delegation of a privilege rather than a grant of it, and
+the same structural idea as the capability bounding set. The stages that follow in
+this chapter simply expand each box of Figure 23-1 in turn.
+</p>
+
+<hr>
+<h2 id="vm">The eBPF Virtual Machine</h2>
+
+<p class="chapter-intro">
+At the base of the subsystem is a small abstract machine—a register-based virtual
+processor with its own instruction set—that every eBPF program is expressed in.
+Its design is deliberately close to real 64-bit hardware, which is what makes both
+efficient interpretation and straightforward JIT compilation possible. This
+section describes the machine's registers and instructions, then how the kernel
+actually executes them when no JIT is used.
+</p>
+
+<p>
+Two design choices distinguish this machine from an ordinary CPU, and the whole
+rest of the chapter follows from them. First,
+it is a <span class="key-term">restricted</span> machine by construction: there is
+no instruction to allocate memory, no lock instruction, no unstructured jump to
+an arbitrary address, and no direct access to kernel memory
+except through the narrow, checked channels of maps, the context, and helper
+calls. Those omissions are not accidents—they are exactly what make the verifier's
+job tractable, because a machine that cannot express dangerous operations is far
+easier to prove safe than one that can. Second, the machine is
+<span class="key-term">abstract</span>: an eBPF program is never executed by
+hardware directly but always through the kernel, whether interpreted or JIT-compiled,
+so the kernel retains complete control over what a program can reach. The virtual
+machine is, in effect, a deliberately weakened processor whose weaknesses are its
+safety guarantees.
+</p>
+
+<p>
+That restriction has aged, and in one direction only: the list of things the
+machine cannot do is shorter than it once was and will be shorter still. Loops
+were forbidden outright; they are now permitted when the verifier can bound them.
+Mutual exclusion was unavailable; a program can now take a lock. Sleeping was
+impossible; some program types may now sleep. What has not changed is the shape of
+each concession: a capability is never simply granted, it is granted together with
+a failure the program is obliged to handle. A bounded loop may run out of its
+budget. A lock acquisition may return <code>-EDEADLK</code> or
+<code>-ETIMEDOUT</code> rather than block—the resilient queued spinlock behind
+<code>bpf_res_spin_lock()</code> (<code class="file-path">kernel/bpf/rqspinlock.c</code>)
+detects AA and ABBA deadlocks and gives up on a timer instead of hanging the CPU
+it is running on. A sleepable program runs only where sleeping is safe and only
+under the protection described in &sect;3. The machine is not becoming a general
+processor by degrees; it is acquiring capabilities whose worst case is a failed
+call rather than a wedged kernel, which is a different thing and the only kind of
+growth this subsystem can afford.
+</p>
+
+<h3 id="isa">Registers and the Instruction Set</h3>
+
+<p>
+The eBPF machine has eleven 64-bit registers, <code>R0</code> through
+<code>R10</code>, and a fixed calling convention that mirrors the one native
+architectures use, so that a register in the virtual machine maps directly to a
+register on the real CPU. Table 23-1 lists their roles. When a program starts, a
+pointer to its <span class="key-term">context</span>—the packet, the traced
+function's arguments, whatever is appropriate to the program type—is waiting in
+<code>R1</code>, and the program returns a value to the kernel in <code>R0</code>.
+The read-only frame pointer <code>R10</code> points at a small 512-byte stack, the
+program's only scratch memory that is not a map.
+</p>
+
+<p>
+The table lists a twelfth register that no program can name. <code>BPF_REG_AX</code>
+is defined as <code>MAX_BPF_REG</code>
+(<code class="file-path">include/linux/filter.h</code>)—one past the last register
+the instruction encoding admits—and exists so that the kernel has somewhere to put
+a value when it rewrites a program after verification. The verifier and the JIT
+both do this: a signed division expands into several instructions that need a
+temporary, the constant-blinding pass of &sect;4 needs a register in which to
+reconstruct the immediate it has just split apart, and the interpreter itself uses
+<code>AX</code> as scratch while emulating division. Because user space cannot
+encode a reference to it—the four-bit register fields can, but the verifier rejects
+any program that tries—the kernel can treat it as private, clobbering it freely
+between instructions with no risk of destroying something the program expected to
+survive. Every architecture's JIT therefore has to find a real register for
+<code>AX</code> as well as for <code>R0</code> through <code>R10</code>; on x86_64
+it lands in <code>r10</code>, which is why that architecture also keeps a second
+hidden register, <code>AUX_REG</code> in <code>r11</code>, for the rewrites the JIT
+performs on its own account.
+</p>
+
+<table>
+<caption>Table 23-1. The eBPF registers and their calling convention</caption>
+<thead>
+<tr><th>Register</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>R0</code></td><td>Return value from helper calls and from the program itself</td></tr>
+<tr><td><code>R1</code> &ndash; <code>R5</code></td><td>Arguments to helper and function calls; <code>R1</code> holds the context pointer on entry</td></tr>
+<tr><td><code>R6</code> &ndash; <code>R9</code></td><td>Callee-saved registers, preserved across helper calls</td></tr>
+<tr><td><code>R10</code></td><td>Read-only frame pointer to the 512-byte program stack</td></tr>
+<tr><td><code>AX</code></td><td>Hidden scratch register (<code>BPF_REG_AX</code>); usable by the kernel's own rewrites, not nameable from user space</td></tr>
+</tbody>
+</table>
+
+<p>
+Each instruction is a fixed eight bytes, described by <code>struct bpf_insn</code>
+(<code class="file-path">include/uapi/linux/bpf.h</code>): an opcode, a destination
+and a source register packed into one byte, a signed 16-bit offset, and a signed
+32-bit immediate.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/uapi/linux/bpf.h */
+struct bpf_insn {
+	__u8	code;		/* opcode */
+	__u8	dst_reg:4;	/* dest register */
+	__u8	src_reg:4;	/* source register */
+	__s16	off;		/* signed offset */
+	__s32	imm;		/* signed immediate constant */
+};</code></pre></div>
+
+<p>
+The five fields, summarized in Table 23-2, pack a complete instruction into eight
+bytes. The <code>code</code> byte is the opcode, whose structure the classes below
+elaborate; the two register fields are four bits each—enough to name any of the
+eleven registers—so a destination and a source register share a single byte. The
+<code>off</code> field is a signed displacement used by memory accesses and as the
+target of jumps, and <code>imm</code> is a signed 32-bit constant used as an
+operand or, for calls, a helper or function identifier.
+</p>
+
+<p>
+Those last two fields are less tidy than the table makes them look, because a
+fixed eight-byte encoding leaves nowhere to put a new operation once the opcode
+byte is crowded, and both have been pressed into service as opcode extensions. On
+a division or modulo, <code>off</code> is not a displacement at all: zero means the
+operation is unsigned and one means it is signed, which is how signed division was
+added without spending an opcode. On a register-to-register move, an
+<code>off</code> of <code>BPF_ADDR_SPACE_CAST</code> turns the move into a pointer
+cast between address spaces, the instruction that makes the sparse shared memory of
+a BPF arena (&sect;5.2) addressable. On an atomic instruction the sub-operation lives in
+<code>imm</code> rather than in the opcode, so <code>imm</code> distinguishes an
+atomic add from a compare-and-exchange. Reading eBPF bytecode therefore means
+knowing the class before the remaining fields can be interpreted at all—a price
+paid once, in the disassembler and the verifier, in exchange for an instruction
+that never needs more than eight bytes.
+</p>
+
+<table>
+<caption>Table 23-2. Fields of struct bpf_insn</caption>
+<thead>
+<tr><th>Field</th><th>Width</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>code</code></td><td>8 bits</td><td>The opcode: instruction class, operation, and mode (see Table 23-3)</td></tr>
+<tr><td><code>dst_reg</code></td><td>4 bits</td><td>The destination register (<code>R0</code>&ndash;<code>R10</code>)</td></tr>
+<tr><td><code>src_reg</code></td><td>4 bits</td><td>The source register, when the operation takes one</td></tr>
+<tr><td><code>off</code></td><td>16 bits, signed</td><td>Memory-access displacement or jump offset; on a few instructions an opcode modifier instead (signed division, address-space cast)</td></tr>
+<tr><td><code>imm</code></td><td>32 bits, signed</td><td>Immediate operand, call target, atomic sub-operation, or the offset of a long jump</td></tr>
+</tbody>
+</table>
+
+<p>
+A single exception, loading a 64-bit immediate, uses a
+double-width sixteen-byte form. The opcodes are grouped into
+<span class="key-term">classes</span>—64-bit and 32-bit arithmetic
+(<code>BPF_ALU64</code>, <code>BPF_ALU</code>), jumps
+(<code>BPF_JMP</code>, <code>BPF_JMP32</code>), and memory loads and stores
+(<code>BPF_LDX</code>, <code>BPF_STX</code>, and relatives)—a design close enough
+to a real RISC instruction set that the JIT of &sect;4 can often translate one
+eBPF instruction into one or two machine instructions. This deliberate resemblance
+to hardware is the difference between eBPF and its classic ancestor, and it is
+what lets eBPF programs run at native speed rather than being slowly interpreted.
+Table 23-3 lists the eight instruction classes—the low three bits of the opcode
+byte—that every instruction belongs to.
+</p>
+
+<p>
+The double-width load deserves more than its one-line mention, because it is the
+seam at which a program stops being self-contained. Its second eight bytes hold
+the upper half of the constant, but its <code>src_reg</code> field carries a small
+code that changes what the constant means. A plain zero loads the literal value.
+<code>BPF_PSEUDO_MAP_FD</code> says the value is a file descriptor for a map, and
+the kernel replaces it at load time with the kernel address of the corresponding
+<code>struct bpf_map</code>; <code>BPF_PSEUDO_MAP_VALUE</code> does the same but
+resolves to an offset inside a map's value, which is how a global variable in a C
+program becomes an address. <code>BPF_PSEUDO_BTF_ID</code> resolves to the address
+of a kernel variable named by BTF, and <code>BPF_PSEUDO_FUNC</code> to the address
+of another function in the same program. This is the mechanism referred to
+loosely elsewhere in the chapter as a program &ldquo;referring to&rdquo; a
+map: the compiler emits an instruction with a placeholder, the loader patches the
+file descriptor in, and the kernel rewrites it into a pointer that the program
+could never have computed for itself. A program as it leaves the compiler is
+therefore not runnable bytecode but bytecode plus a set of relocations, and one of
+the quieter jobs of <code>BPF_PROG_LOAD</code> is to resolve them.
+</p>
+
+<table>
+<caption>Table 23-3. The eBPF instruction classes (low 3 bits of the opcode)</caption>
+<thead>
+<tr><th>Class</th><th>Value</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BPF_LD</code></td><td>0x00</td><td>Load, including the double-width 64-bit immediate load</td></tr>
+<tr><td><code>BPF_LDX</code></td><td>0x01</td><td>Load from memory into a register (stack, map value, context, packet)</td></tr>
+<tr><td><code>BPF_ST</code></td><td>0x02</td><td>Store an immediate to memory</td></tr>
+<tr><td><code>BPF_STX</code></td><td>0x03</td><td>Store a register to memory; also carries the atomic operations</td></tr>
+<tr><td><code>BPF_ALU</code></td><td>0x04</td><td>32-bit arithmetic and logic (add, sub, and, shifts, &hellip;)</td></tr>
+<tr><td><code>BPF_JMP</code></td><td>0x05</td><td>64-bit conditional and unconditional jumps, calls, and exit</td></tr>
+<tr><td><code>BPF_JMP32</code></td><td>0x06</td><td>32-bit conditional jumps (was <code>BPF_RET</code> in classic BPF)</td></tr>
+<tr><td><code>BPF_ALU64</code></td><td>0x07</td><td>64-bit arithmetic and logic (was <code>BPF_MISC</code> in classic BPF)</td></tr>
+</tbody>
+</table>
+
+<p>
+Within a class the remaining opcode bits select the specific operation and its
+operands. For arithmetic and jumps, the high nibble names the operation
+(<code>BPF_ADD</code>, <code>BPF_SUB</code>, <code>BPF_JEQ</code>,
+<code>BPF_JGT</code>, and so on) and one bit, the <span class="key-term">source</span>
+bit, chooses whether the second operand is another register (<code>BPF_X</code>)
+or the instruction's immediate field (<code>BPF_K</code>). For loads and stores,
+other bits encode the access <span class="key-term">size</span>—<code>BPF_B</code>,
+<code>BPF_H</code>, <code>BPF_W</code>, or <code>BPF_DW</code> for 8, 16, 32, or
+64 bits—and the addressing mode. The two classes whose values were reused,
+<code>BPF_JMP32</code> and <code>BPF_ALU64</code>, are a visible fossil of the
+extension: they occupy the opcode slots that classic BPF used for
+<code>BPF_RET</code> and <code>BPF_MISC</code>, which eBPF dropped, so the same
+three-bit field that once encoded a two-register filter now encodes a full 64-bit
+machine.
+</p>
+
+<p>
+A few properties of the instruction set repay attention. The choice of eleven
+registers is not arbitrary: it matches the number of general-purpose registers
+that both the x86_64 and ARM64 calling conventions can dedicate to eBPF, so that
+each virtual register lives in a real hardware register and the JIT rarely has to
+spill to memory—one reason JIT'd eBPF is so fast. The presence of a full set of
+32-bit operations (<code>BPF_ALU</code>, <code>BPF_JMP32</code>) alongside the
+64-bit ones lets the compiler use narrower, cheaper instructions where a value is
+known to fit, and lets the verifier track 32-bit sub-registers precisely.
+</p>
+
+<p>
+The one class of instruction that concerns concurrency is the
+<span class="key-term">atomic</span> group, carried inside <code>BPF_STX</code>
+with the sub-operation in <code>imm</code>. It is a fuller set than its origins
+suggest. The original member was an atomic add, and the name
+<code>BPF_XADD</code> survives as an alias for the flag that now means
+&ldquo;atomic&rdquo; in general; alongside it are atomic and, or and exclusive-or,
+each of which may set <code>BPF_FETCH</code> to return the previous value as well
+as apply the operation, plus an unconditional exchange and a compare-and-exchange
+that takes its expected value in <code>R0</code>. To these the kernel has added
+<code>BPF_LOAD_ACQ</code> and <code>BPF_STORE_REL</code>, a load-acquire and a
+store-release compiling to <code>smp_load_acquire()</code> and
+<code>smp_store_release()</code>. Their arrival is more significant than one more
+pair of opcodes, because ordering operations are only meaningful against a
+memory model, and eBPF now has to have one: a program written on x86_64 and
+loaded on ARM64 must observe the same orderings, so what the JITs emit for these
+two instructions is a portability guarantee rather than a local optimization.
+</p>
+
+<p>
+That pair of opcodes is also a reminder that the instruction set is not finished.
+The compiler exposes the encoding it will emit as a CPU version,
+and a program built for a newer one will be rejected by an older kernel. The
+fourth such version brought sign-extending loads (<code>BPF_MEMSX</code>) and
+moves (<code>BPF_MOVSX</code>), so that reading a signed char from a structure no
+longer costs a shift pair; signed division and modulo, encoded in <code>off</code>
+as described above; and a long unconditional jump, <code>BPF_JMP32 | BPF_JA</code>,
+whose displacement is the 32-bit <code>imm</code> rather than the 16-bit
+<code>off</code>, lifting a limit that large generated programs had begun to hit.
+A later addition, <code>BPF_JCOND</code>, is stranger: its only condition,
+<code>BPF_MAY_GOTO</code>, is a jump the verifier is free to take or not, which
+the compiler emits at the head of a loop whose trip count it cannot bound. The
+verifier turns it into a hidden countdown, so the loop terminates because the
+machine will eventually refuse to go round again rather than because anyone proved
+it would stop—the clearest example in the instruction set of a capability granted
+with its failure attached.
+</p>
+
+<p>
+What the set pointedly lacks is as telling as what it has: there are no I/O
+instructions, no way to raise an interrupt, no privileged operations, and every
+jump target is a fixed offset the verifier can follow rather than a value computed
+at run time. The instruction set is, in short, expressive enough to compute and to
+manipulate data structures, and no more.
+</p>
+
+<h3 id="interp">The Interpreter, Stack, and Tail Calls</h3>
+
+<p>
+On systems where the JIT is disabled, eBPF bytecode is executed by an
+<span class="key-term">interpreter</span>, <code>___bpf_prog_run</code>
+(<code class="file-path">kernel/bpf/core.c</code>), a carefully optimized
+dispatch loop that reads each instruction and performs its operation on the
+virtual registers. The interpreter is the reference semantics of the machine: the
+JIT must produce code that behaves exactly as it would. Each program frame gets a
+stack of at most <code>MAX_BPF_STACK</code> (512) bytes, addressed through
+<code>R10</code>; the verifier of &sect;3 guarantees a program never reads
+uninitialized stack or exceeds this bound.
+</p>
+
+<p>
+The interpreter repays a look, because its two implementation tricks say
+something about how narrow the margins are. The dispatch loop is not a
+<code>switch</code> statement but a computed-goto table: a 256-entry array of label
+addresses indexed by the opcode byte, every unused slot pointing at a single
+rejection label, so decoding an instruction is one array read and one indirect
+jump with no bounds test and no return to the top of a loop between instructions.
+And <code>___bpf_prog_run</code> is not what the kernel actually calls. Sixteen
+wrappers are generated around it, <code>__bpf_prog_run32</code> through
+<code>__bpf_prog_run512</code>, each declaring a C array of exactly that many
+bytes to serve as the program's stack, and
+<code>bpf_prog_select_interpreter()</code> picks one by rounding the verified stack
+depth up to a multiple of thirty-two. A program that uses eight bytes of stack
+costs a thirty-two-byte frame rather than a five-hundred-and-twelve-byte one. This
+matters because eBPF runs on kernel stacks that are only a few pages deep, often
+several frames into some other subsystem's call chain, and a fixed half-kilobyte
+frame on every invocation would be an unaffordable tax on a mechanism whose whole
+argument is that it is cheap.
+</p>
+
+<p>
+Two mechanisms let programs grow beyond a single straight-line body. A
+<span class="key-term">tail call</span> lets one program jump to another—selected
+by index from a special program-array map—without returning, a way to compose
+behavior and stay within the instruction limit; the chain is capped at
+<code>MAX_TAIL_CALL_CNT</code>, thirty-three, counted in a variable local to the
+interpreter frame so that recursion through a cycle of programs terminates. Ordinary
+<span class="key-term">function calls</span> (BPF-to-BPF calls) let a program be
+split into subroutines that the verifier analyzes individually. Which runtime
+actually executes a loaded program—interpreter or JIT—is chosen by
+<code>bpf_prog_select_runtime</code>
+(<code class="file-path">kernel/bpf/core.c</code>); on a kernel built with
+<code>CONFIG_BPF_JIT_ALWAYS_ON</code>, the interpreter is compiled out entirely and
+a program that cannot be JIT-compiled is simply refused, closing off the
+interpreter as a potential attack surface.
+</p>
+
+<p>
+One detail of the dispatch table gives away something the chapter has not yet
+said. Several of its entries are for opcodes that appear in no specification and
+that <code>BPF_PROG_LOAD</code> would reject outright: <code>BPF_TAIL_CALL</code>,
+which is how the tail-call helper is recognized without a real call;
+<code>BPF_PROBE_MEM</code>, a load that is allowed to fault and delivers zero into
+the destination register instead of oopsing, which is what makes reading an
+arbitrary kernel pointer in a tracing program survivable; and
+<code>BPF_ST | BPF_NOSPEC</code>, a speculation barrier whose purpose is taken up
+in &sect;4. These exist because the bytecode the interpreter runs is not the bytecode
+that was loaded. The verifier rewrites the program as it goes—converting an
+ordinary load into a faulting one where it decided the pointer was untrusted,
+narrowing a context access into the real structure field behind it, planting a
+barrier where it could not otherwise rule out a speculative path—using an
+instruction vocabulary wider than the one user space is permitted. That asymmetry
+is not incidental to the design. The verifier's guarantee is not only that it rejects
+what it cannot prove but that it may make a program safe that was not, and it needs
+instructions of its own to do so.
+</p>
+
+<p>
+Two practical constraints on the machine follow from how it is run. The 512-byte
+stack is genuinely small—far too small for large buffers or deep recursion—which
+is deliberate: it bounds the memory a program can consume and keeps the verifier's
+per-frame analysis finite, and it pushes any substantial state out into maps,
+where it is shared and accounted for rather than hidden on a stack. A program that
+needs more working room uses a map; a program that needs to be large is split with
+function calls or chained with tail calls. The other constraint is on the
+interpreter itself, which even where present is a liability on the fastest paths:
+an XDP program interpreted per packet would be far too slow, so hooks that fire at
+high frequency rely on the JIT and on a <span class="key-term">dispatcher</span>
+(<code class="file-path">kernel/bpf/dispatcher.c</code>) that replaces the indirect
+call into a program with a direct one, eliminating even the branch-prediction cost
+of reaching the program. The recurring theme of this section—a small, restricted,
+carefully bounded machine—is thus not only about safety but about speed: the same
+limits that make a program easy to prove safe also make it cheap to run millions of
+times a second.
+</p>
+
+<hr>
+<h2 id="verifier">The Verifier</h2>
+
+<p class="chapter-intro">
+The verifier is what makes eBPF possible. It is a static analyzer that examines a
+program's bytecode before the kernel will run it and either proves that the
+program is safe—cannot crash, leak, or hang the kernel—or rejects it. Because the
+proof is done once, at load time, the program itself needs no run-time checks and
+can execute at full speed. Everything permissive about eBPF, all the places it is
+allowed to run and the kernel data it is allowed to touch, is underwritten by this
+one component. This section describes what the verifier guarantees and, at a high
+level, how it reaches those guarantees.
+</p>
+
+<p>
+How unusual this component is takes a moment to register. Most of the kernel enforces
+safety <em>dynamically</em>—a bounds check runs each time an array is indexed, a
+lock is taken on every critical section—paying a small cost at run time forever.
+The verifier does the opposite: it pays a potentially large cost
+<em>once</em>, at load, to prove a property that then holds for free on every
+subsequent execution. It is, in effect, a small theorem prover living in the
+kernel, and like any prover it must be <span class="key-term">conservative</span>:
+faced with a program it cannot prove safe, it must reject it, even if the program
+would in fact have behaved. This is the source of the eBPF developer's characteristic
+frustration—programs that are obviously correct to a human but that the verifier
+cannot follow—and it is a deliberate trade. A false rejection costs a developer
+some rewriting; a false acceptance would cost the kernel its integrity. The
+verifier is tuned, always, to fail safe.
+</p>
+
+<h3 id="proves">What the Verifier Proves</h3>
+
+<p>
+The verifier, entered at <code>bpf_check</code>
+(<code class="file-path">kernel/bpf/verifier.c</code>), establishes a specific set
+of safety properties, and a program that violates any of them is refused. It
+proves that the program <span class="key-term">terminates</span>: control flow
+forms an acyclic graph except for loops it can prove bounded, and total work is
+capped by a complexity limit (<code>BPF_COMPLEXITY_LIMIT_INSNS</code>, a million
+instructions of analysis—raised from an earlier hard limit of a few thousand) so
+that no program can loop forever. It proves that
+every <span class="key-term">memory access is in bounds</span>—into the stack, a
+map value, or a packet—and that the program never reads uninitialized memory,
+through <code>check_mem_access</code>. It proves that the program never
+<span class="key-term">leaks kernel pointers</span> to user space, by tracking
+which values are pointers and forbidding them from being stored where user space
+could read them. And it proves that every <span class="key-term">helper call</span>
+is valid—that the helper is permitted for this program type and that its arguments
+have the types the helper requires—through <code>check_helper_call</code> and
+<code>check_func_arg</code>. The maps of &sect;5 and the helper machinery of
+&sect;10 rest on these guarantees.
+</p>
+
+<p>
+A fifth property belongs on that list, and it constrains the program's shape
+rather than its instructions: the verifier proves that the
+<span class="key-term">call depth is bounded</span>. A program may call its own
+functions, but <code>MAX_CALL_FRAMES</code>
+(<code class="file-path">include/linux/bpf_verifier.h</code>) caps the nesting at
+eight frames, and <code>check_max_stack_depth</code> adds up the stack each frame
+needs to confirm the total fits. Recursion is refused outright, since a call graph
+with a cycle has no bound the verifier could compute. The reason for the fuss is
+that an eBPF program does not get a stack of its own: it runs on whatever kernel
+stack the hook it is attached to happens to be using, already some depth into that
+subsystem's own call chain. A guarantee that a program cannot read out of bounds
+would be worth little if it could still overflow the stack it borrowed, so the
+worst-case depth has to be known before the program is allowed anywhere near a
+hook.
+</p>
+
+<p>
+It is important to be precise about what &ldquo;safe&rdquo; means here, because the
+word promises less than it may seem. The verifier is a
+<span class="key-term">safety tool, not a security tool</span>: it proves that a
+program cannot crash the kernel, hang it, read out of bounds, or leak kernel
+pointers, but it does not judge what the program <em>does</em> with the access it
+is legitimately granted. A verified tracing program that is permitted to read a
+data structure can still read a secret in that structure and report it; the
+verifier guarantees the read is in bounds, not that it is wise or authorized. This
+is why the privilege to load programs matters so much (&sect;6.1) and why security
+policy is layered on top through capabilities, the unprivileged-eBPF switch, and
+LSM controls—the verifier secures the kernel <em>against</em> the program's
+mechanics, while those other mechanisms govern <em>who</em> may run one and
+<em>what</em> it is allowed to see.
+</p>
+
+<p>
+One further guarantee shows how far the verifier's reasoning reaches: <span class="key-term">reference tracking</span>. Some helpers
+and kfuncs hand a program a resource it must later give back—a looked-up socket it
+must release, a reserved ring-buffer slot it must submit or discard, a dynamic
+pointer it must free. The verifier models each such resource as an outstanding
+<span class="key-term">reference</span> (<code>acquire_reference</code> when it is
+obtained, <code>release_reference_state</code> when it is returned,
+<code class="file-path">kernel/bpf/verifier.c</code>) and refuses to accept a
+program that could reach its exit—by any path—with a reference still held,
+reporting an &ldquo;unreleased reference&rdquo; error. This turns what would be a
+resource leak or a use-after-free in ordinary C into a load-time rejection: the
+program cannot even be loaded unless every acquired resource is provably released
+on every path. It is a small but striking example of the verifier enforcing not
+just memory safety but correct <em>protocol</em>—the disciplined use of the
+kernel's own resources—before a single instruction runs.
+</p>
+
+<p>
+Reference tracking in turn explains a feature that would otherwise look reckless.
+A program can abandon its work part way through by calling
+<code>bpf_throw()</code>, which unwinds to an exception callback the program
+declared in its BTF and returns a value to the kernel on the program's behalf. An
+early exit from arbitrary depth is exactly the construct that leaks resources in
+ordinary C, and the verifier's answer is to treat a throw as one more path to the
+exit and hold it to the same standard: everything acquired must be provably
+released before it, just as on any ordinary return. The result is a language
+feature that looks like an escape hatch from verification and is in fact one more
+thing the verifier checks—which is the pattern the whole subsystem follows, and
+the reason why eBPF can keep acquiring constructs that in
+any other setting would be exactly what a static analyzer cannot handle.
+</p>
+
+<h3 id="how-verify">How the Verifier Works</h3>
+
+<p>
+The verifier reaches its conclusions by <span class="key-term">abstract
+interpretation</span>: it simulates the program's execution over all possible
+paths, tracking not concrete values but what it can know about each register and
+stack slot. For every register it maintains a <code>struct bpf_reg_state</code>
+(<code class="file-path">include/linux/bpf_verifier.h</code>) recording the
+register's <span class="key-term">type</span>—an enumerated kind such as
+<code>SCALAR_VALUE</code>, <code>PTR_TO_CTX</code> (the context),
+<code>PTR_TO_MAP_VALUE</code>, <code>PTR_TO_STACK</code>, or
+<code>PTR_TO_PACKET</code>—and, for scalars, a
+<span class="key-term">range</span> of possible values kept as both signed and
+unsigned minimums and maximums and as a <span class="key-term">tnum</span>, a
+representation that tracks which bits are known and which are unknown
+(<code class="file-path">kernel/bpf/tnum.c</code>). When the program accesses
+memory through a pointer, the verifier checks the access against what it knows
+about that pointer's type and bounds; when it calls a helper, it checks each
+argument's tracked type against the helper's declared prototype.
+</p>
+
+<p>
+Calling that field a type is a simplification that has become steadily less
+accurate, and several of the chapter's later guarantees are expressed in the real
+shape of it. A register's type is a base kind
+in the low bits and a bitmask of <span class="key-term">type flags</span> above
+(<code class="file-path">include/linux/bpf.h</code>), so that a property can be
+attached to any kind without inventing a new one for each combination.
+<code>PTR_MAYBE_NULL</code> is such a flag, and
+<code>PTR_TO_MAP_VALUE_OR_NULL</code> is not an independent type at all but
+literally <code>PTR_MAYBE_NULL | PTR_TO_MAP_VALUE</code>. <code>MEM_RDONLY</code>
+marks memory the program may read and not write. <code>MEM_RCU</code> marks a
+pointer valid only while the current RCU read-side critical section lasts.
+<code>MEM_ALLOC</code> marks an object the program allocated and therefore owns.
+The most consequential pair is <code>PTR_TRUSTED</code> and
+<code>PTR_UNTRUSTED</code>, which are not opposites despite the names: a trusted
+pointer came from the kernel in a context where its lifetime is guaranteed and may
+be handed on to a helper or kfunc, while an untrusted one—a pointer read out of a
+map, or reached by walking from a trusted pointer to something the verifier cannot
+vouch for—may be dereferenced but may not escape back into the kernel. That
+distinction is what lets a program follow kernel data structures at all, and it is
+taken up again in the discussion of kfuncs in &sect;10.2.
+</p>
+
+<p>
+Two refinements of this tracking catch the mistakes programmers most often
+make. The first is <span class="key-term">nullable
+pointers</span>. A map lookup does not return a usable pointer but a
+<em>maybe-null</em> one, carrying the flag just described—and the verifier
+refuses to let the program dereference it directly. Only when the program tests it
+against zero does the verifier, on the branch where the test proved it non-null,
+clear <code>PTR_MAYBE_NULL</code> to leave the usable
+<code>PTR_TO_MAP_VALUE</code>; on the other branch it
+stays null and any dereference is rejected. This makes the null check that C
+programmers so often forget a load-time requirement rather than a run-time crash.
+The second is <span class="key-term">related-register tracking</span>. When a
+program copies one register to another, the verifier records that the two are
+linked (through a shared identifier), so that a bound later learned about one is
+applied to the other as well. This is what makes the idiomatic packet-bounds
+check work: a program computes a pointer to the end of the data it wants to read,
+compares it against the packet's end pointer, and the verifier propagates the
+range proven by that single comparison to every register derived from it,
+establishing that the subsequent reads are in bounds.
+</p>
+
+<p>
+Because branches multiply the paths to consider, the verifier explores the program
+as a graph: at each conditional it uses what it has learned to refine the register
+ranges on each side (a comparison against a bound narrows the range that survives
+it), pushing the alternative path onto a stack with <code>push_stack</code> to
+examine later. To keep this from exploding, it <span class="key-term">prunes</span>:
+<code>is_state_visited</code> recognizes when it reaches a program point in a state
+no more permissive than one it has already proven safe, and stops re-exploring. A
+final touch bridges the abstract machine and the concrete kernel:
+<code>convert_ctx_accesses</code> rewrites the program's accesses to context
+fields—which the program wrote as if the context were a simple structure—into the
+real offsets of the underlying kernel structure, so the same bytecode can run
+against kernel layouts it was never compiled against. When a program is rejected,
+the reason is written to a <span class="key-term">verifier log</span> that user
+space can read, which is why eBPF developers spend so much time reading the
+verifier's often-lengthy explanations of why their program is unsafe.
+</p>
+
+<p>
+Pruning as just described could not work on its own, and the reason exposes the
+verifier's cleverest mechanism. Two states reaching the same instruction almost
+never match exactly—some scalar will hold 7 in one and 9 in the other—so a
+literal comparison would find almost nothing equivalent and the analysis would
+explore everything. What rescues it is
+<span class="key-term">precision tracking</span>. The verifier notices which
+registers a decision actually depended on—the ones that determined a branch, or
+bounded a memory access—and when it finds one, <code>mark_chain_precision</code>
+walks the instruction history <em>backwards</em>, marking every register and stack
+slot that contributed to that value as <code>precise</code>. When two states are
+later compared, only the precise parts must agree; everything else may differ
+freely. The analysis is therefore exact where exactness is load-bearing and
+deliberately forgetful everywhere else, which is what keeps the state count
+tractable. It also explains a frustration that otherwise looks arbitrary: a
+program can be rejected because a value the programmer never thought important got
+marked precise somewhere far away, splitting states that would otherwise have
+merged, and a rewrite that changes nothing about the program's behaviour can make
+it verify.
+</p>
+
+<p>
+Two realities temper this elegant picture. The first is that the analysis happens
+in a definite order, established up front: before exploring states, the verifier
+runs <code>check_cfg</code> to build the program's control-flow graph and reject
+disallowed shapes—an unreachable instruction, a jump out of range, or an
+unbounded back-edge that would form a loop it cannot prove terminates. Loops are
+allowed only where the verifier can bound them, precisely because an unbounded
+loop is the one control-flow shape its path exploration cannot exhaust. The second
+reality is <span class="key-term">state explosion</span>. Because the
+verifier walks every path, a program with many branches can generate an enormous
+number of states to check, and although pruning collapses equivalent ones, the
+work is bounded only by hard limits—chiefly the million-instruction complexity
+ceiling of &sect;3.1, alongside a bound on how many branches may be waiting to be
+explored and, for unprivileged loads only, a much tighter cap on how many distinct
+states a single instruction may accumulate—beyond which even a safe program is
+rejected for being too complex to analyze. Improvements to the verifier's
+precision and pruning are therefore a continual focus of kernel development: every
+gain lets it accept programs it previously had to refuse. The verifier's power and
+its limitations are two faces of the same exhaustive search.
+</p>
+
+<p>
+Neither reality is as hard a wall as it once was. Loops, to take the first, no
+longer need their iteration count proved. The <code>bpf_loop</code> helper takes the body as a
+callback that the verifier checks once and treats as running an unknown number of
+times, and the open-coded iterators of &sect;10.2 go further: with
+<code>bpf_iter_num_new</code>, <code>bpf_iter_num_next</code> and
+<code>bpf_iter_num_destroy</code> a program writes an ordinary <code>while</code>
+loop in C, and the verifier tracks the iterator as a small state machine, knowing
+that <code>next</code> must eventually return null and requiring that
+<code>destroy</code> be reached on every path. The <code>may_goto</code>
+instruction of &sect;2.1 is the same bargain without even an iterator, the verifier
+supplying a hidden countdown for a loop it cannot bound at all.
+</p>
+
+<p>
+State explosion has an answer better than splitting a program into tail-called
+pieces, and it is the one large eBPF programs actually use. A function declared with global
+linkage is verified <em>independently</em> of its callers: at the call site the
+verifier checks only that the arguments match the function's BTF prototype and
+assumes the function is safe, then verifies the function separately against
+arbitrary inputs of those types (<code>do_check_subprogs</code>). The cost of a
+program becomes the sum of its functions rather than the product of their paths,
+which is the difference between a large program verifying and a large program
+being refused. The discipline it imposes is the familiar one: a global function
+must be describable by a type signature, because the signature is the entire
+contract between it and the rest of the program—the same trade an ordinary C
+programmer makes when splitting a file into translation units, enforced here by
+something that will not accept the program otherwise.
+</p>
+
+<hr>
+<h2 id="jit">The JIT Compiler</h2>
+
+<p class="chapter-intro">
+Once the verifier has accepted a program, most systems do not interpret it at all
+but translate it to native machine code with a
+<span class="key-term">just-in-time compiler</span>. Because the eBPF instruction
+set was designed to resemble real hardware, this translation is direct and the
+resulting code runs as fast as any other compiled kernel code—which is what makes
+it practical to attach an eBPF program to a hook that fires millions of times a
+second. This section describes the JIT and the safety measures that surround it.
+</p>
+
+<p>
+The JIT is not merely an optimization, and why it matters as much as it does
+takes a paragraph to say. The interpreter of &sect;2.2 is a dispatch loop:
+for each eBPF instruction it fetches the opcode, branches to the code that
+implements it, and updates the virtual registers—many native instructions of
+overhead per bytecode instruction. For a program on a cold path this is
+irrelevant, but the hooks where eBPF earns its keep are the hottest paths the
+kernel has: an XDP program runs once per received packet, an fentry probe once per
+call of a busy function. At those rates interpreter overhead would be
+prohibitive, and the whole premise of eBPF—that a program can be attached
+everywhere without slowing the kernel—would collapse. The JIT is what makes the
+premise true: by turning the bytecode into the same kind of native code the rest
+of the kernel is compiled to, it erases the distinction between a loaded eBPF
+program and a built-in kernel function. On most modern systems it is on by
+default, and the interpreter survives mainly as a fallback and a reference.
+</p>
+
+<h3 id="jit-native">From Bytecode to Native Code</h3>
+
+<p>
+Each architecture provides a JIT back end, <code>bpf_int_jit_compile</code>, that
+walks the verified bytecode and emits equivalent native instructions. The
+translation is largely one-to-one: an <code>ALU64</code> add becomes a native add,
+a jump becomes a native branch, a map lookup becomes a call. The generated code is
+written into an executable kernel allocation headed by a
+<code>struct bpf_binary_header</code>, and when compilation succeeds the kernel
+records the result in the program object—setting <code>prog-&gt;jited</code> and
+pointing <code>prog-&gt;bpf_func</code> at the native entry point—so that every
+later invocation calls straight into machine code with no interpreter in the loop.
+The whole selection between interpreter and JIT is made once, in
+<code>bpf_prog_select_runtime</code> (<code class="file-path">kernel/bpf/core.c</code>),
+and is governed by the <code class="file-path">/proc/sys/net/core/bpf_jit_enable</code>
+sysctl.
+</p>
+
+<p>
+A few practical details fill out the picture. Compilation is not a single sweep
+but a small <span class="key-term">multi-pass</span> process: the back end
+assembles the program more than once because the size of a native instruction can
+depend on how far away its jump target is, and the offsets are only known once a
+first pass has laid the code out. Programs that contain BPF-to-BPF calls are
+handled by <code>jit_subprogs</code>, which compiles each subprogram and then
+resolves the calls between them in a final pass. Because a system may load a great
+many small programs, the kernel does not give each its own page but
+<span class="key-term">packs</span> several into shared executable huge pages
+(<code>bpf_prog_pack</code>, <code class="file-path">kernel/bpf/core.c</code>),
+reducing the pressure JIT'd code places on the CPU's instruction TLB, and it caps
+total JIT memory with <code>bpf_jit_limit</code>—half the address space
+available for executable allocations, by default—so that loading programs cannot
+exhaust it. For debugging, setting <code>bpf_jit_enable</code> to <code>2</code>
+makes the kernel dump the generated machine code to the kernel log—useful for
+understanding what the JIT produced, and pointedly warned against in production.
+</p>
+
+<p>
+Sharing a page between programs has a consequence that leads somewhere
+unexpected: it produces the strongest form of the write-exclusive-or-execute rule anywhere in the
+kernel. If several programs live in one read-only executable page, no single
+program's compilation can be allowed to make that page writable, so the JIT does
+not write to the executable address at all.
+<code>bpf_jit_binary_pack_alloc</code> hands the back end two things: an ordinary
+writable buffer to emit into, and a reservation in a shared read-only executable
+pack where the finished code will live. When the back end is done,
+<code>bpf_jit_binary_pack_finalize</code> copies the image across with
+<code>bpf_arch_text_copy</code>, the same text-poking primitive the kernel uses to
+patch its own instructions, and frees the writable buffer. The image is therefore
+never writable at the address it will be executed from—not briefly, not during
+compilation—which is a stronger guarantee than making a page read-only after
+writing it, and it closes the window an attacker would most want.
+</p>
+
+<p>
+Native code raises a problem the interpreter never had: once a program is a block
+of anonymous machine instructions, nothing in the kernel knows what it is. A stack
+trace through it shows a bare address, <code>perf</code> cannot attribute a sample
+to it, and an oops that passes through it is unreadable. The kernel therefore
+registers each JIT'd program as a kernel symbol
+(<code>bpf_prog_kallsyms_add</code>, <code class="file-path">kernel/bpf/core.c</code>),
+built from the program's name and the first bytes of the hash of its instructions,
+so it appears in <code class="file-path">/proc/kallsyms</code> like any other
+function and the ordinary symbolization machinery resolves addresses inside it.
+<code>is_bpf_text_address</code> lets the unwinder recognize such an address as
+kernel text at all. The behaviour is controlled by its own sysctl,
+<code>bpf_jit_kallsyms</code>, which defaults on where the JIT does, and turning it
+off trades away all of this to avoid publishing the addresses of JIT'd code to
+anyone who can read the symbol table.
+</p>
+
+<p>
+The JIT also has to make good on a promise the verifier made on its behalf. Where
+the verifier decided a pointer was untrusted it converted the load into the
+faulting <code>BPF_PROBE_MEM</code> form of &sect;2.2, and it falls to the back end
+to arrange that such a load actually survives a fault. It does so by emitting the
+load as ordinary machine code and recording an entry in the program's
+<span class="key-term">exception table</span> tagged <code>EX_TYPE_BPF</code>,
+naming the faulting instruction and the register to clear. When the access does
+fault, the kernel's existing fixup machinery—the same one that makes
+<code>copy_from_user</code> safe—finds the entry, writes zero into the
+destination register, and resumes at the next instruction. A tracing program can
+therefore follow a pointer that turns out to be garbage and read zero instead of
+taking the kernel down with it, and no instruction in the generated code pays for
+the check.
+</p>
+
+<h3 id="jit-arch">Hardening and Architecture Backends</h3>
+
+<p>
+Compiling attacker-influenced bytecode into executable kernel code is itself a
+security concern, so the JIT is wrapped in defenses. <span class="key-term">Constant
+blinding</span>, enabled by the <code>bpf_jit_harden</code> sysctl, rewrites the
+immediate constants a program embeds so that an attacker cannot smuggle a chosen
+machine-code sequence into the JIT's output as data and then jump into the middle
+of an instruction—a class of attack that plagued early JITs. The images themselves
+are never writable at the address they execute from, as &sect;4.1 describes. The
+back ends are architecture-specific—<code class="file-path">arch/x86/net/bpf_jit_comp.c</code> for
+x86_64 and <code class="file-path">arch/arm64/net/bpf_jit_comp.c</code> for
+ARM64—and each must additionally cope with the kernel's control-flow-integrity
+measures, emitting the retpolines or landing pads that the surrounding kernel
+expects, so that JIT'd eBPF is as hardened as the code around it. This is a good
+illustration of the chapter's recurring tension: eBPF's power to run custom code
+in the kernel is matched at every turn by machinery to keep that power from being
+turned against the kernel.
+</p>
+
+<p>
+Described concretely, blinding does more than &ldquo;rewrites the immediate
+constants&rdquo; suggests. For each instruction carrying an
+immediate the kernel draws a fresh random number and emits three instructions in
+place of one: move the constant exclusive-ored with the random value into
+<code>BPF_REG_AX</code>, exclusive-or the random value back out, then perform the
+original operation against that register. The value the program wanted is computed
+at run time and never appears anywhere in the instruction stream, so an attacker
+cannot plant a chosen byte sequence in a constant and jump into the middle of it.
+This is the use of the hidden register of &sect;2.1 that made it necessary, and it
+is also why blinding is not free: every immediate becomes three instructions and a
+register dependency. The <code>bpf_jit_harden</code> sysctl accordingly has three
+settings rather than two—zero for off, one to blind only programs loaded without
+<code>CAP_BPF</code>, two to blind everything—and at the middle setting the
+capability is checked through the program's BPF token, so a container delegated
+the right to load programs is treated as privileged for this purpose too.
+</p>
+
+<p>
+The architecture-specific work is larger than two files suggests: eleven
+architectures ship an eBPF back end, among them x86_64, ARM64, riscv, s390,
+powerpc and loongarch, and each reimplements the whole translation against its own
+encoding and calling convention. The control-flow-integrity obligations differ
+correspondingly. On x86_64 with indirect branch tracking the JIT must begin each
+entry point with an <code>ENDBR</code> instruction, and deliberately poisons the
+one at an address that should never be reached indirectly. On ARM64 it emits a
+<code>BTI</code> landing pad where the kernel is built with branch target
+identification, and where pointer authentication is configured it signs the return
+address in the prologue and authenticates it before returning, exactly as
+compiled kernel functions do. The rule the back ends follow is that generated code
+must be indistinguishable from compiled code as far as the hardware's protections
+are concerned—an eBPF program exempt from them would be the easiest target in
+the kernel.
+</p>
+
+<p>
+The most subtle of these defenses concerns <span class="key-term">speculative
+execution</span>—the Spectre class of vulnerabilities—because an eBPF program is a
+uniquely convenient tool for an attacker who wants to steer the CPU's branch
+prediction and read secrets through a side channel. The kernel counters this on
+two fronts, and both touch the JIT. The verifier does not only analyze the paths a
+program will architecturally take; it also follows the paths the CPU might
+<span class="key-term">speculatively</span> take down a mispredicted branch,
+tracking a per-state <code>speculative</code> flag
+(<code class="file-path">kernel/bpf/verifier.c</code>), and where such a path could
+leak data it inserts a speculation barrier (a <code>nospec</code> operation) or
+masks the offending memory access so that a transient read is confined to a safe
+region. The JIT then realizes those barriers in native code and, for the indirect
+jumps that tail calls compile to, emits <span class="key-term">retpolines</span> or
+LFENCE-based thunks (<code>emit_indirect_jump</code>,
+<code class="file-path">arch/x86/net/bpf_jit_comp.c</code>) that close the
+Spectre-v2 branch-target-injection avenue. These mitigations are why loading an
+eBPF program is safe even on hardware vulnerable to speculative side channels, and
+they are a large part of why the verifier and JIT are as intricate as they are.
+</p>
+
+<hr>
+<h2 id="maps">Maps</h2>
+
+<p class="chapter-intro">
+A verified eBPF program is, by design, sharply limited: it runs briefly, on a
+small stack, and cannot allocate memory or keep global variables in the ordinary
+sense. <span class="key-term">Maps</span> are how it escapes those limits. A map is
+a kernel-resident key/value store, created independently of any program and
+referred to by a file descriptor, that programs and user space can both read and
+write. Maps are how an eBPF program keeps state between invocations, how several
+programs share data, how a program communicates its findings back to user space,
+and even how programs call one another. This section describes the map
+abstraction, the variety of map types, and the mechanisms for moving data through
+them.
+</p>
+
+<p>
+The reason maps carry so much weight is that they are the
+<span class="key-term">only</span> persistent, shareable memory an eBPF program
+has. A program's registers and its 512-byte stack vanish the instant it returns;
+anything it must remember from one invocation to the next, or share with another
+program or with user space, has to live in a map. This constraint turns out to be
+a feature, not just a limitation. Because all durable state is funneled through a
+small set of well-defined map types, that state is <em>accountable</em>: the
+kernel knows exactly how much memory each program's data occupies, charges it to
+the creating process's memory cgroup (through memcg-aware allocation,
+<code class="file-path">kernel/bpf/syscall.c</code>), and can reclaim it when the
+map is destroyed. A program cannot hide unbounded state on a stack or in a leaked
+allocation, because it has neither; it has maps, and maps are counted. This was
+not always so cleanly arranged: map memory used to be charged against the
+creating process's <code>RLIMIT_MEMLOCK</code>, a limit meant for pinned pages
+that fitted eBPF badly and that every serious tool began by raising to infinity,
+which made the accounting a formality. Moving the charge to the memory cgroup
+replaced a limit nobody enforced with one the rest of the kernel already knows how
+to enforce. Even the
+familiar convenience of global variables in eBPF C is, underneath, a map—the
+compiler places a program's globals in a single-entry array map that libbpf
+memory-maps, so that user space and the program share them directly.
+</p>
+
+<h3 id="map-model">The Map Abstraction</h3>
+
+<p>
+Every map is a <code>struct bpf_map</code>
+(<code class="file-path">include/linux/bpf.h</code>) created by the
+<code>BPF_MAP_CREATE</code> command of the <code>bpf()</code> syscall
+(<code>map_create</code>, <code class="file-path">kernel/bpf/syscall.c</code>),
+which fixes its type, key size, value size, and maximum number of entries. Behind
+each map type stands a <code>struct bpf_map_ops</code>—a table of operations
+(<code>map_lookup_elem</code>, <code>map_update_elem</code>,
+<code>map_delete_elem</code>, <code>map_get_next_key</code>, and others)—so that the
+generic map interface can dispatch to a hash table, an array, or a ring buffer
+without the caller caring which. A program accesses a map through
+helper functions such as
+<code>bpf_map_lookup_elem</code>, whose argument types the verifier checks against
+the map's declared key and value sizes; user space accesses the same map through
+the syscall's element commands (<code>BPF_MAP_LOOKUP_ELEM</code> and relatives),
+or, for the batch commands, thousands of elements at once. Because a map's file
+descriptor is an ordinary kernel object, it outlives the program that created it
+and can be handed to others, which is the basis of all sharing in eBPF.
+</p>
+
+<p>
+The descriptor itself is compact. Table 23-4 lists its principal fields: the
+type, the key and value sizes and entry count that define the map's shape, the
+flags and kernel-assigned id, the BTF type identifiers that make its contents
+self-describing, and the reference counts and memory-cgroup pointer through which
+the kernel tracks and accounts for it. Everything specific to a particular kind of
+map—the hash buckets, the array backing store—lives not here but in a private
+structure the <code>ops</code> table knows how to reach.
+</p>
+
+<table>
+<caption>Table 23-4. Principal fields of struct bpf_map</caption>
+<thead>
+<tr><th>Field</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ops</code></td><td>The operations table for this map's type (see Table 23-5)</td></tr>
+<tr><td><code>map_type</code></td><td>The map type (one of <code>enum bpf_map_type</code>)</td></tr>
+<tr><td><code>key_size</code>, <code>value_size</code></td><td>Size in bytes of each key and each value</td></tr>
+<tr><td><code>max_entries</code></td><td>The maximum number of entries the map may hold</td></tr>
+<tr><td><code>map_flags</code></td><td>Creation flags (e.g. per-CPU placement, mmapable, no-prealloc)</td></tr>
+<tr><td><code>id</code></td><td>A unique, kernel-assigned identifier for enumeration</td></tr>
+<tr><td><code>btf</code>, <code>btf_key_type_id</code>, <code>btf_value_type_id</code></td><td>BTF describing the key and value types (see &sect;5.1)</td></tr>
+<tr><td><code>record</code></td><td>Offsets and kinds of any special fields inside a value: locks, timers, kptrs, list and tree nodes (see &sect;5.1)</td></tr>
+<tr><td><code>refcnt</code>, <code>usercnt</code></td><td>Reference counts governing the map's lifetime</td></tr>
+<tr><td><code>objcg</code></td><td>The memory cgroup charged for the map's memory</td></tr>
+<tr><td><code>frozen</code></td><td>Whether the map has been made read-only (see &sect;5.1)</td></tr>
+<tr><td><code>name</code></td><td>The map's name, as shown by <code>bpftool</code></td></tr>
+</tbody>
+</table>
+
+<p>
+The <code>ops</code> table, <code>struct bpf_map_ops</code>, is what makes the one
+map abstraction serve so many implementations: each map type supplies its own
+version of a common set of function pointers, and the generic syscall and helper
+code calls through them without knowing the concrete type. Table 23-5 lists the
+most important members. The core four—lookup, update, delete, and get-next-key—
+implement the everyday element operations; <code>map_alloc</code> and
+<code>map_free</code> construct and destroy the type-specific storage; and the
+remainder support batching, memory-mapping, the BTF check of &sect;5.1, and the
+specialized operations that certain map types need, such as
+<code>map_redirect</code> for the XDP maps or <code>map_push_elem</code> and
+<code>map_pop_elem</code> for queues and stacks.
+</p>
+
+<table>
+<caption>Table 23-5. Principal members of struct bpf_map_ops</caption>
+<thead>
+<tr><th>Member</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>map_alloc</code>, <code>map_free</code></td><td>Allocate and free the type-specific map storage</td></tr>
+<tr><td><code>map_lookup_elem</code></td><td>Look up the value for a key</td></tr>
+<tr><td><code>map_update_elem</code></td><td>Insert or update the value for a key</td></tr>
+<tr><td><code>map_delete_elem</code></td><td>Remove the entry for a key</td></tr>
+<tr><td><code>map_get_next_key</code></td><td>Iterate: return the key following a given one</td></tr>
+<tr><td><code>map_push_elem</code>, <code>map_pop_elem</code>, <code>map_peek_elem</code></td><td>Queue/stack operations for those map types</td></tr>
+<tr><td><code>map_lookup_batch</code>, <code>map_update_batch</code></td><td>Bulk element operations for user space</td></tr>
+<tr><td><code>map_mmap</code></td><td>Map the map's memory into a process (e.g. array-backed globals)</td></tr>
+<tr><td><code>map_redirect</code></td><td>Redirect a packet through the map (XDP dev/cpu/xsk maps)</td></tr>
+<tr><td><code>map_check_btf</code></td><td>Validate the map's BTF key/value types at creation</td></tr>
+<tr><td><code>map_gen_lookup</code></td><td>Supply instructions that inline a lookup, replacing the helper call (see &sect;10.1)</td></tr>
+<tr><td><code>map_mem_usage</code></td><td>Report the map's memory footprint</td></tr>
+</tbody>
+</table>
+
+<p>
+Two aspects of the abstraction reward a second look. The first is that a map's key
+and value need not be opaque blobs: a map can be given
+BTF type information for its key and value
+(checked by <code>map_check_btf</code>,
+<code class="file-path">kernel/bpf/syscall.c</code>), which lets tools print its
+contents in a structured form and lets the verifier reason about special fields a
+value may contain—a timer, or a spin lock. The second is
+<span class="key-term">concurrency</span>. The same map may be read and written
+simultaneously by a program running on every CPU and by user space, so
+consistency must be arranged. The commonest answer is a
+<span class="key-term">per-CPU</span> map, which gives each processor its own copy
+of every value so that updates on a hot path need no lock at all and user space
+aggregates the per-CPU copies when it reads. Where a value genuinely must be
+shared and updated atomically, a program can embed a
+<code>bpf_spin_lock</code> in the value and take it around the update
+(<code class="file-path">kernel/bpf/helpers.c</code>)—a tightly restricted lock the
+verifier polices to guarantee it is always released—or use the atomic instructions
+of &sect;2.1 for simple counters. The map layer thus offers the same spectrum of
+concurrency strategies the rest of the kernel uses, adapted to the constraint that
+the code touching the data has already been proven safe.
+</p>
+
+<p>
+The mention of a timer or a spin lock inside a value points at something larger
+than a footnote, and it is the field named <code>record</code> in Table 23-4 that
+carries it. Having BTF for a value lets the kernel look inside it and locate
+fields of special kinds at known offsets, and there are now some fourteen such
+kinds (<code>enum btf_field_type</code>,
+<code class="file-path">include/linux/bpf.h</code>). Some are synchronization: a
+spin lock, a resilient spin lock. Some are deferred work: a
+<code>bpf_timer</code> that fires a program-supplied callback after an interval,
+or a workqueue item that runs one in process context. The most consequential are
+the two that let a value hold something other than data. A
+<span class="key-term">kptr</span> is a pointer to a kernel object stored in a map
+value; because the kernel knows the field is there and what it points at, it can
+hold a reference for as long as the value lives and drop it when the value is
+deleted, and a program exchanges such a pointer atomically with
+<code>bpf_kptr_xchg()</code> rather than assigning it. The other is a graph field:
+a list head or node, a red-black tree root or node, optionally with a refcount.
+</p>
+
+<p>
+The graph fields repay a closer look, because they quietly contradict the
+picture of a map as a flat table of blobs. A program can allocate an object with
+<code>bpf_obj_new()</code>, link it into a list or a tree whose root lives in a map
+value, and later unlink and free it—ordinary intrusive data structures, built at
+run time, inside memory the kernel accounts for. The verifier tracks ownership
+through all of it: an object is owned by whoever holds it, linking transfers that
+ownership to the collection, unlinking transfers it back, and a program that
+reaches its exit still owning one is rejected by the reference tracking of
+&sect;3.1. What makes this safe is the same thing that makes it possible—the
+kernel knows the layout, so it knows what to tear down when a map is destroyed,
+and the verifier knows the layout, so it can prove the program's use of it
+disciplined. A value is not a blob the kernel is indifferent to; it is a typed
+structure whose special fields the kernel is jointly responsible for.
+</p>
+
+<p>
+This kernel-side machinery and the way programmers actually create maps look
+quite different, and the two need connecting. A program rarely calls
+<code>BPF_MAP_CREATE</code> by hand; instead it <em>declares</em> each map in its
+source as a specially typed structure placed in a dedicated
+<code class="file-path">.maps</code> ELF section, giving the map's type, key and
+value types, and size. The loader (libbpf) reads these declarations along with the
+program's BTF, issues the <code>BPF_MAP_CREATE</code> calls, and rewrites the
+program's references to point at the resulting descriptors before it loads the
+program—so the BTF-typed keys and values described above flow directly from the C
+declaration into the kernel. This declarative style also allows maps to be
+<span class="key-term">pre-populated</span> at load time: a program-array map can
+have its tail-call targets filled in, or a map-of-maps its inner maps, straight
+from the object file, so the tables exist before the first program runs.
+Relatedly, once user space has finished initializing a map of constants it can
+<span class="key-term">freeze</span> it with <code>BPF_MAP_FREEZE</code>
+(<code>map-&gt;frozen</code>, <code class="file-path">kernel/bpf/syscall.c</code>),
+making it read-only from then on—the mechanism behind read-only global data, which
+lets the verifier treat such values as the constants they are.
+</p>
+
+<h3 id="map-types">Map Types</h3>
+
+<p>
+The map interface is uniform, but the implementations behind it are diverse, each
+tuned to a different access pattern or purpose. Table 23-6 lists a representative
+selection of the three dozen or so map types. Some are ordinary data structures—a
+hash table, an array, a longest-prefix-match trie for routing, a queue or
+stack—optionally kept per-CPU so that each processor
+has its own lock-free copy. Others are specialized machinery dressed as maps: a
+<span class="key-term">program array</span> holds other programs and is what tail
+calls jump through; the ring buffer is a
+high-throughput channel to user space; the <span class="key-term">devmap</span>,
+<span class="key-term">cpumap</span>, and <span class="key-term">xskmap</span> name
+the redirect targets for the XDP fast path of &sect;7.2; and the various
+<span class="key-term">local storage</span> maps attach a value to a kernel object
+such as a task, an inode, or a socket. struct_ops
+maps, discussed in &sect;10.2, even hold programs that implement a kernel interface.
+</p>
+
+<table>
+<caption>Table 23-6. Representative eBPF map types</caption>
+<thead>
+<tr><th>Map type</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BPF_MAP_TYPE_HASH</code>, <code>ARRAY</code></td><td>General key/value stores; the everyday workhorses</td></tr>
+<tr><td><code>PERCPU_HASH</code>, <code>PERCPU_ARRAY</code></td><td>Per-CPU variants that avoid locking on hot paths</td></tr>
+<tr><td><code>LRU_HASH</code></td><td>A hash that evicts least-recently-used entries when full</td></tr>
+<tr><td><code>LPM_TRIE</code></td><td>Longest-prefix-match lookup, e.g. for IP routing</td></tr>
+<tr><td><code>PROG_ARRAY</code></td><td>Holds programs; the target of tail calls</td></tr>
+<tr><td><code>RINGBUF</code></td><td>High-throughput streaming channel to user space</td></tr>
+<tr><td><code>PERF_EVENT_ARRAY</code></td><td>Sends events and samples up through the perf subsystem</td></tr>
+<tr><td><code>DEVMAP</code>, <code>CPUMAP</code>, <code>XSKMAP</code></td><td>Redirect targets for XDP (a device, a CPU, an AF_XDP socket)</td></tr>
+<tr><td><code>SOCKMAP</code>, <code>SOCKHASH</code></td><td>Sockets as map values; redirect targets for socket-layer programs (see &sect;7.3)</td></tr>
+<tr><td><code>SK_STORAGE</code>, <code>TASK_STORAGE</code>, <code>INODE_STORAGE</code></td><td>Local storage attached to a socket, task, or inode</td></tr>
+<tr><td><code>STRUCT_OPS</code></td><td>Holds programs that implement a kernel operations struct</td></tr>
+<tr><td><code>USER_RINGBUF</code></td><td>A ring buffer written by user space and drained by a program</td></tr>
+<tr><td><code>ARENA</code></td><td>A sparse memory region shared directly with user space, addressed by pointer</td></tr>
+</tbody>
+</table>
+
+<p>
+It helps to see these not as a flat list but as a few families with different
+purposes. The <span class="key-term">data-structure</span> maps—hash, array, LRU
+hash, LPM trie, queue, stack, and the Bloom filter—are what most programs mean by
+&ldquo;a map&rdquo;: ordinary containers chosen for their lookup behavior. The
+<span class="key-term">plumbing</span> maps are not really containers at all but
+kernel mechanisms with a map-shaped interface: a program array wires up tail
+calls, a perf-event array and a ring buffer carry data to user space, and the
+devmap, cpumap, and xskmap are the XDP redirect targets. The
+<span class="key-term">local-storage</span> maps invert the usual relationship—
+instead of the program holding a map of objects, a kernel object (a socket, task,
+inode, or cgroup) transparently holds a slot of program-defined data that appears
+and disappears with the object itself, which is how a program annotates, say,
+every socket without managing a table keyed by socket. And the
+<span class="key-term">composition</span> maps—arrays and hashes
+<em>of maps</em>—hold other maps as their values, so that a program can select at
+run time which inner map to use. That so many different kernel facilities are
+presented through the one map interface is a large part of why eBPF feels uniform
+despite its breadth: to a program, redirecting a packet, emitting an event, and
+looking up a value all look like operating on a map.
+</p>
+
+
+<p>
+The per-CPU maps deserve one more note, because they
+serve a second purpose beyond lock-free storage. An eBPF program runs with CPU
+migration disabled (<code>migrate_disable</code>,
+<code class="file-path">include/linux/filter.h</code>), so it stays on the same
+logical CPU for its entire execution—<em>including across tail calls</em>. That
+guarantee makes a per-CPU map usable as a <span class="key-term">scratch
+buffer</span>: because no other CPU can touch the current CPU's copy while the
+program runs, a program can stash a large working value there and read it back in
+a later tail call, something the disappearing 512-byte stack of &sect;2.2 cannot
+do. Per-CPU maps are thus the idiomatic way both to keep lock-free counters that
+user space later sums across CPUs and to carry more state than the stack allows
+through a chain of tail-called programs. Their one limitation is the flip side of
+their strength: because each CPU sees only its own copy, they cannot share data
+<em>across</em> CPUs, so they suit per-flow or per-CPU-aggregated data rather than
+a global table.
+</p>
+
+<p>
+One recent map type belongs to none of those families, and it matters here
+because it relaxes the constraint the section opened with.
+A <span class="key-term">BPF arena</span>
+(<code class="file-path">kernel/bpf/arena.c</code>) is not a key/value store at all
+but a sparse region of memory shared between a program and a user-space process,
+reached on both sides by ordinary pointers rather than by lookups. User space maps
+it and sees a normal address range; the program allocates pages within it with a
+kfunc and addresses them with the <code>BPF_ADDR_SPACE_CAST</code> instruction of
+&sect;2.1, which turns a thirty-two-bit offset into a kernel address by adding the
+arena's base—the reason that instruction exists. Pages are faulted in on demand
+from whichever side touches them first, so a structure built by the program is
+immediately readable by user space with no copying and no syscall. What this
+offers that no other map type does is the ability to build genuinely
+pointer-linked data structures—a tree whose nodes point at one another—and
+have both sides walk them. The cost is that the verifier can say much less about
+memory reached this way than about a map value of declared size, so an arena is a
+deliberate step toward performance and away from the strong guarantees the rest of
+the chapter has been describing.
+</p>
+
+<h3 id="map-share">Ring Buffers and Pinning</h3>
+
+<p>
+Two facilities deserve a closer look because they solve problems every non-trivial
+eBPF application meets. The first is getting data <em>out</em> of the kernel
+efficiently. The <span class="key-term">ring buffer</span> map
+(<code class="file-path">kernel/bpf/ringbuf.c</code>) is a single shared circular
+buffer that a program writes with a reserve-then-commit discipline
+(<code>bpf_ringbuf_reserve</code> to claim space,
+<code>bpf_ringbuf_submit</code> to publish it) and that user space drains by
+polling a memory-mapped view—so a busy tracer can stream millions of events per
+second to a user-space collector without a syscall per event. The verifier tracks
+a reserved ring-buffer region as a reference that must be submitted or discarded,
+so a program cannot leak buffer space.
+</p>
+
+<p>
+The second is <span class="key-term">persistence</span>. Because maps and programs
+are referred to by file descriptors, they would normally vanish when the process
+that created them exits. To let an eBPF object outlive its creator—so that a
+program loaded by one tool keeps running, and its map keeps accumulating data,
+after that tool is gone—the object can be <span class="key-term">pinned</span> into
+a special filesystem, <span class="key-term">bpffs</span>, mounted at
+<code class="file-path">/sys/fs/bpf</code>
+(<code class="file-path">kernel/bpf/inode.c</code>). Pinning gives the object a
+path in the filesystem namespace that holds a reference to it; any process that can
+open that path recovers a file descriptor to the same map or program. This is how
+eBPF applications persist state across restarts and share objects between
+unrelated processes—the filesystem serving, once again, as the kernel's universal
+namespace.
+</p>
+
+<p>
+Set against what it replaced, the ring buffer illustrates how the subsystem
+matures. The older channel to user space was the
+<span class="key-term">perf buffer</span>, built on a per-CPU
+<code>PERF_EVENT_ARRAY</code>: it worked, but giving each CPU its own buffer wasted
+memory, reordered events across CPUs, and made it awkward to reserve variable-size
+records. The ring buffer was introduced to fix exactly these problems—one buffer
+shared across CPUs (preserving event order), a reservation interface that commits
+a record only once it is fully written (so a partially built event is never
+visible to the reader), and an epoll-friendly notification so the consumer can
+sleep rather than poll. For most new tools it is now the default way to stream
+data out. There is a counterpart for the other direction. A program cannot block
+waiting for user space, so a request-response channel was awkward to build until
+the user ring buffer, which user space writes and a program drains with
+<code>bpf_user_ringbuf_drain()</code>, handing each record in turn to a callback
+the verifier has checked. The pair gives an eBPF application a full-duplex path to
+its user-space half without a syscall in either direction. Pinning, meanwhile, is more than a way to keep an object alive: because
+bpffs is an ordinary mounted filesystem, pins form a
+<span class="key-term">hierarchy</span> of paths, and a complex eBPF application
+can lay out its maps and links under a directory that other processes discover by
+convention—much as services rendezvous through well-known paths in
+<code class="file-path">/run</code>. Together, the ring buffer and bpffs answer the
+two questions any long-lived eBPF deployment must: how to get data out at speed,
+and how to let the pieces outlive and find one another.
+</p>
+
+<hr>
+<h2 id="programs">Programs and Attach Points</h2>
+
+<p class="chapter-intro">
+A program and its map are inert until the program is connected to something that
+will run it. What gives eBPF its enormous reach is the sheer number of places in
+the kernel where a program may be attached—from the
+network card's receive path to the entry of nearly any kernel function—each
+exposing a different context and expecting a different
+<span class="key-term">program type</span>. This section describes the machinery
+common to every attachment: the program types, the <code>bpf()</code> syscall that
+loads them, and the modern <code>bpf_link</code> abstraction that binds them to a
+hook. The two sections that follow then make the breadth sketched in Figure 23-2
+concrete, touring the major attach-point families in turn—the observability and
+networking hooks of &sect;7, and the policy hooks of &sect;8.
+</p>
+
+<p>
+One property unites all of these attach points, and stating it before the survey
+makes the rest cohere: eBPF is <span class="key-term">event-driven</span>. A program never runs on
+its own initiative; it runs only when the event it is attached to occurs—a packet
+arrives, a function is entered, a socket is created—and then runs to completion and
+stops. Its lifetime is tied to its attachment: while a program is attached, the
+hook holds a reference that keeps it (and every map it uses) alive, and detaching
+the last reference is what lets it be freed. This is why the same program can be
+loaded once and attached to several hooks, why an attached program keeps running
+after the tool that loaded it exits (provided something still holds the link), and
+why the shape of a program—its context, its permitted helpers—is dictated entirely
+by the kind of event it will handle. The attach point is not an afterthought to a
+program but the very thing that defines what it is.
+</p>
+
+<h3 id="prog-types">Program Types and the bpf() System Call</h3>
+
+<p>
+A program's type, one of the many values of
+<code>enum bpf_prog_type</code>, is fixed when it is loaded and determines three
+things at once: what context it receives, which helper functions and kfuncs it may
+call, and where it may be attached. A <code>BPF_PROG_TYPE_XDP</code> program
+receives a raw packet buffer and may be attached only to a network interface's XDP
+hook; a <code>BPF_PROG_TYPE_KPROBE</code> program receives the register state at a
+kprobe and may read function arguments; a <code>BPF_PROG_TYPE_CGROUP_SKB</code>
+program filters packets for the processes in a cgroup. Table 23-7 gives a
+representative sample of the dozens of types. All of them enter the kernel the same
+way: through the <code>bpf()</code> system call
+(<code class="file-path">kernel/bpf/syscall.c</code>), whose
+<code>BPF_PROG_LOAD</code> command copies the bytecode from user space, runs the
+verifier, selects the runtime, and returns a file descriptor for the resulting
+program object. The same syscall, through its several dozen commands, creates maps,
+loads BTF, attaches programs, and queries every kind of object; access to it is
+gated by the <code>CAP_BPF</code> capability (with some operations still requiring
+<code>CAP_SYS_ADMIN</code>), the privilege that the modern kernel carved out
+specifically so that using eBPF need not mean granting full administrative power.
+Historically the kernel also allowed <span class="key-term">unprivileged eBPF</span>—loading
+a restricted subset of programs with no capability at all—but because it widened
+the attack surface for speculative-execution exploits, it is now gated by the
+<code class="file-path">kernel.unprivileged_bpf_disabled</code> sysctl
+(<code>sysctl_unprivileged_bpf_disabled</code>,
+<code class="file-path">kernel/bpf/syscall.c</code>) and disabled by default on
+most distributions, so in practice loading a program requires <code>CAP_BPF</code>.
+</p>
+
+<p>
+The program type is often not fine-grained enough on its own, so loading also
+carries an <span class="key-term">expected attach type</span>
+(<code>expected_attach_type</code> in the load attributes,
+<code class="file-path">include/uapi/linux/bpf.h</code>) that narrows what the
+program is for. A single <code>BPF_PROG_TYPE_CGROUP_SOCK</code>, for instance, can
+be destined for the socket-creation hook or the bind hook, and a
+<code>BPF_PROG_TYPE_TRACING</code> program can be an fentry, an fexit, or an
+iterator; the expected attach type tells the verifier which, so it can present the
+right context and permit the right operations. This two-level scheme—a broad type
+plus a specific expected attach type—keeps the number of program types manageable
+while still letting the verifier tailor its checks precisely to where a program
+will run. It is the reason a program compiled for one hook cannot simply be
+attached to another: the mismatch is caught at load or attach time, not left to
+fail at run time.
+</p>
+
+<p>
+Naming the attach point is also part of loading, not only of attaching, and for
+some program types it is the load that does the harder work. A
+<code>BPF_PROG_TYPE_TRACING</code> program must say at load time which kernel
+function it will instrument, because the verifier has to know that function's
+prototype before it can decide what the program's context holds; the load
+attributes therefore carry an <code>attach_btf_id</code> naming a function in the
+kernel's BTF, and the verifier resolves the argument types from it. The load call
+carries several other things besides the instructions—flags such as the one that
+marks a program sleepable, and a log buffer with a verbosity level. That last
+matters more than it sounds, because it is the primary debugging interface for eBPF:
+when the verifier rejects a program it writes into that buffer the instruction it
+stopped at, the register state it had inferred, and why the check failed, and
+reading that transcript is how eBPF programs are actually debugged.
+</p>
+
+<p>
+One program type stands apart from all the others in Table 23-7 because what it
+attaches to is not a kernel hook at all.
+<code>BPF_PROG_TYPE_EXT</code>, an <span class="key-term">extension</span>
+program, attaches to another loaded eBPF program and replaces one of its global
+functions—hence the <code>freplace</code> section prefix by which it is written.
+The target is named the same way a tracing program names a kernel function, by BTF
+type, and the verifier checks that the replacement's signature matches the
+original's before allowing the swap. This is the second payoff of the modular
+verification described in &sect;3.2: a global function is verified independently of
+its callers because the verifier treats its signature as a contract, and anything
+that honors the same contract can stand in its place. A program can thus be
+shipped with a deliberately trivial policy function that an operator later
+replaces, at run time, without reloading or re-verifying the rest of it.
+</p>
+
+<table>
+<caption>Table 23-7. Representative eBPF program types and their attach points</caption>
+<thead>
+<tr><th>Program type</th><th>Attaches to / runs on</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BPF_PROG_TYPE_KPROBE</code></td><td>A kprobe or uprobe: entry/return of a kernel or user function</td></tr>
+<tr><td><code>BPF_PROG_TYPE_TRACEPOINT</code>, <code>RAW_TRACEPOINT</code></td><td>A static kernel tracepoint</td></tr>
+<tr><td><code>BPF_PROG_TYPE_PERF_EVENT</code></td><td>A perf event, such as a sampling timer or PMU counter</td></tr>
+<tr><td><code>BPF_PROG_TYPE_TRACING</code></td><td>fentry/fexit on a function, via a BPF trampoline</td></tr>
+<tr><td><code>BPF_PROG_TYPE_XDP</code></td><td>A network interface's XDP hook, in the driver receive path</td></tr>
+<tr><td><code>BPF_PROG_TYPE_SCHED_CLS</code>, <code>SCHED_ACT</code></td><td>The tc (traffic-control) ingress/egress path</td></tr>
+<tr><td><code>BPF_PROG_TYPE_CGROUP_SKB</code>, <code>CGROUP_SOCK</code></td><td>Network and socket events for a cgroup's processes</td></tr>
+<tr><td><code>BPF_PROG_TYPE_SOCK_OPS</code>, <code>SK_SKB</code>, <code>SK_MSG</code></td><td>TCP connection milestones, and data arriving at or sent from a socket</td></tr>
+<tr><td><code>BPF_PROG_TYPE_LSM</code></td><td>A Linux Security Module hook (BPF LSM; see Chapter 20)</td></tr>
+<tr><td><code>BPF_PROG_TYPE_STRUCT_OPS</code></td><td>A kernel operations struct, e.g. a TCP congestion-control algorithm</td></tr>
+<tr><td><code>BPF_PROG_TYPE_EXT</code></td><td>A global function in another loaded eBPF program, which it replaces</td></tr>
+</tbody>
+</table>
+
+<p>
+The program type, the expected attach type, and the way a program is written are
+tied together by a convention that is never spelled out in the kernel, yet is how
+eBPF is actually authored. The kernel knows only the numeric program type and attach type,
+passed in the load and attach calls; it has no idea what an ELF section is. But a
+program's <em>type is not marked in the object file</em> in any standard way, so
+loaders adopted a convention—set by libbpf and now near-universal—of encoding it
+in the name of the <span class="key-term">ELF section</span> the program is placed
+in. A programmer writes <code>SEC("xdp")</code> or
+<code>SEC("kprobe/tcp_v4_connect")</code> or
+<code>SEC("cgroup/connect4")</code> above a function, and the loader parses that
+string: the first component selects the program type, and any part after a slash
+supplies the expected attach type or the specific event to attach to, which also
+lets the loader <span class="key-term">auto-attach</span> the program to the right
+hook. Table 23-8 shows the relationship for a representative set of section names.
+</p>
+
+<table>
+<caption>Table 23-8. Program type, attach type, and ELF section name (representative)</caption>
+<thead>
+<tr><th>ELF section name</th><th>Program type</th><th>Expected attach type</th></tr>
+</thead>
+<tbody>
+<tr><td><code>xdp</code></td><td><code>BPF_PROG_TYPE_XDP</code></td><td><code>BPF_XDP</code></td></tr>
+<tr><td><code>tc/ingress</code>, <code>tcx/ingress</code></td><td><code>BPF_PROG_TYPE_SCHED_CLS</code></td><td><code>BPF_TCX_INGRESS</code></td></tr>
+<tr><td><code>kprobe/&lt;function&gt;</code></td><td><code>BPF_PROG_TYPE_KPROBE</code></td><td>(none; attached via perf)</td></tr>
+<tr><td><code>tracepoint/&lt;category&gt;/&lt;name&gt;</code></td><td><code>BPF_PROG_TYPE_TRACEPOINT</code></td><td>(none)</td></tr>
+<tr><td><code>fentry/&lt;function&gt;</code></td><td><code>BPF_PROG_TYPE_TRACING</code></td><td><code>BPF_TRACE_FENTRY</code></td></tr>
+<tr><td><code>fexit/&lt;function&gt;</code></td><td><code>BPF_PROG_TYPE_TRACING</code></td><td><code>BPF_TRACE_FEXIT</code></td></tr>
+<tr><td><code>iter/&lt;struct&gt;</code></td><td><code>BPF_PROG_TYPE_TRACING</code></td><td><code>BPF_TRACE_ITER</code></td></tr>
+<tr><td><code>cgroup/connect4</code></td><td><code>BPF_PROG_TYPE_CGROUP_SOCK_ADDR</code></td><td><code>BPF_CGROUP_INET4_CONNECT</code></td></tr>
+<tr><td><code>cgroup_skb/ingress</code></td><td><code>BPF_PROG_TYPE_CGROUP_SKB</code></td><td><code>BPF_CGROUP_INET_INGRESS</code></td></tr>
+<tr><td><code>sk_msg</code></td><td><code>BPF_PROG_TYPE_SK_MSG</code></td><td><code>BPF_SK_MSG_VERDICT</code></td></tr>
+<tr><td><code>lsm/&lt;hook&gt;</code></td><td><code>BPF_PROG_TYPE_LSM</code></td><td><code>BPF_LSM_MAC</code></td></tr>
+<tr><td><code>struct_ops/&lt;name&gt;</code></td><td><code>BPF_PROG_TYPE_STRUCT_OPS</code></td><td>(none)</td></tr>
+<tr><td><code>freplace/&lt;function&gt;</code></td><td><code>BPF_PROG_TYPE_EXT</code></td><td>(none; target named by BTF)</td></tr>
+</tbody>
+</table>
+
+<p>
+Two conventions govern these names. A single program type often
+fans out into many attach types through the section suffix—one
+<code>BPF_PROG_TYPE_CGROUP_SOCK_ADDR</code>, for example, covers
+<code>connect4</code>, <code>connect6</code>, <code>bind4</code>,
+<code>sendmsg4</code>, and a dozen more, each a distinct expected attach type—so the
+handful of program types in Table 23-7 expand into scores of concrete section
+names. And a trailing <code>.s</code> on a section name (as in
+<code>fentry.s</code> or <code>lsm.s</code>) marks the program as
+sleepable (&sect;7.1). Because this scheme lives
+entirely in the loader, it is a convention rather than kernel ABI, but it is so
+widely followed that the section name is, in practice, how one declares what an
+eBPF program is and where it attaches.
+</p>
+
+<h3 id="attach">Attaching Programs: Links and Hooks</h3>
+
+<p>
+Loading a program yields only a program object; attaching it to a hook is a
+separate step, and the modern mechanism for it is the
+<span class="key-term">bpf_link</span>. A link, created by the
+<code>BPF_LINK_CREATE</code> command, is an object representing a live attachment
+of one program to one hook; it, too, is a file descriptor, and closing it detaches
+the program. This is cleaner than the older direct-attach commands because
+ownership is explicit—the attachment lasts exactly as long as something holds the
+link—and because a link can be pinned in bpffs to persist. Figure 23-2 sketches the
+breadth of attach points a link can bind a program to, spanning the tracing,
+networking, cgroup, and security subsystems.
+</p>
+
+<p>
+The link is more than a handle; it is where several practical attachment problems
+are solved. Each kind of hook has its own <span class="key-term">link type</span>
+(around fifteen of them), but they share a uniform interface: a link can be
+enumerated, pinned, and—importantly—<span class="key-term">updated</span>. The
+<code>BPF_LINK_UPDATE</code> command atomically swaps the program behind a live
+link for a new one without ever detaching, so a tool can upgrade the program on a
+busy hook with no gap during which packets go unhandled—the mechanism behind
+zero-downtime updates in production eBPF systems. Where a hook allows more than one
+program, as the cgroup hooks do, attachment also carries ordering and precedence
+rules: a program can be attached with flags that let a child cgroup's program
+either override or run alongside a parent's, and multiple programs on one hook run
+in a defined sequence. The link abstraction turns what were once ad-hoc,
+per-subsystem attach interfaces into one consistent, introspectable model, which
+is a large part of why tooling such as <code>bpftool</code> can list and manage
+every attachment in the system uniformly.
+</p>
+
+<p>
+That last point—several programs sharing one hook—turned out to need a mechanism
+of its own, because the obvious implementations all assume a single owner. If two
+unrelated tools both want a program on a machine's ingress path, neither can be
+asked to know about the other, and neither may quietly displace the other's work.
+The kernel's answer is a small shared library of attachment logic,
+<code class="file-path">kernel/bpf/mprog.c</code>, which maintains an ordered array
+of programs behind a hook and revises it under RCU so that a program running on
+another CPU sees either the old sequence or the new one, never a partial edit.
+Attachment requests name their position relative to what is already there: flags
+ask for placement before or after a given entry, or for replacement of one, and
+that entry is identified by the descriptor or the id of an existing program or
+link. A tool can therefore say &ldquo;insert mine ahead of that one&rdquo; and
+have the request either succeed or fail cleanly, rather than overwriting a
+neighbor. The tc express hooks of &sect;7.3 are built on this, as are the
+attachments for virtual device pairs.
+</p>
+
+<p>
+A link can also be dissolved from the kernel's side, which is easy to miss when
+thinking of it as a descriptor user space holds. Every link type supplies a detach
+operation, and the subsystem calls it when the thing being attached to ceases to
+exist—when a cgroup is destroyed, or a network device is unregistered, or a
+module carrying the instrumented function is unloaded. The link object survives as
+a handle so that user space still has something valid to close and to query, but
+it no longer refers to a live attachment; a subsequent update of it fails rather
+than silently reattaching somewhere. Detachment is thus not solely a user-space
+decision, and a tool that holds a link must be prepared to find that the hook
+underneath it is gone.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 400" role="img" aria-labelledby="fig23-2-title" style="max-width:780px; width:100%; height:auto;">
+<title id="fig23-2-title">Figure 23-2. eBPF Attach Points Across the Kernel</title>
+<defs><marker id="e211b" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="360" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 23-2. eBPF Attach Points Across the Kernel</text>
+
+<rect x="330" y="176" width="200" height="52" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+<text x="430" y="198" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">eBPF program</text>
+<text x="430" y="216" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">attached via a bpf_link</text>
+
+<g font-family="Inter,sans-serif" font-size="9.5" text-anchor="middle">
+<rect x="60" y="80" width="180" height="46" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="150" y="99" font-weight="700">tracing</text><text x="150" y="114" font-size="8" fill="#475569">kprobes, tracepoints, fentry/fexit</text>
+<rect x="620" y="80" width="180" height="46" rx="8" fill="#ede9fe" stroke="#7c3aed"/><text x="710" y="99" font-weight="700">networking</text><text x="710" y="114" font-size="8" fill="#475569">XDP, tc, socket filters</text>
+<rect x="60" y="278" width="180" height="46" rx="8" fill="#fef9c3" stroke="#ca8a04"/><text x="150" y="297" font-weight="700">cgroups</text><text x="150" y="312" font-size="8" fill="#475569">skb, sock, device, sysctl</text>
+<rect x="620" y="278" width="180" height="46" rx="8" fill="#fee2e2" stroke="#dc2626"/><text x="710" y="297" font-weight="700">security</text><text x="710" y="312" font-size="8" fill="#475569">BPF LSM hooks</text>
+<rect x="340" y="80" width="180" height="46" rx="8" fill="#e0e7ff" stroke="#4f46e5"/><text x="430" y="99" font-weight="700">struct_ops</text><text x="430" y="114" font-size="8" fill="#475569">TCP congestion control, sched_ext</text>
+<rect x="340" y="278" width="180" height="46" rx="8" fill="#f1f5f9" stroke="#64748b"/><text x="430" y="297" font-weight="700">iterators &amp; perf</text><text x="430" y="312" font-size="8" fill="#475569">bpf_iter, perf events</text>
+</g>
+<g stroke="#334155" stroke-width="1.2" fill="none">
+<path d="M330,196 H150 V126" marker-end="url(#e211b)"/>
+<path d="M530,196 H710 V126" marker-end="url(#e211b)"/>
+<path d="M330,208 H150 V278" marker-end="url(#e211b)"/>
+<path d="M530,208 H710 V278" marker-end="url(#e211b)"/>
+<path d="M430,176 V126" marker-end="url(#e211b)"/>
+<path d="M430,228 V278" marker-end="url(#e211b)"/>
+</g>
+<text x="430" y="360" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">one uniform mechanism reaches almost every subsystem — the source of eBPF's breadth</text>
+</svg>
+<figcaption>Figure 23-2. eBPF attach points across the kernel — a single loaded program, bound through a bpf_link, can be attached to hooks in the tracing, networking, cgroup, security, and struct_ops subsystems, among others. The uniformity of this attach model is what lets one mechanism serve observability, networking, security, and even kernel-policy customization.</figcaption>
+</figure>
+
+<hr>
+<h2 id="obsnet">Observability and Networking Hooks</h2>
+
+<p class="chapter-intro">
+The previous section described how a program is loaded and attached; this one and
+the next describe <em>where</em>. The attach points fall into two natural groups,
+and this section takes the first: the hooks that watch the kernel execute and the
+hooks that handle packets. They have more in common than their subject matter
+suggests. Both sit on the kernel's hottest paths—a function entered thousands of
+times a second, a packet arriving on a saturated link—and both are therefore the
+hooks that justify the JIT of &sect;4 and the tight limits of &sect;2. Tracing with
+kprobes, tracepoints, and fentry/fexit comes first, then XDP in the network
+driver, then the traffic-control and socket hooks further up the stack.
+</p>
+
+<p>
+One question recurs at every one of these hooks, and naming it in advance makes
+the three subsections read as variations on a theme: <em>how early on the path
+should the program run?</em> The earlier a hook fires, the cheaper it is and the
+less work has already been spent on data that may be discarded—but the less the
+kernel has yet done to make that data intelligible, so the program must do more of
+the parsing itself and has less to go on. The smallest illustration is inside
+tracing, where a raw tracepoint hands a program its arguments untouched and almost
+free, while an fentry probe on the same function goes through a trampoline in order
+to present those arguments properly typed. The same tension, at a far larger
+scale, orders the networking hooks of this section, which &sect;7.3 lays out as a
+sequence running from the driver up to the socket. There is no generally right answer, which is exactly
+why the kernel offers hooks at several depths along each path rather than one.
+</p>
+
+<h3 id="tracing">Tracing: kprobes, Tracepoints, and fentry/fexit</h3>
+
+<p>
+The attach points that made eBPF famous are the tracing hooks, which let a program
+run when almost any point in the kernel is reached—the foundation of modern
+observability tools such as <code>bpftrace</code> and BCC. A
+<span class="key-term">kprobe</span> program (<code>BPF_PROG_TYPE_KPROBE</code>,
+handled in <code class="file-path">kernel/trace/bpf_trace.c</code>) attaches to a
+dynamic probe placed at the entry or return of an arbitrary kernel function; it
+receives the CPU register state and can read the function's arguments, count its
+calls, or measure its latency. The same program type also serves
+<span class="key-term">uprobes</span>, the equivalent for user-space functions. A
+<span class="key-term">tracepoint</span> program attaches instead to one of the
+kernel's thousands of static, stable instrumentation points, whose arguments have
+a defined layout; the raw-tracepoint variant gives faster access to the untouched
+arguments. Because these programs run in the kernel at the traced site, they can
+aggregate data in maps—building a latency histogram in place, for instance—and
+stream only results to user space, avoiding the flood of events that older
+trace-everything tools produced.
+</p>
+
+<p>
+The most efficient tracing attachment is <span class="key-term">fentry/fexit</span>
+(<code>BPF_PROG_TYPE_TRACING</code>), which hooks a function's entry and exit
+through a <span class="key-term">BPF trampoline</span>—a small piece of generated
+code that calls the eBPF program with the function's real, typed arguments and, on
+exit, its return value. Built on the same trampoline machinery as the ftrace-based
+function tracer, it imposes far less overhead than a classic kprobe and, thanks to
+BTF, gives the program properly typed access to the traced function's parameters.
+Together these hooks make it possible to instrument a running production kernel—to
+answer a question about its behavior—without patching it, rebooting it, or slowing
+it appreciably, which is the capability that first drew the industry to eBPF.
+</p>
+
+<p>
+A word on why tracing is safe to allow so freely. A tracing program is, by the
+verifier's construction, essentially an <em>observer</em>: it can read the kernel
+state its context exposes and write only to its own maps, not to arbitrary kernel
+memory, so attaching one to a hot kernel function does not in the ordinary case
+corrupt the function's data or alter its behavior. Reads of kernel memory that the verifier cannot prove
+safe statically go through helpers such as <code>bpf_probe_read_kernel</code> that
+fault gracefully rather than crashing if an address is bad. Some tracing programs
+may additionally be marked <span class="key-term">sleepable</span>, permitting them
+to call helpers that block—needed for uprobes on memory that may be paged out—at
+the cost of stricter rules the verifier enforces around what they may hold across
+a sleep. The upshot is that even pervasive instrumentation of a production kernel
+carries no risk of the instrumented code misbehaving, which is precisely what
+makes always-on observability with eBPF acceptable where a debugging kernel module
+would not be.
+</p>
+
+<p>
+That said, observation is the default rather than an absolute, and three
+deliberate exceptions qualify the guarantee. A tracing
+program attached with the <code>BPF_MODIFY_RETURN</code> attach type—written as
+<code>fmod_ret</code>—runs before the target function and may, by returning a
+non-zero value, cause the kernel to skip the function entirely and use the
+program's value as its result. A kprobe program may call
+<code>bpf_override_return()</code> to the same effect. And
+<code>bpf_probe_write_user()</code> writes into the traced process's memory.
+These exist because error injection and fault testing are legitimate needs that no
+amount of pure observation can serve, and each is fenced off accordingly: the
+override helper requires a build option and works only on functions the kernel has
+explicitly annotated as safe to fail, the modify-return type is refused on
+functions not marked the same way, and the user-write helper announces itself in
+the kernel log the first time it is used. The distinction to carry away is that
+eBPF's safety guarantee is about memory and termination, not about
+non-interference; a program that changes what the kernel does is still a program that
+cannot crash it, and the ability to do so is gated separately and conspicuously.
+</p>
+
+<p>
+One practical limit of the classic tracing attachments was cost at scale, and
+lifting it changed what tools can offer. Placing
+a kprobe means patching a function's first instruction, and attaching one program
+to ten thousand functions once meant ten thousand separate attach operations, each
+with its own text patch and its own bookkeeping—slow enough that tracing
+everything was impractical. The multi-attach variants
+(<code>kprobe.multi</code> and <code>kretprobe.multi</code>, built on the kernel's
+fprobe machinery) take a whole list of symbols in a single call and produce a
+single link covering all of them, patching the sites in one batch. A related
+session variant pairs the entry and return probes of one call so that a value
+computed on entry—a timestamp, say—is handed directly to the return probe
+instead of being stashed in a map keyed by thread. Between them these turn
+whole-kernel tracing from an expensive setup step into something a tool can do at
+startup, which is why modern tracers can offer to probe every function matching a
+pattern.
+</p>
+
+<h3 id="xdp">XDP: the Express Data Path</h3>
+
+<p>
+The attach point that best shows what eBPF is capable of is
+<span class="key-term">XDP</span>, the eXpress Data Path. An XDP program runs at
+the earliest possible moment in packet reception—inside the network driver, on the
+raw received buffer, <em>before</em> the kernel has allocated the socket buffer
+(<code>sk_buff</code>) that normal network processing depends on. Because it runs
+before that expensive allocation, an XDP program can accept, drop, or forward
+packets at rates of tens of millions per second per core, which is why XDP
+underpins high-performance load balancers, firewalls, and DDoS filters built
+entirely in eBPF. The program receives a <code>struct xdp_md</code> context
+describing the packet and returns one of a few <span class="key-term">actions</span>:
+<code>XDP_PASS</code> to send the packet on into the normal stack,
+<code>XDP_DROP</code> to discard it, <code>XDP_TX</code> to bounce it back out the
+same interface, or <code>XDP_REDIRECT</code> to send it elsewhere. A fifth,
+<code>XDP_ABORTED</code>, means that the program itself went wrong; the packet is
+dropped as with <code>XDP_DROP</code>, but a tracepoint fires so the event can be
+counted and traced. It is also what the kernel substitutes when a program returns
+a value it does not recognize, so an unhandled case in a program becomes a
+reported error rather than undefined behavior—the same instinct as the rest of
+the subsystem, which is to leave no path unaccounted for.
+</p>
+
+<p>
+The redirect action is where the map types of &sect;5.2 return: an XDP program
+redirects a packet by looking up a target in a <code>devmap</code> (another network
+device), a <code>cpumap</code> (another CPU, to spread load), or an
+<code>xskmap</code> (an <span class="key-term">AF_XDP</span> socket that delivers the
+packet straight to a user-space application, bypassing the kernel stack entirely).
+The hook itself is invoked by <code>bpf_prog_run_xdp</code> in the driver's receive
+routine; where a driver has no native XDP support the kernel provides a slower
+generic path higher up the stack. XDP is the sharpest example of the whole
+subsystem's promise—programmable, safe, kernel-speed packet processing—and of how
+far the descendant of a packet filter has come from filtering packets on a socket.
+</p>
+
+<p>
+XDP comes in three <span class="key-term">modes</span> that trade performance for
+generality, selected by flags when the program is attached
+(<code class="file-path">include/uapi/linux/if_link.h</code>).
+<span class="key-term">Native</span> XDP (<code>XDP_FLAGS_DRV_MODE</code>) is the
+intended one: the driver runs the program in its receive routine, before the
+<code>sk_buff</code>, at full speed—but it requires the driver to support XDP, which
+most high-performance ones now do. <span class="key-term">Generic</span> XDP
+(<code>XDP_FLAGS_SKB_MODE</code>) is a fallback the kernel provides for any device:
+it runs the program later, after the <code>sk_buff</code> has been built, so it
+loses XDP's headline performance but lets programs be developed and tested on
+hardware without native support. <span class="key-term">Offloaded</span> XDP
+(<code>XDP_FLAGS_HW_MODE</code>) goes the other way, running the program on a
+capable SmartNIC so packets are processed without ever reaching the host CPU at
+all. The same program, unchanged, can run in any mode the hardware supports, so a
+developer writes once and deploys wherever the target allows—another instance of
+the portability theme that BTF and CO-RE carry to its conclusion in &sect;9.
+</p>
+
+<p>
+Two later additions loosened constraints that the original design had accepted.
+The first concerns packet size: an XDP program was long restricted to traffic that
+fits in a single memory page, which excluded jumbo frames and the large
+aggregated buffers that hardware offloads produce. A program may now declare at
+load time that it understands multi-buffer packets, after which the driver may
+hand it a packet spread across several fragments—with the consequence that direct
+access still reaches only the first one, and the rest must be read through a
+helper. The second concerns hardware metadata. A network card computes things
+about a packet that the driver would normally record in the socket buffer—a
+receive timestamp, a hash of the flow, a VLAN tag—but at XDP time no socket
+buffer exists yet. Rather than inventing a fixed structure that every driver would
+have to fill, the kernel exposes these as kfuncs whose implementation each driver
+supplies and the JIT inlines at the call site, so a program that wants the
+timestamp pays for the timestamp and a program that does not pays nothing, and a
+driver that cannot provide one reports so rather than fabricating a value.
+</p>
+
+<h3 id="tc">Traffic Control and the Socket Layer</h3>
+
+<p>
+XDP is fast because it runs before the kernel builds a socket buffer, but that is
+also its limitation: it sees only a raw buffer, on ingress, before the stack has
+done anything. The <span class="key-term">traffic-control</span> (tc) hooks occupy
+the complementary position. A <code>BPF_PROG_TYPE_SCHED_CLS</code> program attaches
+to the tc layer on either ingress or egress and operates on a fully formed
+<code>sk_buff</code>—the packet as the network stack understands it, with its
+metadata parsed—so it can classify, rewrite, encapsulate, redirect, or drop
+traffic with the full context XDP lacks, at the cost of running later and slower.
+This is the layer at which large-scale container networking, such as Cilium's,
+implements policy and load balancing. Modern kernels expose these hooks through a
+dedicated fast path, <span class="key-term">tcx</span>
+(<code>tc_run</code>, <code class="file-path">net/core/dev.c</code>), which supports
+<code>bpf_link</code> attachment and multiple programs per hook, bringing tc into
+line with the link-based model of &sect;6.2. Between XDP at the driver and tc in
+the stack, eBPF can process a packet at whichever point trades performance for
+context most appropriately.
+</p>
+
+<p>
+What a tc program actually does with a packet needs spelling out, because the
+vocabulary differs from XDP's. Its return value is a traffic-control action rather
+than an XDP verdict: pass the packet along, drop it, or tell the stack it has been
+reclassified. Redirection is not a return value at all but a helper the program
+calls, naming a target interface and a direction, after which the program returns
+the code that means &ldquo;I have dealt with this.&rdquo; And because the packet is a
+fully formed socket buffer, a tc program may rewrite it in ways an XDP program
+cannot: helpers adjust headroom to push or pop an encapsulation header, overwrite
+bytes anywhere in the packet, and recompute the checksums that such edits
+invalidate. This is why tunnelling, NAT and service load balancing in container
+networking are implemented here rather than at XDP—the work requires a packet the
+stack has already made sense of.
+</p>
+
+<p>
+The tc hooks also illustrate how eBPF attachment has matured. The original way to
+run BPF in the traffic-control layer was the <code>cls_bpf</code> classifier
+(<code class="file-path">net/sched/cls_bpf.c</code>), configured indirectly through
+the <code>tc</code> command's filter machinery—functional, but bolted onto a
+pre-eBPF subsystem whose semantics for multiple filters and cleanup were awkward.
+The newer tcx hook was added specifically to give tc
+a first-class eBPF attach point with the properties the rest of this section
+describes: <code>bpf_link</code> ownership, a well-defined order when several
+programs share a hook, and clean detachment. The progression from
+<code>cls_bpf</code> to tcx mirrors the wider shift from the early ad-hoc
+attach interfaces to the uniform link-based model, and it is why new tc-based eBPF
+should use tcx while the older path lingers only for compatibility.
+</p>
+
+<p>
+The shared-hook machinery of &sect;6.2 has a second consumer that shows the
+direction of travel. A virtual device pair of the kind that connects
+a container to its host has historically been a veth pair, with a tc program
+attached to each end; netkit is a newer device type
+designed for the same job with the eBPF program as part of the device rather than
+a filter bolted to it, so a packet can be handled and forwarded without the
+queueing and softirq handoff a veth pair imposes between the two halves. Its
+programs attach through the same relative-ordering mechanism tcx uses. The pattern
+is the one this chapter keeps returning to: a facility first grows an eBPF hook,
+then the hook becomes the point of the facility.
+</p>
+
+<p>
+XDP and tc sit at two points on the receive path, and the organizing question of
+this section has a third answer that lies past the end of it: above the stack, at
+the socket. Two program types run there. A
+<span class="key-term">sockops</span> program
+(<code>BPF_PROG_TYPE_SOCK_OPS</code>) is called at milestones in a TCP
+connection—the handshake completing, a retransmission timeout firing—and may set
+per-connection parameters such as the initial congestion window or the buffer
+sizes, which lets a policy that would otherwise be a system-wide sysctl be applied
+per cgroup instead. The other two operate on data rather than events: an
+<code>SK_SKB</code> program sees each received buffer as it arrives at a socket and
+an <code>SK_MSG</code> program sees each chunk a process sends, and either may
+return a verdict—<code>SK_PASS</code> or <code>SK_DROP</code>—or redirect the data
+to a different socket entirely.
+</p>
+
+<p>
+That redirect is the reason the socket hooks exist, and it makes a use of maps
+unlike any other in the chapter. The sockets a program may redirect to are held in
+a <span class="key-term">sockmap</span> or sockhash
+(<code class="file-path">net/core/sock_map.c</code>), a map whose values are
+sockets rather than bytes; a verdict program looks up a target and hands the data
+to it directly (<code class="file-path">net/core/skmsg.c</code>), so a payload
+travelling between two sockets on the same machine never descends into the
+protocol stack at all—no headers built, no checksums, no queueing. The case this
+was built for is the sidecar proxy, where every connection is relayed through a
+local process and the two hops through the loopback stack are pure overhead. It
+also shows the receive path and the send path meeting the same design: XDP acts
+before the kernel has built anything, tc after it has built a packet, and the
+socket hooks after it has finished with packets altogether.
+</p>
+
+<hr>
+<h2 id="policy">Programmable Kernel Policy</h2>
+
+<p class="chapter-intro">
+The hooks of &sect;7 observe or transform something passing through the kernel. The
+hooks of this section do something categorically different: they
+<em>decide</em>. A cgroup program decides whether a process in a container may
+open a socket or reach a device node; a BPF LSM program decides whether an
+operation is permitted at all; a sched_ext program decides which task a CPU runs
+next. In each case a policy the kernel would otherwise have compiled into itself is
+supplied instead by a loaded program, and in each case the program is attached not
+to a point on a code path but to an object or a subsystem that consults it when a
+decision is due.
+</p>
+
+<p>
+Moving policy into a loaded program raises a question the previous section never
+had to face: what happens when the program is wrong? An observability program that
+computes nonsense produces a misleading histogram; a policy program that computes
+nonsense can deny every file a process opens or leave a runnable task on the
+runqueue forever. The verifier offers nothing here: its guarantees are about a
+program's mechanics, not its judgment (&sect;3.1), and a disastrous decision is
+perfectly safe by its standards. The kernel's answer, arrived at independently in
+all three cases, is to bound the blast radius structurally rather than to trust the
+program: to arrange matters so that a program which runs flawlessly and decides
+terribly can still only do a limited amount of harm. A cgroup program is confined
+to its own subtree; an LSM program is confined to one direction; a sched_ext
+scheduler is watched and can be evicted. Each of the three subsections below
+describes its own containment in detail, and collectively they are what makes it
+defensible to let policy this consequential be loaded at run time at all.
+</p>
+
+<h3 id="cgroup-hooks">cgroup Hooks</h3>
+
+<p>
+The <span class="key-term">cgroup</span> hooks attach an eBPF program not to a
+code path but to a <span class="key-term">control group</span>—a subtree of the
+process hierarchy (Chapter 3)—so that the program runs for every process in that
+group. The cgroup program types
+(<code class="file-path">kernel/bpf/cgroup.c</code>) span a range of events. A
+<code>CGROUP_SKB</code> program filters the group's network packets on ingress or
+egress; a <code>CGROUP_SOCK</code> program runs when a process in the group creates
+a socket; a <code>CGROUP_SOCK_ADDR</code> program can inspect and even rewrite the
+addresses of <code>connect</code> and <code>bind</code> calls, which is how
+transparent proxies and service meshes redirect connections; a
+<code>CGROUP_DEVICE</code> program decides which device nodes the group may access,
+the eBPF realization of device resource control; and
+<code>CGROUP_SYSCTL</code> and <code>CGROUP_SOCKOPT</code> programs mediate sysctl
+and socket-option access. Because attachment is to a cgroup rather than a global
+hook, these programs let policy be applied per container or per service without
+affecting the rest of the system, which is why container runtimes and
+<code>systemd</code> lean on them heavily.
+</p>
+
+<p>
+Because cgroups form a hierarchy, the cgroup hooks must define what happens when
+several programs, attached at different levels of the tree, all apply to a process.
+The attach flags settle this
+(<code class="file-path">include/uapi/linux/bpf.h</code>): the default lets a single
+program own a hook; <code>BPF_F_ALLOW_OVERRIDE</code> lets a descendant cgroup's
+program replace an ancestor's for processes in that subtree; and
+<code>BPF_F_ALLOW_MULTI</code> lets a program be added alongside those of ancestor
+cgroups, with all of them run in a defined order. This
+mirrors the containment structure administrators already use: a host-wide policy
+can be set at the root cgroup, and individual containers can tighten it within
+their own subtree without being able to loosen what an ancestor imposed. The
+result is per-container network and resource policy that composes along the same
+hierarchy that cgroups v2 uses for everything else (Chapter 25), which is exactly
+what a container runtime needs.
+</p>
+
+<p>
+The order in which those programs run is easy to guess wrongly, so here it is
+precisely. The kernel builds an array of effective programs for
+each cgroup by walking from that cgroup <em>upward</em> to the root
+(<code>compute_effective_progs</code>,
+<code class="file-path">kernel/bpf/cgroup.c</code>), so the default order is
+innermost first: the container's own program runs before its parent's, and the
+root's runs last. That is the right default for a denial, since the most specific
+policy is consulted first and the outer ones still get their say; but it is the
+wrong order for a program that rewrites something, since an outer program would
+then see a value an inner one had already changed. A program may therefore be
+attached with a flag that places it in a separate group which runs before all the
+others and in the opposite direction, outermost first. The two groups are built at
+opposite ends of the same array, which is why the choice costs nothing at run
+time: by the moment an event occurs the order is already a flat list, walked from
+one end to the other.
+</p>
+
+<h3 id="bpf-lsm">BPF LSM: Programmable Security</h3>
+
+<p>
+Chapter 20 described the Linux Security Modules framework, the set of hooks
+throughout the kernel at which a security module may allow or deny an operation.
+<span class="key-term">BPF LSM</span> (<code>BPF_PROG_TYPE_LSM</code>,
+<code class="file-path">security/bpf/</code>) makes those hooks attachable by eBPF
+programs, so that security policy can be written and loaded at run time rather than
+compiled into a module like SELinux or AppArmor. A BPF LSM program attaches to a
+specific <code>security_*</code> hook—file open, socket connect, program exec,
+and so on—receives the operation's typed arguments through the same trampoline
+mechanism as fentry, and returns a verdict that can deny the operation by
+returning an error. This turns the LSM framework into a programmable one: an
+administrator or security tool can express a bespoke policy as an eBPF program,
+attach it, and enforce it immediately, with the verifier guaranteeing the policy
+code itself cannot destabilize the kernel. It is mandatory access control with the
+flexibility of a loadable program, and it sits alongside the traditional LSMs
+rather than replacing them.
+</p>
+
+<p>
+One asymmetry is essential to why this is safe to permit: a BPF LSM program can
+only <em>restrict</em>, never grant. The LSM framework runs its hooks
+<em>after</em> the ordinary discretionary checks have already passed, and a hook's
+verdict can turn an allow into a deny but never a deny into an allow—so attaching a
+BPF LSM program can only make the system more restrictive, never open a hole the
+standard permission checks would have closed. This one-way property, combined with
+the verifier's guarantee that the policy code cannot itself crash the kernel, is
+what makes it defensible to let security policy be loaded at run time at all.
+Enabling BPF LSM does require the module to be selected among the active LSMs at
+boot, keeping it under the same administrative control as SELinux or AppArmor, but
+once enabled it lets security tooling react to new threats with a freshly loaded
+program rather than a kernel rebuild—the same run-time-extensibility advantage the
+rest of the chapter describes, applied to the kernel's security decisions.
+</p>
+
+<p>
+That one-way property is not left to the framework's conventions alone; the
+verifier enforces it directly. When it loads an LSM program it looks up the
+permitted range of return values for the particular hook being attached to
+(<code>bpf_lsm_get_retval_range</code>,
+<code class="file-path">kernel/bpf/bpf_lsm.c</code>) and proves the program cannot
+return anything outside it: zero or a negative error number for almost every hook,
+and zero or one for the handful that answer a yes-or-no question rather than
+granting permission. A program that might return a positive value where an error
+is expected is rejected at load time, not caught later. Two related refinements
+sit beside this. A set of hooks is marked off-limits to eBPF entirely, so that the
+machinery managing security modules cannot itself be hooked by a program. And a
+second set is marked as safe to attach a sleepable program to, which matters
+because deciding about a file often means resolving its path or reading user
+memory, neither of which can be done from a context that may not block.
+</p>
+
+<p>
+A further capability closes the distance between this subsection and the last. An
+LSM program may be attached to a cgroup rather than to the hook globally, so that
+it is consulted only for processes in that subtree. This combines the reach of the
+LSM hooks—which cover operations no network-oriented cgroup program can see—with
+the containment of &sect;8.1, and it is what lets a container runtime impose a
+mandatory-access policy on one workload without imposing it on the host. It also
+shows the two mechanisms of this section converging: what began as separate
+answers to separate problems has become one, a policy program scoped to a subtree
+of the process hierarchy and consulted at a security decision point.
+</p>
+
+<h3 id="sched-ext">Scheduling with sched_ext</h3>
+
+<p>
+The most ambitious attach domain of all is the CPU scheduler itself. Chapter 7
+described the kernel's built-in scheduling classes; <span class="key-term">sched_ext</span>
+(<code class="file-path">kernel/sched/ext.c</code>) adds one more—a scheduling
+class whose policy is supplied entirely by eBPF. Through the
+<code>struct_ops</code> mechanism of &sect;10.2, a set of eBPF programs implements
+the callbacks of a scheduler—choosing which task to run next, on which CPU, and for
+how long—and the kernel calls into them exactly as it would a compiled scheduling
+class. This lets a complete scheduling policy be written, loaded, tested, and
+replaced on a running system without recompiling the kernel, turning what was once
+the most delicate and hard-to-modify part of the kernel into something a developer
+can iterate on in user space. Safety is preserved on two levels at once: the
+verifier proves each callback well-behaved before it runs, and a watchdog reverts
+the system to the default scheduler if a sched_ext policy misbehaves—for example,
+by failing to schedule a runnable task. That an eBPF program can now decide what
+runs on a CPU is the strongest possible statement of how far the subsystem has
+come from filtering packets, and it leads directly into the extension mechanisms
+of &sect;10 that make it possible.
+</p>
+
+<p>
+The organizing idea of a sched_ext scheduler is the
+<span class="key-term">dispatch queue</span> (DSQ,
+<code>struct scx_dispatch_q</code>,
+<code class="file-path">include/linux/sched/ext.h</code>).
+Rather than manipulate runqueues directly, the eBPF callbacks move runnable tasks
+into dispatch queues with a kfunc (<code>scx_bpf_dsq_insert</code>)—a built-in global queue, per-CPU local queues, or custom
+queues the scheduler creates—and the kernel pulls the next task to run from the
+appropriate queue. A scheduler is thus written as a small set of callbacks that
+react to events (a task woke up, a CPU needs work, a slice expired) by enqueuing
+tasks with a chosen time slice and priority, while the kernel handles the delicate
+mechanics of context switching and preemption underneath. This division—policy in
+eBPF, mechanism in the kernel—is the same separation of policy from mechanism that
+recurs throughout this book, here taken to its most surprising conclusion: the
+scheduling <em>policy</em>, historically among the hardest kernel code to change,
+becomes a loadable program, while the kernel retains the mechanism and the safety
+net. Experimental schedulers tuned for gaming latency, for build-server
+throughput, or for specific datacenter workloads have been written this way in a
+fraction of the effort a new built-in scheduling class would take.
+</p>
+
+<p>
+How much of the system a loaded scheduler actually takes over is itself a choice,
+and it is the first thing to understand about deploying one. By default, enabling
+a sched_ext scheduler moves every ordinary task on the machine to it at once—the
+built-in scheduler of Chapter 7 keeps only the tasks that were never its
+responsibility, such as real-time ones. A scheduler may instead declare that it
+wants partial switching, in which case it receives only the tasks an administrator
+explicitly places in the sched_ext scheduling class and everything else continues
+to be scheduled as before. The second mode is what makes experimentation on a
+working machine reasonable: a scheduler tuned for one workload can be given that
+workload and nothing else, with the rest of the system unaffected if it turns out
+to behave badly.
+</p>
+
+<p>
+The safety net has three separate strands, and each catches a different kind of
+failure. The first is the watchdog already mentioned: the kernel records when each
+runnable task last ran and, if one waits beyond a configurable timeout, concludes
+that the scheduler has stalled and tears it down. The second is self-reporting—a
+scheduler that detects its own invariant broken can abort deliberately rather than
+limp—and the third is an operator's escape hatch, a magic SysRq key that ejects
+the loaded scheduler from a console even when the machine is too unresponsive to
+run a command. In every case the outcome is the same: the tasks return to the
+built-in scheduler, the reason is recorded where user space can read it, and the
+machine keeps running. This is the containment the introduction to this section
+promised, and it is notably not a verifier property at all. The verifier cannot
+tell a scheduler that starves a task from one that does not, so the kernel does
+not ask it to; it watches the consequences instead.
+</p>
+
+<hr>
+<h2 id="btf">BTF and CO-RE</h2>
+
+<p class="chapter-intro">
+An eBPF program that reads kernel data structures faces a portability problem the
+earlier sections have quietly deferred: the layout of a kernel structure—which
+field lives at which offset—differs from one kernel build to the next, so a
+program compiled against one kernel's headers would read the wrong bytes on
+another. The solution is a type system the kernel carries about itself,
+BTF, and a relocation technique built on it,
+CO-RE, that together let a single compiled program
+run correctly on many kernel versions. This section describes both.
+</p>
+
+<p>
+The way the problem was solved before makes the achievement clear. The earliest tracing frameworks, such as BCC, sidestepped the
+layout problem by shipping the program's <em>source</em> and a full compiler
+toolchain to every machine, compiling the program on the target against that
+machine's installed kernel headers each time it ran. This worked but was heavy: it
+demanded a copy of Clang/LLVM and the matching kernel headers on every host,
+spent seconds compiling at startup, and failed on any system where the headers
+were absent or mismatched. BTF and CO-RE replace that whole apparatus with a
+compile-once model in which the adaptation to each kernel is a fast, header-free
+patching step at load. The result reshaped how eBPF tools are built and
+distributed—from &ldquo;ship a compiler and compile here&rdquo; to &ldquo;ship one
+small binary that adapts itself&rdquo;—which is why this section, though it comes
+late in the chapter, describes some of the machinery most responsible for eBPF's
+practical spread.
+</p>
+
+<h3 id="btf-format">BTF: the BPF Type Format</h3>
+
+<p>
+<span class="key-term">BTF</span> (BPF Type Format) is a compact encoding of C
+type information—structures and their fields, unions, enums, function prototypes,
+typedefs—defined in <code class="file-path">include/uapi/linux/btf.h</code> and
+implemented in <code class="file-path">kernel/bpf/btf.c</code>. Its central use is
+that the kernel describes its <em>own</em> types in BTF: when built with
+<code>CONFIG_DEBUG_INFO_BTF</code>, the kernel image carries a complete BTF
+description of its data structures, generated at build time by the
+<code>pahole</code> tool from the compiler's debug information, and exposes it to
+user space at <code class="file-path">/sys/kernel/btf/vmlinux</code>. From this one
+artifact flow many capabilities: the verifier uses BTF to type-check a program's
+access to kernel structures and to kfunc arguments; maps can be defined with typed
+keys and values; the <code>bpf_iter</code> mechanism uses it to walk kernel
+objects; and, most importantly, CO-RE uses it to relocate programs. Modules carry
+their own <span class="key-term">split BTF</span> that references the base kernel's
+types rather than duplicating them, as Appendix B described, and user space can
+load additional BTF through the <code>BPF_BTF_LOAD</code> command.
+</p>
+
+<p>
+A little of BTF's structure explains why it is compact enough to ship in the
+kernel image. It is a flat array of type descriptors, each tagged with a
+<span class="key-term">kind</span>—twenty of them, numbered 0 through 19, including
+<code>BTF_KIND_INT</code>, <code>BTF_KIND_PTR</code>, <code>BTF_KIND_STRUCT</code>,
+<code>BTF_KIND_ENUM</code>, <code>BTF_KIND_FUNC</code>, and
+<code>BTF_KIND_TYPEDEF</code>—that reference one another by index, with a single
+shared string table for names. This is far smaller than the compiler's original
+DWARF debug information from which <code>pahole</code> distills it, small enough
+that a complete description of the kernel's types adds only a few megabytes to the
+image. A companion section, <code class="file-path">.BTF.ext</code>, carries the
+per-instruction function, line, and CO-RE relocation information a program needs.
+BTF's uses extend well beyond CO-RE: it is what lets <code>bpftool</code> and
+<code>drgn</code> pretty-print kernel structures, what gives fentry programs
+typed arguments (&sect;7.1), and what the verifier consults to type-check kfunc
+calls (&sect;10.2). For systems too small to carry full kernel BTF, tools can
+generate a minimal BTF containing only the types a
+particular program actually needs. BTF, in short, is the kernel's machine-readable
+self-description, and much of modern eBPF is built on the kernel finally being able
+to tell tools what its own data looks like.
+</p>
+
+<p>
+Two of those twenty kinds stand apart, because they are not C types at
+all and they carry information the rest of this chapter has already relied on. A
+type tag attaches a name to a type, and a declaration tag attaches one to a
+declaration; both survive from the source annotations that a C compiler would
+otherwise discard. This is how the kernel's own pointer annotations reach the
+verifier. A field declared <code>__user</code> or <code>__percpu</code> in a
+kernel header is recorded in BTF as a pointer carrying that tag, and when the
+verifier types a program's access to such a field it sets the corresponding
+pointer flag of &sect;3.2—so a program that reads a user pointer as though it were
+a kernel one is rejected, for the same reason and by the same mechanism that makes
+the kernel's own <code>sparse</code> annotations meaningful. Declaration tags do
+the equivalent job for functions: the flags that mark a kfunc as sleepable or as
+acquiring a reference (&sect;10.2) are declaration tags in BTF, not a separate
+table the kernel must keep in step.
+</p>
+
+<p>
+One practical consequence of the kernel publishing its own types deserves naming,
+because it is the first thing anyone writing an eBPF program encounters. Given
+BTF, the kernel's headers become unnecessary for compilation: a tool reads
+<code class="file-path">/sys/kernel/btf/vmlinux</code> and emits a single C header
+containing every type the running kernel defines, which the program includes
+instead of the dozens of kernel headers it would otherwise need. That header is
+generated from the kernel actually running rather than from a source tree that may
+not match it, it needs no include paths or configuration macros, and it is
+self-contained. Combined with the relocations of &sect;9.2, this is what reduces
+building an eBPF program from an exercise in reproducing a kernel's build
+environment to compiling one file against one generated header.
+</p>
+
+<h3 id="core">CO-RE: Compile Once, Run Everywhere</h3>
+
+<p>
+<span class="key-term">CO-RE</span>—&ldquo;compile once, run everywhere&rdquo;—is
+the technique that turns BTF into portability. The problem it solves is concrete:
+a tracing program that reads, say, a field of <code>task_struct</code> hard-codes
+that field's offset when compiled, but the offset varies between kernels, so the
+program would break on any kernel but the one it was built against. CO-RE breaks
+that dependency. When the program is compiled, the compiler does not bake in the
+offset; instead it emits, for each such access, a
+<span class="key-term">relocation record</span>
+(<code>struct bpf_core_relo</code>, <code class="file-path">include/uapi/linux/bpf.h</code>)
+describing the access symbolically—&ldquo;the offset of field <em>foo</em> in
+struct <em>bar</em>.&rdquo; Before loading the program on a particular machine, the
+user-space loader library (libbpf) reads that machine's own
+<code class="file-path">vmlinux</code> BTF, looks up where <em>foo</em> actually
+lives in <em>this</em> kernel, and patches the program's instructions with the
+correct offset. Figure 23-3 shows the flow.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 340" role="img" aria-labelledby="fig23-3-title" style="max-width:780px; width:100%; height:auto;">
+<title id="fig23-3-title">Figure 23-3. CO-RE Field Relocation</title>
+<defs><marker id="e213" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="300" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 23-3. CO-RE Field Relocation</text>
+
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<rect x="60" y="86" width="220" height="66" rx="8" fill="#dbeafe" stroke="#2563eb"/><text x="170" y="108" font-weight="700">compile once</text><text x="170" y="125" font-size="8.5" fill="#475569">access to task-&gt;pid emitted as a</text><text x="170" y="138" font-size="8.5" fill="#475569">symbolic CO-RE relocation, not an offset</text>
+<rect x="320" y="86" width="220" height="66" rx="8" fill="#fef9c3" stroke="#ca8a04"/><text x="430" y="104" font-weight="700">loader (libbpf)</text><text x="430" y="121" font-size="8.5" fill="#475569">reads this kernel's</text><text x="430" y="134" font-size="8.5" fill="#475569">/sys/kernel/btf/vmlinux</text>
+<rect x="580" y="86" width="220" height="66" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="690" y="104" font-weight="700">patch &amp; load</text><text x="690" y="121" font-size="8.5" fill="#475569">real offset written into the</text><text x="690" y="134" font-size="8.5" fill="#475569">instruction, then verified</text>
+</g>
+<g stroke="#334155" stroke-width="1.3">
+<line x1="280" y1="119" x2="320" y2="119" marker-end="url(#e213)"/>
+<line x1="540" y1="119" x2="580" y2="119" marker-end="url(#e213)"/>
+</g>
+<g font-family="Inter,sans-serif" font-size="9" fill="#475569" text-anchor="middle">
+<rect x="320" y="196" width="220" height="40" rx="8" fill="#fff" stroke="#cbd5e1"/><text x="430" y="214" font-weight="700" fill="#334155">BTF is the key</text><text x="430" y="228" font-size="8.5">the kernel's own type layout, self-described</text>
+</g>
+<line x1="430" y1="152" x2="430" y2="196" stroke="#ca8a04" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#e213)"/>
+<text x="430" y="270" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">one compiled object adapts itself to whatever kernel it is loaded on — no kernel headers required at run time</text>
+</svg>
+<figcaption>Figure 23-3. CO-RE field relocation — the program is compiled once with field accesses recorded as symbolic relocations rather than fixed offsets. At load time the user-space loader consults the running kernel's own BTF to discover where each field actually lives, patches the instructions with the correct offsets, and only then submits the program to the verifier. A single object thus runs correctly across many kernel versions.</figcaption>
+</figure>
+
+<p>
+The effect is that one compiled eBPF object—a single <code class="file-path">.o</code>
+file—runs unchanged across a wide range of kernel versions, adapting itself to each
+at load time, and does so without needing the target kernel's header files
+installed. This is what made portable, distributable eBPF tooling practical:
+observability and tracing tools can ship a single binary that works on whatever
+kernel the user happens to run. The kernel side of the mechanism,
+<code>bpf_core_apply</code> (<code class="file-path">kernel/bpf/btf.c</code>),
+exists because the work does not have to be done in user space at all: the load
+call can carry the relocation records alongside the instructions, and the verifier
+applies them against the kernel's own BTF before it begins checking
+(<code class="file-path">kernel/bpf/verifier.c</code>). That matters for a loader
+too small to embed a BTF library—a program built into a kernel component, or one
+loaded by the minimal generated loader that some tools prefer to libbpf—since
+such a loader can hand the kernel the symbolic accesses and let it resolve them.
+For the ordinary case, though, the work is done in user space against the BTF the
+kernel so helpfully publishes about itself.
+</p>
+
+<p>
+Field offsets are only the simplest of the relocations CO-RE performs, and the
+richer ones are what let a single program cope with kernels that differ not just
+in layout but in <em>content</em>. The relocation kinds
+(<code>enum bpf_core_relo_kind</code>,
+<code class="file-path">include/uapi/linux/bpf.h</code>) include not only a field's
+byte offset but its <span class="key-term">existence</span>, the existence of a
+whole type, and the existence or value of an <span class="key-term">enum</span>
+constant. With these a program can ask, at load time, &ldquo;does this kernel's
+<code>task_struct</code> have this field?&rdquo; or &ldquo;is this enum value
+defined here?&rdquo; and take a different path when the answer is no—so one binary
+can support a field that was added in a later kernel, gracefully doing without it
+on older ones. The full list runs to thirteen kinds, and several of the remainder
+answer questions a moved offset alone cannot. A field's size and its signedness
+are relocated separately, so a counter widened from thirty-two bits to sixty-four
+in a later kernel is still read correctly rather than half-read. A pair of shift
+amounts handles bitfields, whose position within a word is not expressible as a
+byte offset at all and which would otherwise lie beyond CO-RE's reach. A type's
+size can be relocated, and so can a type's identifier in either the program's own
+BTF or the target kernel's, which is what lets a program name a type to a helper.
+And one kind asks not where a type is but whether the target's version of it is
+compatible with the program's—the check to make before trusting a whole structure
+rather than a single field. Programmers rarely write the relocations by hand; they use accessor
+macros such as <code>bpf_core_read</code> and <code>bpf_core_field_exists</code>
+(built on the compiler's <code>__builtin_preserve_access_index</code>), which look
+like ordinary field accesses but cause the compiler to emit the relocation records
+instead of fixed offsets. The effect is that CO-RE handles not only the common
+case of a field that merely moved, but the harder cases of fields, types, and
+constants that appear, disappear, or change across the kernel's evolution—which is
+what makes a single tracing tool viable across many years of kernel releases.
+</p>
+
+<hr>
+<h2 id="extend">Extending BPF: Helpers and kfuncs</h2>
+
+<p class="chapter-intro">
+An eBPF program cannot do much on its own—it can compute, and read its context and
+its maps, but to affect the wider kernel it must call <em>into</em> the kernel. The
+kernel exposes a controlled vocabulary of functions that programs may call, and
+this vocabulary has evolved from a fixed, stable set of
+<span class="key-term">helpers</span> to an open, extensible mechanism of
+<span class="key-term">kfuncs</span>. This closing section describes both, and the
+<code>struct_ops</code> facility that turns the whole relationship around by letting
+eBPF implement kernel interfaces rather than merely call them.
+</p>
+
+<p>
+The constraint behind all three mechanisms is the same one that runs through the
+chapter: a program may not simply call any kernel function it likes. If it could,
+two things would break at once—safety, because most kernel functions assume
+preconditions the verifier cannot check, and portability, because a program bound
+to an arbitrary internal function would break the moment that function changed.
+So the kernel exposes only a <span class="key-term">curated</span> set of entry
+points, each with a declared, verifier-checkable signature, and this section is
+about the three generations of that curation. Helpers were the first: a fixed,
+stable, numbered set. kfuncs are the second: an open, BTF-typed set any subsystem
+can extend. And struct_ops is the inversion of the whole idea, letting the kernel
+call <em>into</em> eBPF through a defined interface. Read together they trace eBPF's
+growth from a consumer of a handful of kernel services into a peer that both calls
+the kernel and is called by it.
+</p>
+
+<h3 id="helpers">Helper Functions</h3>
+
+<p>
+<span class="key-term">Helper functions</span> are the original way an eBPF program
+calls the kernel. Each is a kernel function with a fixed number, callable from
+bytecode as if it were a built-in instruction—<code>bpf_map_lookup_elem</code> to
+read a map, <code>bpf_probe_read_kernel</code> to safely read kernel memory,
+<code>bpf_ktime_get_ns</code> for a timestamp, <code>bpf_get_current_pid_tgid</code>
+for the running task's identifiers, <code>bpf_ringbuf_output</code> to emit an
+event, and roughly two hundred others
+(<code class="file-path">kernel/bpf/helpers.c</code>). Each helper declares a
+<code>struct bpf_func_proto</code> giving the types of its arguments and its return
+value, and the verifier checks every call against that prototype—this is the
+&ldquo;valid helper calls&rdquo; guarantee of &sect;3.1. The set of helpers a given
+program may call depends on its type, so that a networking program and a tracing
+program are offered different vocabularies suited to what each may safely do. The
+helper interface is a <span class="key-term">stable ABI</span>, and precisely so:
+the helpers are numbered in <code class="file-path">include/uapi/linux/bpf.h</code>,
+the kernel's user-space API header, so they inherit the same stability guarantee
+as the system-call interface—a helper is never removed or changed once added,
+which is what lets a program built years ago keep running on today's kernel. (The
+<code>bpf-helpers</code> manual page is generated directly from that header.)
+</p>
+
+<p>
+How the per-program-type restriction is enforced is where helpers and the
+verifier meet. Each program type supplies a callback that,
+given a helper's identifier, returns that helper's <code>bpf_func_proto</code> or
+nothing at all; the verifier calls it when it encounters a helper call, and a
+<code>NULL</code> answer means &ldquo;this helper is not available to this program
+type&rdquo; and rejects the program. This is why an XDP program cannot call a
+tracing helper and vice versa—the availability is not a run-time check but a
+load-time property of the program's type. The stability that makes helpers a
+dependable ABI is also their limitation, and it is the reason the interface stopped
+growing: every helper is a permanent, numbered, kernel-wide entry point that must
+be supported forever once added and documented in the <code>bpf-helpers</code>
+manual page. Adding one meant amending a central enumeration and committing to it
+indefinitely, a high bar that made helpers a poor fit for the many small,
+subsystem-specific functions programs increasingly wanted—exactly the gap kfuncs
+were created to fill.
+</p>
+
+<p>
+It would be easy to conclude from all this machinery that calling a helper is
+expensive, and for the commonest call of all it is not, because it is not a call.
+Before handing a program to the JIT, the verifier makes a pass over the
+instructions replacing certain helper calls with inline code
+(<code class="file-path">kernel/bpf/verifier.c</code>). A lookup in an array map
+becomes a bounds check and an indexed load—three or four instructions with no
+function call, no argument marshalling, and nothing for the JIT to spill registers
+around. The map type supplies the replacement through its ops table
+(<code>map_gen_lookup</code> in Table 23-5), so each map type that can be looked
+up cheaply says how, and the ones that cannot simply decline and keep the real
+call. The verifier is in a position to do
+this because it already knows which map a given call refers to, having tracked the
+pointer there; the same analysis that proves the call safe is what makes it
+unnecessary. The helper interface is therefore an abstraction at the source level
+that frequently vanishes before execution—which is why programs are written with
+map lookups on their hottest paths without apology.
+</p>
+
+<h3 id="kfuncs">kfuncs and struct_ops</h3>
+
+<p>
+That very stability made helpers hard to grow, since every new one is a permanent
+addition to a kernel-wide ABI. The newer <span class="key-term">kfunc</span>
+mechanism removes that friction. A kfunc is an ordinary kernel function, annotated
+<code>__bpf_kfunc</code> and registered for particular program types with
+<code>register_btf_kfunc_id_set</code> (<code class="file-path">kernel/bpf/btf.c</code>),
+that becomes callable from eBPF—but unlike a helper it is identified through BTF by
+name and type rather than by a fixed number, so a subsystem, or even a module, can
+expose its own kfuncs without touching a central table. The verifier type-checks
+kfunc calls using BTF and honors a set of flags on each kfunc
+(<code>KF_ACQUIRE</code>, <code>KF_RELEASE</code>, <code>KF_RET_NULL</code>, and
+others) that declare, for example, that a kfunc returns a reference the program
+must later release—letting the verifier enforce correct resource handling. Newer
+memory-access idioms such as the <span class="key-term">dynamic pointer</span>
+(<code>bpf_dynptr</code>) are built on this machinery.
+</p>
+
+<p>
+The flags are richer than acquire-and-release, and together they let a kfunc
+declare its contract to the verifier precisely
+(<code class="file-path">include/linux/btf.h</code>):
+<code>KF_RET_NULL</code> says the return value may be null and must be checked
+before use; <code>KF_SLEEPABLE</code> says the kfunc may block, so only sleepable
+programs may call it; <code>KF_RCU</code> and <code>KF_RCU_PROTECTED</code> govern
+RCU-protected pointers; the <code>KF_ITER_NEW</code>/<code>NEXT</code>/<code>DESTROY</code>
+trio marks the constructor, the step and the destructor of an open-coded
+iterator (&sect;3.2); and
+<code>KF_DESTRUCTIVE</code> marks a kfunc whose effects are dangerous enough to
+require extra privilege. One flag is conspicuous by its absence. Early kfuncs had
+to opt in to strict argument checking with a <code>KF_TRUSTED_ARGS</code> flag,
+which demanded that pointer arguments be provably valid—obtained from an acquire
+kfunc or handed to the program by the kernel itself—rather than walked out of
+some other structure. So many kfuncs came to want that guarantee that it was made
+the default for all of them and the flag was deleted; the long comment that
+survives in <code class="file-path">include/linux/btf.h</code> now documents a rule
+that applies everywhere rather than an option a kfunc may choose. The deliberate difference from helpers is that
+kfuncs are <em>not</em> a stable ABI: a kfunc may change or be removed between
+kernel versions, and a program that uses one is expected to adapt—using the CO-RE
+existence relocations of &sect;9.2 to detect at load time whether a kfunc is
+present. This is a considered trade: by giving up the permanence of the helper
+interface, kfuncs let any subsystem or module expose exactly the operations its
+programs need, turning what was a slow, central, forever-committed process into a
+fast, local, revisable one. Most new BPF-callable functionality now arrives as
+kfuncs rather than helpers; the helper interface is effectively closed to new
+additions, and kfuncs are regarded as the future API through which eBPF programs
+reach the kernel—expected to stabilize in practice over time even though they
+carry no formal ABI promise.
+</p>
+
+<p>
+Two details of how a kfunc declares itself are easy to miss and characteristic of
+the mechanism's style. The first is that the flags have kept growing past the
+resource-handling ones described above, and some of the newer ones are about code
+generation rather than safety: a kfunc can declare that it clobbers few enough
+registers that the compiler and JIT need not save anything around the call, and
+others declare that it takes or returns a pointer into the arena of &sect;5.2,
+which the JIT must address differently from an ordinary kernel pointer. The
+second is stranger. Because BTF records the <em>names</em> of a function's
+parameters and not only their types, a kfunc can communicate with the verifier
+through the name it gives an argument: a suffix on a parameter's name marks it as
+the size of the buffer in the preceding argument, or as a value that must be a
+compile-time constant. The type system the kernel grew for portability is being
+used here as an annotation channel, which is why the kfunc interface can keep
+acquiring new contracts without a central registry to record them in.
+</p>
+
+<p>
+The furthest reach of the subsystem is <span class="key-term">struct_ops</span>,
+which inverts the usual relationship. Instead of an eBPF program calling the
+kernel, struct_ops lets a set of eBPF programs <em>implement</em> a kernel
+operations structure—a vtable the kernel calls into. The canonical example is TCP
+congestion control: a complete congestion-control algorithm can be written in
+eBPF, loaded, verified, and registered as a <code>struct tcp_congestion_ops</code>
+that the network stack then calls exactly as it would a built-in one. The same
+mechanism underlies <code>sched_ext</code> (&sect;8.3), which lets an entire CPU
+scheduling policy be written in eBPF. With struct_ops the descendant of the packet filter
+has become something no one anticipated: a way to write core kernel policy itself
+in a safe, loadable, verified language—the clearest sign that eBPF is less a
+feature of the kernel than a new way of extending it.
+</p>
+
+<p>
+Mechanically, struct_ops rests on the machinery the rest of the chapter built. A
+subsystem that wants to accept eBPF implementations registers its operations
+structure with <code>register_bpf_struct_ops</code>
+(<code class="file-path">include/linux/bpf.h</code>; the TCP registration is in
+<code class="file-path">net/ipv4/bpf_tcp_ca.c</code>), which uses BTF to describe
+the structure's function pointers. A user then provides an eBPF program for each
+member, gathered into a <code>struct_ops</code> map (&sect;5.2); the verifier checks
+every one against the BTF signature of the slot it fills, and only once all pass is
+the structure registered and its function pointers made live for the kernel to
+call. The safety guarantee is thus end-to-end: the kernel calls into these
+programs on its most sensitive paths—every acknowledged TCP segment, every
+scheduling decision—yet each was proven safe before it could be installed. The
+replacement is a link like any other (&sect;6.2): an implementation attached this
+way can be swapped for another atomically while the kernel is calling into it,
+provided the subsystem supplies the update operation that makes the exchange
+coherent, so a congestion-control algorithm can be revised on a machine carrying
+live connections. Recent kernels have extended the pattern
+further—to HID device drivers, to the handshake policy of SMC connections, and,
+closing a circle with &sect;7.3, to queueing disciplines, so that a packet
+scheduler too can be written as a loadable program. This is the natural endpoint
+of the chapter's theme: the same verified-program mechanism that began as a
+packet filter now lets
+whole kernel subsystems be implemented, safely, from outside the kernel.
+</p>
+
+<hr>
+<h2 id="chapter-summary">Summary</h2>
+
+<p class="chapter-intro">
+This chapter described a subsystem with no counterpart in Linux 2.6.11:
+eBPF, the kernel's mechanism for running
+user-supplied programs safely inside itself. The programs are expressed for a small
+64-bit <span class="key-term">virtual machine</span> whose instruction set
+deliberately resembles real hardware, so that they can be
+<span class="key-term">JIT-compiled</span> to native code and run at full speed.
+What makes running them safe is the verifier, which
+proves before execution that a program terminates, accesses only memory it is
+allowed to, leaks no kernel pointers, and calls the kernel only through permitted
+interfaces—turning &ldquo;run untrusted code in the kernel&rdquo; from a
+contradiction into a routine operation. Around this core sit
+maps, the typed key/value stores through which
+programs keep state and share it with user space and one another, and the dozens of
+<span class="key-term">program types and attach points</span>—from the XDP fast path
+in a network driver to fentry probes on kernel functions to LSM security hooks—that
+give eBPF its extraordinary reach. Those attach points are best read as a
+sequence rather than a list: on the receive path a program can run before the
+kernel has built anything, after it has built a packet, or after it has finished
+with packets altogether, and the same uniform attach model serves all three.
+</p>
+
+<p>
+The rest of the subsystem exists to make that core practical and portable.
+BTF gives the kernel a description of its own types,
+and CO-RE uses it to let a single compiled program run
+across many kernel versions. That is the use BTF was introduced for, but by the
+end of the chapter it has become the subsystem's connective tissue: the same type
+information declares what a map's keys and values mean, gives each kfunc a
+signature the verifier can check, carries the annotations that tell the verifier a
+pointer came from user space, and describes the slots a struct_ops implementation
+must fill. Above it, helpers and the newer, extensible
+kfuncs give programs a controlled vocabulary for calling
+into the kernel; and struct_ops inverts the arrangement,
+letting eBPF supply kernel policy—a congestion-control algorithm, a queueing
+discipline, a CPU scheduler—that the kernel then calls as its own. Table 23-9 collects the pieces and their roles. The larger lesson
+is that eBPF represents a genuine shift in how Linux evolves: where once extending
+the kernel meant patching its source or writing a module that could crash it, it
+increasingly means loading a small, verified program that the kernel can run
+without ever having to trust it. Running through every part of that story is a
+single discipline: each new power the subsystem grants is matched by machinery
+that keeps it from being misused—the verifier that fails safe rather than guess,
+the JIT hardening against speculative-execution and code-injection attacks, the
+security hooks that can only tighten policy and never loosen it, and the watchdogs
+that revert a misbehaving program. In a book about how the kernel works, eBPF is
+the part that is changing fastest what it means to work <em>on</em> the kernel at
+all.
+</p>
+
+<p>
+That shift is easiest to appreciate through what has been built on it. Few people
+write eBPF bytecode, or even the restricted C, by hand; instead a layer of
+tools and libraries turns high-level intent into loaded programs. Tracing
+front-ends such as <span class="key-term">bpftrace</span> and
+<span class="key-term">BCC</span> compile short scripts into eBPF for
+observability; libraries such as libbpf (C), the Go
+eBPF library, and <span class="key-term">aya</span> (Rust) load and manage programs
+from applications; and large systems such as <span class="key-term">Cilium</span>
+(container networking and security) and Katran (load balancing) are built almost
+entirely on eBPF. The analogy often drawn is to the web browser: just as
+JavaScript turned the browser from a document viewer into a programmable platform
+that could evolve without shipping a new browser, eBPF is turning the kernel into a
+programmable platform that can gain new networking, observability, and security
+behavior without shipping a new kernel. That is the sense in which eBPF is less a
+feature of Linux than a new layer of it.
+</p>
+
+<table>
+<caption>Table 23-9. The components of the eBPF subsystem</caption>
+<thead>
+<tr><th>Component</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td>Virtual machine (&sect;2)</td><td>The 64-bit register machine and instruction set programs are written for</td></tr>
+<tr><td>Verifier (&sect;3)</td><td>Statically proves each program safe before it may run</td></tr>
+<tr><td>JIT compiler (&sect;4)</td><td>Translates verified bytecode to native machine code</td></tr>
+<tr><td>Maps (&sect;5)</td><td>Typed key/value stores for state, sharing, and communication</td></tr>
+<tr><td>Programs &amp; links (&sect;6)</td><td>The program types, and the <code>bpf_link</code> objects that bind them to hooks</td></tr>
+<tr><td>Observability &amp; networking hooks (&sect;7)</td><td>Tracing probes, XDP in the driver, and the traffic-control and socket hooks</td></tr>
+<tr><td>Policy hooks (&sect;8)</td><td>cgroup, BPF LSM, and sched_ext—kernel policy supplied by a loaded program</td></tr>
+<tr><td>BTF &amp; CO-RE (&sect;9)</td><td>Self-describing kernel types and the relocations that make programs portable</td></tr>
+<tr><td>Helpers &amp; kfuncs (&sect;10)</td><td>The controlled and extensible vocabulary for calling into the kernel</td></tr>
+<tr><td><code>struct_ops</code> (&sect;10.2)</td><td>Lets eBPF implement kernel interfaces such as TCP congestion control, a queueing discipline, or a scheduler</td></tr>
+</tbody>
+</table>
+
+<p class="source-trail-pointer">The kernel source files this chapter works from are collected by topic in <a href="source-trails.html#ch23">Source Trails</a>.</p>
+</main>
+
+<footer class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>v0.1</p>
+  <p>© 2026 Lianwei Wang. All rights reserved.</p>
+</footer>
+
+</div><!-- .book-container -->
+<script src="assets/progress.js" defer></script>
+</body>
+</html>
+

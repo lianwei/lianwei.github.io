@@ -1,0 +1,2484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Chapter 25 of Inside the Linux Kernel: Containers, Namespaces, and Cgroups — the eight namespace types and struct nsproxy, clone/unshare/setns, user namespaces and capabilities, PID namespaces, the cgroup v2 unified hierarchy, the cpu/memory/io controllers, delegation, the rdma/misc/dmem device-resource controllers, Pressure Stall Information (PSI), and how a container is assembled from these primitives in Linux 7.0.">
+  <meta property="og:title" content="Chapter 25: Containers, Namespaces, and Cgroups — Inside the Linux Kernel">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <title>Chapter 25: Containers, Namespaces, and Cgroups — Inside the Linux Kernel</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+</head>
+<body>
+<progress class="chapter-progress" max="100" value="0" aria-hidden="true"></progress>
+<nav class="chapter-nav">
+  <a class="book-title" href="index.html" title="Table of Contents">Inside the Linux Kernel</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-24.html">&larr; Chapter 24</a>
+  <span class="nav-sep">|</span>
+  <a href="#top">Chapter 25</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-26.html">Chapter 26 &rarr;</a>
+</nav>
+<a href="#top" class="back-to-top" aria-label="Back to top">&uarr;</a>
+<div class="book-container" id="top" style="margin-top: 3.5rem;">
+<header class="chapter-header">
+  <div class="chapter-number">Chapter 25</div>
+  <h1 class="chapter-title" style="border:none; margin-top:0.5rem;">Containers, Namespaces, and Cgroups</h1>
+  <p class="chapter-subtitle">How Linux 7.0 isolates and limits processes without a virtual machine — the eight namespace types and the nsproxy that ties them to a task, user namespaces and the capability model, PID namespaces, the cgroup v2 unified hierarchy and its resource controllers, delegation, Pressure Stall Information, and how a container runtime assembles all of these primitives into what we call a container.</p>
+</header>
+
+<main class="chapter-body">
+<nav class="toc">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#isolation">What Isolation Means in Linux</a>
+  <ul class="toc-sub">
+    <li><a href="#problem">1.1 Multitenancy Without Virtual Machines</a></li>
+    <li><a href="#two-axes">1.2 Namespaces and Cgroups: Two Orthogonal Mechanisms</a></li>
+  </ul>
+</li>
+<li><a href="#namespaces">Namespaces</a>
+  <ul class="toc-sub">
+    <li><a href="#nsproxy">2.1 The nsproxy and the Eight Namespace Types</a></li>
+    <li><a href="#ns-api">2.2 Creating and Joining: clone, unshare, setns</a></li>
+    <li><a href="#nsfs">2.3 The nsfs Filesystem and /proc/pid/ns</a></li>
+  </ul>
+</li>
+<li><a href="#userns">User Namespaces and Capabilities</a>
+  <ul class="toc-sub">
+    <li><a href="#uidmap">3.1 UID/GID Mapping and Fake Root</a></li>
+    <li><a href="#caps">3.2 Capabilities Per Namespace</a></li>
+  </ul>
+</li>
+<li><a href="#pidns">PID and the Other Namespaces</a>
+  <ul class="toc-sub">
+    <li><a href="#pid-namespace">4.1 PID Namespaces and struct pid</a></li>
+    <li><a href="#otherns">4.2 Network, Mount, and the Rest</a></li>
+  </ul>
+</li>
+<li><a href="#cgroups">Control Groups</a>
+  <ul class="toc-sub">
+    <li><a href="#unified">5.1 The Unified Hierarchy</a></li>
+    <li><a href="#cssset">5.2 css, css_set, and Task Membership</a></li>
+  </ul>
+</li>
+<li><a href="#controllers">The Controllers</a>
+  <ul class="toc-sub">
+    <li><a href="#cpu-mem-io">6.1 cpu, memory, and io</a></li>
+    <li><a href="#delegation">6.2 pids, cpuset, and Delegation</a></li>
+    <li><a href="#device-ctrls">6.3 rdma, misc, and dmem: Controllers for Device Resources</a></li>
+  </ul>
+</li>
+<li><a href="#psi">Pressure Stall Information</a>
+  <ul class="toc-sub">
+    <li><a href="#psi-measure">7.1 Measuring Contention</a></li>
+    <li><a href="#psi-triggers">7.2 Triggers and Notifications</a></li>
+  </ul>
+</li>
+<li><a href="#container">The Anatomy of a Container</a>
+  <ul class="toc-sub">
+    <li><a href="#runtime">8.1 What a Container Runtime Does</a></li>
+    <li><a href="#container-security">8.2 Security and the Attack Surface</a></li>
+  </ul>
+</li>
+<li><a href="#chapter-summary">Summary</a></li>
+</ol>
+</nav>
+
+<p class="chapter-intro">
+Linux 2.6.11 knew a process as a single kind of thing: an entity
+with a unique process ID, a view of one filesystem, one network stack, and one set
+of users, competing for the machine's CPU and memory with every other process on
+equal terms. That model is still the foundation, but modern Linux has learned to
+<em>partition</em> it. A single kernel can now present many processes each with the
+convincing illusion of having the machine to itself—its own process IDs starting at
+1, its own root filesystem, its own network interfaces, its own notion of who is
+root—while an administrator caps exactly how much CPU, memory, and I/O each
+partition may consume. This is the kernel foundation of
+<span class="key-term">containers</span>: the technology behind Docker, Podman, and
+Kubernetes, and the way most server software is deployed today.
+</p>
+
+<p>
+There is a striking fact to keep in mind throughout this chapter: the Linux kernel
+has <em>no container object</em>. Nowhere in the source is there a
+<code>struct container</code>. What the kernel provides instead are two independent
+sets of primitives—<span class="key-term">namespaces</span>, which control what a
+process can <em>see</em>, and <span class="key-term">control groups</span> (cgroups),
+which control what a process can <em>use</em>—plus supporting mechanisms such as
+capabilities and seccomp. A &ldquo;container&rdquo; is what you get when a user-space
+runtime composes these primitives in a particular way. This chapter builds the
+picture from those primitives up: the eight namespace types and how a task reaches
+them, the user namespace that underlies unprivileged containers, the cgroup v2
+hierarchy and its resource controllers, the Pressure Stall Information that reports
+contention, and finally how a container runtime assembles the whole into the thing
+we run.
+</p>
+
+<hr>
+<h2 id="isolation">What Isolation Means in Linux</h2>
+
+<p class="chapter-intro">
+Before the mechanisms, it is worth being clear about the goal and why Linux
+pursues it the way it does. This section explains the problem—running many mutually
+distrustful workloads on one kernel—and the two orthogonal answers the kernel
+gives, which the rest of the chapter then develops. The ideas are older than the
+word &ldquo;container&rdquo;: Unix has offered partial isolation since
+<code>chroot</code> confined a process's view of the filesystem in the 1979 Version
+7, and FreeBSD jails and Solaris zones built fuller isolation in the following
+decades. Linux assembled its own answer incrementally, and on two separate tracks
+that only later converged. The namespace track began with the mount namespace in
+2002, was not complete for unprivileged use until the user namespace landed in 2013,
+and gained its most recent member, the time namespace, only in 2020. The cgroup
+track started independently, merged in 2008 as &ldquo;process containers,&rdquo; and
+was substantial enough a design that it needed a rewrite: the multiple, per-controller
+hierarchies of the original design were replaced by the single unified hierarchy
+this chapter describes, which left experimental status in 2016. Two decades of
+incremental, not-always-coordinated work is why the subject feels less like one
+designed feature than like a toolbox of primitives accumulated piece by piece—and
+exactly why the kernel has no single &ldquo;container&rdquo; abstraction to point
+to.
+</p>
+
+<h3 id="problem">Multitenancy Without Virtual Machines</h3>
+
+<p>
+The classic way to run several untrusting workloads on one physical machine is
+<span class="key-term">virtualization</span>: give each workload its own virtual
+machine with its own kernel, and let a hypervisor divide the hardware. That works,
+but it is expensive—each virtual machine carries a full operating system, boots
+slowly, and reserves memory whether it uses it or not. For the common case where
+every workload wants to run on <em>the same</em> Linux kernel anyway, running dozens
+of copies of that kernel is a great deal of waste.
+</p>
+
+<p>
+Containers take the opposite approach: one shared kernel, many isolated
+<em>userspaces</em>. Because there is only one kernel, a container starts as fast as
+a process (it <em>is</em> a process, or a small tree of them), adds no per-container
+kernel memory, and shares the host's page cache and scheduler. The cost of that
+efficiency is that isolation is now the kernel's responsibility rather than a
+hardware boundary: the single kernel must convincingly present each workload with
+its own private view of the system and enforce its resource limits, and any flaw in
+that enforcement is a flaw in the isolation. Much of this chapter is about how the
+kernel earns that trust—and &sect;8.2 returns to where the trust has limits.
+</p>
+
+<p>
+It helps to see isolation as a <span class="key-term">spectrum</span> rather than a
+binary. At one extreme, ordinary processes share everything and are separated only
+by file permissions; at the other, separate physical machines share nothing. Virtual
+machines sit near the strong-isolation end, paying a full kernel per tenant for a
+hardware-enforced boundary; containers sit in the middle, sharing one kernel for
+near-native density; and hybrid designs such as lightweight virtual machines and
+user-space kernels deliberately trade some of the container's efficiency back for a
+stronger boundary. There is no universally right point on this spectrum—only a
+trade of <span class="key-term">density and speed</span> against
+<span class="key-term">isolation strength</span>. Containers won the common case
+because most workloads are not mutually hostile and do want the same kernel, so
+paying for a second kernel per workload buys isolation they do not need. The rest of
+this chapter is, in effect, the story of how much isolation the shared-kernel point
+on that spectrum can be made to provide.
+</p>
+
+<h3 id="two-axes">Namespaces and Cgroups: Two Orthogonal Mechanisms</h3>
+
+<p>
+Isolation in Linux is built from two mechanisms that answer two different
+questions, and keeping them distinct is the key to understanding the whole subject.
+Namespaces answer &ldquo;what can this process
+<em>see</em>?&rdquo;—which process IDs, which mounts, which network interfaces,
+which users exist as far as this process is concerned. Control
+groups answer &ldquo;how much can this process <em>use</em>?&rdquo;—how much
+CPU time, how much memory, how much I/O bandwidth. The two are entirely
+independent: a process can be in a private set of namespaces without any resource
+limit, or be capped by a cgroup while sharing the host's namespaces, or—as in a
+real container—both at once. Figure 25-1 draws the two axes.
+</p>
+
+<p>
+This orthogonality is not an accident but a deliberate design that keeps each
+mechanism simple and composable. Namespaces virtualize <em>identifiers and
+tables</em>—a PID, a mount tree, a network device list—so that the same kernel data
+structures can hold several disjoint populations at once. Cgroups
+<em>account and throttle</em>—counting pages charged, CPU cycles consumed, I/O
+issued—and enforce ceilings on those counts. A container runtime reaches for both
+because a useful container needs both a private view and a bounded appetite, but the
+kernel never fuses them, and this chapter treats them in turn: namespaces in
+&sect;2 through &sect;4, cgroups in &sect;5 through &sect;7, and their composition
+into a container in &sect;8.
+</p>
+
+<p>
+A concrete example makes the split vivid. Suppose two web servers share a host. Put
+each in its own network and PID namespace, and both can bind port 80 and both can run
+a process they call PID 1, each oblivious to the other—that is namespaces at work,
+and it involves no limits at all. Now give each a cgroup capping it at two CPUs and
+four gigabytes, and neither can starve the other however busy it gets—that is cgroups
+at work, and it involves no private view at all. Each mechanism is useful without the
+other, and a real container simply applies both.
+</p>
+
+<p>
+One caveat frames the whole chapter: neither namespaces nor cgroups is, by itself, a
+complete <em>security</em> mechanism. Namespaces limit what names a process can
+resolve and cgroups limit what resources it can consume, but a process still calls
+into the one shared kernel through the full system-call interface, and a bug reached
+through that interface can defeat either. Real containers therefore add a third leg
+that this chapter touches only in passing but that does the security heavy lifting:
+<span class="key-term">capabilities</span> to shed privileges (&sect;3.2),
+<span class="key-term">seccomp</span> filters to forbid unneeded system calls
+(Chapter 20), and <span class="key-term">Linux Security Modules</span> such as
+SELinux or AppArmor to constrain what remains. The LSM framework itself has grown
+two newer, lighter-weight members that fit the same slot: <code>CONFIG_BPF_LSM</code>
+lets an eBPF program attach directly to security hooks (Chapter 23), and
+<code>CONFIG_SECURITY_LANDLOCK</code> lets an unprivileged process narrow its own
+filesystem and network access without any administrator-installed policy at all.
+Namespaces and cgroups build the
+container; capabilities, seccomp, and LSMs are what make it a boundary worth trusting.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 400" role="img" aria-labelledby="fig25-1-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig25-1-title">Figure 25-1. The Two Axes of Isolation</title>
+<defs><marker id="e231" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="828" height="368" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-1. The Two Axes of Isolation</text>
+
+<rect x="330" y="150" width="200" height="90" rx="10" fill="#e0f2fe" stroke="#0369a1"/>
+<text x="430" y="188" text-anchor="middle" font-family="Inter,sans-serif" font-size="13" font-weight="700">a process</text>
+<text x="430" y="210" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">(or a tree of them)</text>
+
+<rect x="70" y="150" width="200" height="90" rx="10" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="170" y="182" text-anchor="middle" font-family="Inter,sans-serif" font-size="13" font-weight="700" fill="#6d28d9">namespaces</text>
+<text x="170" y="204" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">what it can SEE</text>
+<text x="170" y="222" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">PIDs, mounts, net, users</text>
+
+<rect x="590" y="150" width="200" height="90" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+<text x="690" y="182" text-anchor="middle" font-family="Inter,sans-serif" font-size="13" font-weight="700" fill="#15803d">cgroups</text>
+<text x="690" y="204" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700">how much it can USE</text>
+<text x="690" y="222" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">CPU, memory, I/O</text>
+
+<g stroke="#334155" stroke-width="1.5" fill="none">
+<line x1="330" y1="195" x2="270" y2="195" marker-end="url(#e231)"/>
+<line x1="530" y1="195" x2="590" y2="195" marker-end="url(#e231)"/>
+</g>
+<text x="300" y="185" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#64748b">isolate</text>
+<text x="560" y="185" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#64748b">limit</text>
+
+<rect x="150" y="300" width="560" height="56" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-dasharray="5 3"/>
+<text x="430" y="324" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#c2410c">a container = both axes applied together</text>
+<text x="430" y="342" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">plus capabilities and seccomp — composed by a user-space runtime, not a kernel object</text>
+
+<g stroke="#ea580c" stroke-width="1.2" fill="none" stroke-dasharray="3 2">
+<line x1="170" y1="240" x2="280" y2="300" marker-end="url(#e231)"/>
+<line x1="690" y1="240" x2="580" y2="300" marker-end="url(#e231)"/>
+</g>
+</svg>
+<figcaption>Figure 25-1. The two axes of isolation — namespaces control what a process can see (its private view of process IDs, mounts, network interfaces, and users), while cgroups control how much it can use (its share of CPU, memory, and I/O). The two are orthogonal and independently applicable; a container is what a user-space runtime produces by applying both together, along with capabilities and seccomp, since the kernel itself has no container object.</figcaption>
+</figure>
+
+<hr>
+<h2 id="namespaces">Namespaces</h2>
+
+<p class="chapter-intro">
+A namespace virtualizes one class of global kernel resource so that the processes
+inside the namespace see their own private instance of it, isolated from processes
+outside. Linux 7.0 has <span class="key-term">eight</span> namespace types, each
+covering a different resource. This section introduces all eight and the
+<code>nsproxy</code> that binds them to a task, then the three system calls that
+create and join namespaces, and finally the filesystem through which namespaces are
+named and manipulated as first-class objects. Chapter 3 met the same structures
+from the process side, as part of a task's identity; here they are the raw
+material of containers, and the emphasis is on what each type isolates and how a
+runtime combines them.
+</p>
+
+<p>
+The unifying idea is worth stating plainly: in almost every case a namespace is a
+thin wrapper around a <em>table or index the kernel already maintained</em>. The
+kernel always had a hostname; the UTS namespace just lets there be several. It always
+had a mount tree, a set of network interfaces, an IPC object table, a PID allocator;
+each namespace type lets the kernel keep several disjoint copies and hand each process
+one. Every task belongs to exactly one namespace of each of the eight types—there is
+no &ldquo;no namespace,&rdquo; only the <span class="key-term">initial</span>
+namespaces that the first process starts in and that most processes never leave. Two
+of the types, user and PID, <span class="key-term">nest</span> (a new one has a parent
+and remembers it), which is what lets isolation compound; the other six are flat
+replacements. Keeping that picture—private copies of familiar tables, one per
+process, initial ones by default—makes the eight types far less to memorize than they
+first appear.
+</p>
+
+<h3 id="nsproxy">The nsproxy and the Eight Namespace Types</h3>
+
+<p>
+Most of a task's namespaces are reached through a single shared structure,
+<code>struct nsproxy</code> (<code class="file-path">include/linux/nsproxy.h</code>),
+pointed to by <code>task_struct-&gt;nsproxy</code>. Because the <code>nsproxy</code>
+is reference-counted and shared, all the threads of a process—and a freshly forked
+child that changed no namespaces—point at the same one, so entering a namespace is
+usually a matter of swapping a pointer rather than copying anything. The proxy holds
+pointers to the mount, UTS, IPC, network, time, and cgroup namespaces, plus a
+<code>pid_ns_for_children</code> field discussed in &sect;4.1. Two of the eight
+namespaces are deliberately <em>not</em> in the proxy: a task's active PID namespace
+is derived from its <code>struct pid</code> rather than stored here, and its user
+namespace is reached through its credentials (<code>cred-&gt;user_ns</code>), because
+the user namespace governs the very permission checks that guard the others. The
+structure is small—little more than a reference count and a pointer per namespace, as
+the definition below and Table 25-1 show—which is exactly why sharing it is cheap.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/nsproxy.h */
+struct nsproxy {
+	refcount_t count;
+	struct uts_namespace *uts_ns;
+	struct ipc_namespace *ipc_ns;
+	struct mnt_namespace *mnt_ns;
+	struct pid_namespace *pid_ns_for_children;
+	struct net *net_ns;
+	struct time_namespace *time_ns;
+	struct time_namespace *time_ns_for_children;
+	struct cgroup_namespace *cgroup_ns;
+};</code></pre></div>
+
+<table>
+<caption>Table 25-1. Fields of struct nsproxy</caption>
+<thead>
+<tr><th>Field</th><th>Points to</th></tr>
+</thead>
+<tbody>
+<tr><td><code>count</code></td><td>Reference count; the proxy is shared by all threads of a process and freed when the last drops it.</td></tr>
+<tr><td><code>uts_ns</code></td><td>The UTS namespace (hostname and domain name).</td></tr>
+<tr><td><code>ipc_ns</code></td><td>The IPC namespace (System V IPC and POSIX message queues).</td></tr>
+<tr><td><code>mnt_ns</code></td><td>The mount namespace (the mount tree and root filesystem).</td></tr>
+<tr><td><code>pid_ns_for_children</code></td><td>The PID namespace the task's <em>future children</em> will use—not the task's own active PID namespace (&sect;2.2, &sect;4.1).</td></tr>
+<tr><td><code>net_ns</code></td><td>The network namespace (interfaces, routing, netfilter, ports).</td></tr>
+<tr><td><code>time_ns</code></td><td>The task's own time namespace (monotonic and boot-time clock offsets).</td></tr>
+<tr><td><code>time_ns_for_children</code></td><td>The time namespace the task's future children will use, mirroring the PID case.</td></tr>
+<tr><td><code>cgroup_ns</code></td><td>The cgroup namespace (the cgroup-directory root the task sees).</td></tr>
+</tbody>
+</table>
+
+<p>
+Table 25-2 lists all eight namespace types with their kernel structures and clone
+flags, including the two—user and PID—reached outside the proxy.
+</p>
+
+<table>
+<caption>Table 25-2. The eight namespace types</caption>
+<thead>
+<tr><th>Namespace</th><th>Kernel structure (header)</th><th>Clone flag</th><th>Isolates</th></tr>
+</thead>
+<tbody>
+<tr><td>Mount</td><td><code>struct mnt_namespace</code> (<code class="file-path">fs/mount.h</code>)</td><td><code>CLONE_NEWNS</code></td><td>The mount tree and root filesystem; each has its own set of mounts and propagation state.</td></tr>
+<tr><td>UTS</td><td><code>struct uts_namespace</code> (<code class="file-path">include/linux/utsname.h</code>)</td><td><code>CLONE_NEWUTS</code></td><td>The hostname and NIS domain name returned by <code>uname</code>.</td></tr>
+<tr><td>IPC</td><td><code>struct ipc_namespace</code> (<code class="file-path">include/linux/ipc_namespace.h</code>)</td><td><code>CLONE_NEWIPC</code></td><td>System V IPC objects (semaphores, message queues, shared memory) and POSIX message queues.</td></tr>
+<tr><td>PID</td><td><code>struct pid_namespace</code> (<code class="file-path">include/linux/pid_namespace.h</code>)</td><td><code>CLONE_NEWPID</code></td><td>The process-ID number space; each namespace has its own PID 1 and numbering.</td></tr>
+<tr><td>Network</td><td><code>struct net</code> (<code class="file-path">include/net/net_namespace.h</code>)</td><td><code>CLONE_NEWNET</code></td><td>The entire network stack: interfaces, routing tables, netfilter, sockets, ports.</td></tr>
+<tr><td>User</td><td><code>struct user_namespace</code> (<code class="file-path">include/linux/user_namespace.h</code>)</td><td><code>CLONE_NEWUSER</code></td><td>UID/GID number spaces and the capability sets—the root of unprivileged isolation (&sect;3).</td></tr>
+<tr><td>Cgroup</td><td><code>struct cgroup_namespace</code> (<code class="file-path">include/linux/cgroup_namespace.h</code>)</td><td><code>CLONE_NEWCGROUP</code></td><td>The cgroup-directory root a process sees, so a container cannot observe the host's cgroup paths.</td></tr>
+<tr><td>Time</td><td><code>struct time_namespace</code> (<code class="file-path">include/linux/time_namespace.h</code>)</td><td><code>CLONE_NEWTIME</code></td><td>Offsets for the monotonic and boot-time clocks, applied through the vDSO.</td></tr>
+</tbody>
+</table>
+
+<p>
+Each namespace structure begins with a common core—a
+<code>struct ns_common</code> (<code class="file-path">include/linux/ns/ns_common_types.h</code>)
+that carries a reference count, the namespace <code>ns_type</code>, an inode number
+(<code>inum</code>), a stable 64-bit identifier, and the operations used by the nsfs
+filesystem of &sect;2.3—and then holds whatever state that resource needs:
+<code>struct net</code> is large, with its own loopback device, routing, netfilter,
+and per-protocol state, while <code>struct uts_namespace</code> holds little more than
+a <code>new_utsname</code>. This shared header is what lets generic code treat any
+namespace uniformly; the <code>to_ns_common</code> accessor extracts it from any of
+the eight concrete types, and it is why every namespace can be named by an inode and
+compared for identity regardless of which resource it virtualizes. The
+<code>init_nsproxy</code> (<code class="file-path">kernel/nsproxy.c</code>) is the proxy
+every task starts from, pointing at the initial instance of each namespace
+(<code>init_uts_ns</code>, <code>init_net</code>, <code>init_pid_ns</code>, and so on),
+which carry well-known low inode numbers; the whole namespaced world grows by
+branching off these initial instances. The shared header is shown below, and Table
+25-3 describes its fields. Figure 25-2 shows a task reaching its namespaces.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/ns/ns_common_types.h (abridged) */
+struct ns_common {
+	refcount_t __ns_ref;			/* memory-lifetime reference count */
+	u32 ns_type;				/* type, e.g. CLONE_NEWNET */
+	struct dentry *stashed;			/* cached dentry for the vfs */
+	const struct proc_ns_operations *ops;	/* nsfs operations */
+	unsigned int inum;			/* namespace inode number */
+	union {
+		struct {
+			u64 ns_id;		/* stable 64-bit identifier */
+			atomic_t __ns_ref_active;	/* active-user reference count */
+			/* ... rbtree/list nodes for the namespace trees ... */
+		};
+		struct rcu_head ns_rcu;		/* reused for the RCU-delayed free */
+	};
+};</code></pre></div>
+
+<p>
+The single reference count of earlier kernels has split into two. <code>__ns_ref</code>
+still governs memory lifetime—when it hits zero the namespace is unlinked from the
+namespace trees and freed after an RCU grace period—but a namespace can be alive and
+yet <span class="key-term">inactive</span> well before that: <code>__ns_ref_active</code>
+counts live users (a task with the namespace in its <code>nsproxy</code> or
+<code>cred</code>, an open nsfs file descriptor, a bind mount of a
+<code class="file-path">/proc/&lt;pid&gt;/ns</code> link), and it is what actually
+gates whether the namespace can still be opened, listed, or reentered. A namespace
+whose last active user goes away becomes inactive—no longer discoverable—while
+remaining allocated for as long as something still pins it by <code>__ns_ref</code>,
+such as a file whose <code>f_cred</code> still points at a user namespace nobody is
+running in anymore; the socket-passed-between-processes case in
+<code class="file-path">kernel/nscommon.c</code> is exactly this. Dropping the last
+active reference on a non-user namespace also drops one active reference on the user
+namespace that owns it, cascading up the ownership chain—so a user namespace stays
+listable for exactly as long as any namespace it owns still is.
+</p>
+
+<table>
+<caption>Table 25-3. Fields of struct ns_common</caption>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>__ns_ref</code></td><td>The memory-lifetime reference count; when it reaches zero the namespace is unlinked from the namespace trees and freed after an RCU grace period.</td></tr>
+<tr><td><code>ns_type</code></td><td>Which of the eight types this is, encoded as the corresponding <code>CLONE_NEW*</code> value.</td></tr>
+<tr><td><code>stashed</code></td><td>A cached <code>dentry</code> used by the VFS so that repeated <code class="file-path">/proc/&lt;pid&gt;/ns</code> lookups reuse one nsfs object.</td></tr>
+<tr><td><code>ops</code></td><td>The per-type <code>proc_ns_operations</code> (get, put, install, owner, parent) that nsfs and <code>setns</code> call.</td></tr>
+<tr><td><code>inum</code></td><td>The namespace's inode number—the value shown in the <code class="file-path">/proc/&lt;pid&gt;/ns</code> magic link and used to test namespace identity.</td></tr>
+<tr><td><code>ns_id</code></td><td>A stable, non-recycled 64-bit identifier returned by the <code>NS_GET_ID</code> ioctl (unlike <code>inum</code>, which can be reused for a later namespace) and used as the sort key of the namespace trees the <code>listns</code> syscall of &sect;2.3 walks.</td></tr>
+<tr><td><code>__ns_ref_active</code></td><td>The active-user reference count; it, not <code>__ns_ref</code>, controls whether the namespace is currently listable and reopenable.</td></tr>
+</tbody>
+</table>
+
+<p>
+The <code>ops</code> field deserves a closer look, because it is what makes the whole
+scheme <span class="key-term">polymorphic</span>. A
+<code>struct proc_ns_operations</code> (<code class="file-path">include/linux/proc_ns.h</code>)
+is a small table of function pointers—a vtable in the sense of the virtual
+filesystem of Chapter 12—and there is one constant instance per namespace type
+(<code>netns_operations</code>, <code>pidns_operations</code>,
+<code>userns_operations</code>, and so on). Because every namespace's
+<code>ns_common</code> points at the right one, generic code in nsfs and the syscalls
+can act on a namespace through its <code>ns_common</code> without ever knowing which
+of the eight types it really is; it just calls through <code>ops</code>. The
+structure is shown below, and Table 25-4 describes its fields.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/proc_ns.h */
+struct proc_ns_operations {
+	const char *name;
+	const char *real_ns_name;
+	struct ns_common *(*get)(struct task_struct *task);
+	void (*put)(struct ns_common *ns);
+	int (*install)(struct nsset *nsset, struct ns_common *ns);
+	struct user_namespace *(*owner)(struct ns_common *ns);
+	struct ns_common *(*get_parent)(struct ns_common *ns);
+};</code></pre></div>
+
+<table>
+<caption>Table 25-4. Members of struct proc_ns_operations</caption>
+<thead>
+<tr><th>Member</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>The type's short name—the <code>net</code>, <code>pid</code>, <code>user</code> string that appears in the <code class="file-path">/proc/&lt;pid&gt;/ns</code> link.</td></tr>
+<tr><td><code>real_ns_name</code></td><td>The underlying type name for the &ldquo;for children&rdquo; variants (for example, the pid-for-children ops report a real name of <code>pid</code>).</td></tr>
+<tr><td><code>get</code></td><td>Fetch and pin the namespace of this type from a given task, called when a <code class="file-path">/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> link is opened.</td></tr>
+<tr><td><code>put</code></td><td>Drop a reference taken by <code>get</code>, releasing the namespace when the file descriptor is closed.</td></tr>
+<tr><td><code>install</code></td><td>Enter this namespace: the per-type action behind <code>setns</code>, doing the type-specific work (swap the mount root, the network namespace, the credentials, and so on) of the <code>commit_nsset</code> path in &sect;2.2.</td></tr>
+<tr><td><code>owner</code></td><td>Return the user namespace that owns this one—what the <code>NS_GET_USERNS</code> ioctl and every owning-namespace capability check (&sect;3.2) rely on.</td></tr>
+<tr><td><code>get_parent</code></td><td>Return the parent of a nested user or PID namespace, backing the <code>NS_GET_PARENT</code> ioctl; the flat namespace types leave this unset.</td></tr>
+</tbody>
+</table>
+
+<p>
+So the <code>ops</code> pointer is the seam along which one body of namespace-generic
+code serves all eight types: nsfs opens and closes links through <code>get</code> and
+<code>put</code>, <code>setns</code> enters a namespace through <code>install</code>,
+and the <code>NS_GET_*</code> ioctls of &sect;2.3 walk ownership and nesting through
+<code>owner</code> and <code>get_parent</code>—each dispatched to the correct
+implementation without a single type-specific branch.
+</p>
+
+<p>
+Switching a task's namespaces is careful pointer work rather than deep copying.
+Because a single <code>nsproxy</code> is shared by every thread of a process, the
+kernel never edits one in place; instead <code>create_new_namespaces</code>
+(<code class="file-path">kernel/nsproxy.c</code>) allocates a fresh proxy that reuses
+the unchanged namespace pointers and installs new ones only for the types being
+replaced, and <code>switch_task_namespaces</code> then swaps the task's pointer to it
+under the task lock. The old proxy is reference-counted and freed when its last user
+drops it (<code>free_nsproxy</code>). On the fork path, <code>copy_namespaces</code>
+short-circuits entirely when no <code>CLONE_NEW*</code> flag is set—the overwhelmingly
+common case—so an ordinary fork simply shares the parent's proxy and costs a single
+reference increment. This is why namespaces impose essentially no overhead on
+processes that do not use them, and only modest cost on those that do.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 470" role="img" aria-labelledby="fig25-2-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig25-2-title">Figure 25-2. A Task and Its Namespaces</title>
+<defs><marker id="e232" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="848" height="438" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-2. A Task and Its Namespaces</text>
+
+<rect x="60" y="214" width="190" height="64" rx="10" fill="#dbeafe" stroke="#2563eb"/>
+<text x="155" y="240" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">task_struct</text>
+<text x="155" y="260" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">nsproxy &#183; cred &#183; thread_pid</text>
+
+<rect x="350" y="88" width="180" height="64" rx="10" fill="#ede9fe" stroke="#7c3aed"/>
+<text x="440" y="114" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700">nsproxy</text>
+<text x="440" y="134" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">shared, refcounted</text>
+
+<rect x="610" y="60" width="210" height="132" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="715" y="80" text-anchor="middle" font-family="Inter,sans-serif" font-size="10" font-weight="700" fill="#6d28d9">six namespaces in the proxy</text>
+<g font-family="Inter,sans-serif" font-size="9.5" font-weight="700" text-anchor="middle">
+<rect x="624" y="90" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="666" y="107">mnt_ns</text>
+<rect x="722" y="90" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="764" y="107">uts_ns</text>
+<rect x="624" y="120" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="666" y="137">ipc_ns</text>
+<rect x="722" y="120" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="764" y="137">net_ns</text>
+<rect x="624" y="150" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="666" y="167">time_ns</text>
+<rect x="722" y="150" width="84" height="26" rx="6" fill="#ffffff" stroke="#7c3aed"/><text x="764" y="167">cgroup_ns</text>
+</g>
+
+<rect x="350" y="214" width="180" height="64" rx="10" fill="#fee2e2" stroke="#dc2626"/>
+<text x="440" y="240" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">cred</text>
+<text x="440" y="258" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">uid, gid, capabilities</text>
+<rect x="610" y="214" width="210" height="64" rx="10" fill="#fff5f5" stroke="#dc2626"/>
+<text x="715" y="240" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">user_ns</text>
+<text x="715" y="258" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">reached via cred</text>
+
+<rect x="350" y="340" width="180" height="64" rx="10" fill="#dcfce7" stroke="#16a34a"/>
+<text x="440" y="366" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">struct pid</text>
+<text x="440" y="384" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">numbers[] across levels</text>
+<rect x="610" y="340" width="210" height="64" rx="10" fill="#f0fdf4" stroke="#16a34a"/>
+<text x="715" y="366" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">pid_ns</text>
+<text x="715" y="384" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">active, via struct pid</text>
+
+<g stroke="#334155" stroke-width="1.4" fill="none">
+<line x1="250" y1="246" x2="300" y2="246"/>
+<line x1="300" y1="120" x2="300" y2="372"/>
+<line x1="300" y1="120" x2="350" y2="120" marker-end="url(#e232)"/>
+<line x1="300" y1="246" x2="350" y2="246" marker-end="url(#e232)"/>
+<line x1="300" y1="372" x2="350" y2="372" marker-end="url(#e232)"/>
+<line x1="530" y1="120" x2="610" y2="120" marker-end="url(#e232)"/>
+<line x1="530" y1="246" x2="610" y2="246" marker-end="url(#e232)"/>
+<line x1="530" y1="372" x2="610" y2="372" marker-end="url(#e232)"/>
+</g>
+<text x="440" y="434" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">six namespaces hang off the shared nsproxy; the user namespace is reached through the task's credentials and the active PID namespace through its struct pid</text>
+</svg>
+<figcaption>Figure 25-2. A task and its namespaces — six of the eight namespaces (mount, UTS, IPC, network, time, cgroup) hang off the reference-counted struct nsproxy that task_struct points to and threads share. The user namespace is deliberately reached through the task's credentials, because it governs the permission checks that protect the others, and the active PID namespace is derived from the task's struct pid rather than stored in the proxy.</figcaption>
+</figure>
+
+<h3 id="ns-api">Creating and Joining: clone, unshare, setns</h3>
+
+<p>
+Three system calls create and enter namespaces, and they cover three different
+moments. <code>clone</code> and its successor <code>clone3</code>
+(<code class="file-path">kernel/fork.c</code>) create a <em>new process</em> already
+placed in new namespaces: for each <code>CLONE_NEW*</code> flag passed, the child
+gets a fresh namespace of that type instead of sharing the parent's, wired up by
+<code>copy_namespaces</code> during the fork. <code>unshare</code>
+(<code class="file-path">kernel/nsproxy.c</code>) moves the <em>calling</em> process
+into new namespaces without forking, replacing its <code>nsproxy</code> with one
+that holds fresh namespaces for the requested types—the mechanism behind the
+<code>unshare(1)</code> command. And <code>setns</code>
+(<code class="file-path">kernel/nsproxy.c</code>) joins an <em>existing</em>
+namespace named by a file descriptor, which is how a tool enters the namespaces of
+an already-running container. Table 25-5 summarizes the three.
+</p>
+
+<table>
+<caption>Table 25-5. The namespace system calls</caption>
+<thead>
+<tr><th>Call</th><th>Effect on namespaces</th><th>Typical use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>clone</code> / <code>clone3</code></td><td>Creates a new child process in fresh namespaces for each <code>CLONE_NEW*</code> flag given.</td><td>A runtime starting the first process of a new container.</td></tr>
+<tr><td><code>unshare</code></td><td>Moves the caller itself into new namespaces for the requested types, without forking.</td><td>The <code>unshare(1)</code> tool; setting up namespaces before <code>exec</code>.</td></tr>
+<tr><td><code>setns</code></td><td>Joins the caller (or a child) to an existing namespace referenced by an fd.</td><td>Entering a running container (<code>nsenter</code>, <code>docker exec</code>).</td></tr>
+</tbody>
+</table>
+
+<p>
+The <code>setns</code> path repays a closer look because joining several namespaces
+at once must be all-or-nothing. The kernel first builds a candidate namespace set
+and validates it (<code>prepare_nsset</code> and <code>validate_nsset</code>,
+<code class="file-path">kernel/nsproxy.c</code>)—checking, among other things, that
+the caller has the required capability <em>in the target user namespace</em>—and
+only if every requested namespace is permitted does it apply them together in
+<code>commit_nsset</code>, which installs the new user credentials, mount root, and
+so on and then swaps the task's <code>nsproxy</code> via
+<code>switch_task_namespaces</code>. A <code>pidfd</code> can name a target process
+whose whole namespace set is to be joined at once. Ordering matters here: the user
+namespace must be entered before the others, because it is what authorizes them—a
+subtlety that the two-phase prepare/commit split exists to get right.
+</p>
+
+<p>
+Two constraints on these calls trip up newcomers and are worth spelling out. First,
+<span class="key-term">privilege</span>: creating a namespace of any type requires
+<code>CAP_SYS_ADMIN</code> in the user namespace that will own it, with one pivotal
+exception—creating a <em>user</em> namespace requires no privilege at all, which is
+the whole basis of unprivileged containers (&sect;3). The standard recipe is
+therefore to unshare a new user namespace first, gaining a full capability set inside
+it, and then create the other namespaces under that new authority.
+<code>setns</code> likewise demands <code>CAP_SYS_ADMIN</code> in the target
+namespace's owning user namespace, so a process cannot enter a namespace it has no
+authority over. Second, the <span class="key-term">PID-namespace quirk</span>:
+unsharing or setting a PID namespace does not move the <em>calling</em> process into
+it, because a live process cannot change its own PID. Instead the new namespace is
+recorded in <code>pid_ns_for_children</code> (&sect;4.1) and takes effect for the
+caller's <em>next child</em>, which becomes PID 1 of the new namespace. This is why
+<code>unshare --pid</code> must be followed by a <code>fork</code> before anything
+actually runs inside the new PID namespace—a detail that surprises nearly everyone the
+first time.
+</p>
+
+<h3 id="nsfs">The nsfs Filesystem and /proc/pid/ns</h3>
+
+<p>
+Namespaces are not merely transient kernel state; they are nameable objects with a
+lifetime, exposed through a small pseudo-filesystem called
+<span class="key-term">nsfs</span> (<code class="file-path">fs/nsfs.c</code>). Every
+namespace a process belongs to appears as a magic symbolic link under
+<code class="file-path">/proc/&lt;pid&gt;/ns/</code>—<code class="file-path">.../ns/net</code>,
+<code class="file-path">.../ns/pid</code>, <code class="file-path">.../ns/user</code>,
+and so on. These links have two important properties. Their target text encodes the
+namespace type and its unique inode number, so two processes are in the same
+namespace exactly when their links point to the same inode—the standard way to
+test namespace membership. And opening one yields a file descriptor that
+<em>keeps the namespace alive</em> even if every process in it exits, which is how a
+container manager can hold a namespace open to re-enter later, and the fd that
+<code>setns</code> consumes.
+</p>
+
+<p>
+The nsfs file descriptors also answer queries through <code>ioctl</code>. A caller
+can walk the namespace hierarchy and read its attributes: <code>NS_GET_USERNS</code>
+returns the user namespace that owns a given namespace, <code>NS_GET_PARENT</code>
+returns the parent of a nested user or PID namespace, <code>NS_GET_NSTYPE</code>
+reports which of the eight types it is, and <code>NS_GET_OWNER_UID</code> returns
+the owning UID of a user namespace (<code class="file-path">include/uapi/linux/nsfs.h</code>).
+Further ioctls (<code>NS_GET_ID</code> for the stable 64-bit identifier, and the
+<code>NS_GET_PID_IN_PIDNS</code> family) translate identifiers between namespaces, so
+a manager can ask &ldquo;what number does this process have inside that PID
+namespace?&rdquo; without entering it. Through nsfs, then, namespaces become
+inspectable, referenceable kernel objects rather than hidden per-task state—exactly
+what a container runtime needs to manage them.
+</p>
+
+<p>
+Two practical details make nsfs more than a curiosity. The magic-link target has a
+readable form—<code class="file-path">net:[4026531840]</code>, the type name followed
+by the namespace's inode number in brackets—so even a shell script can compare two
+processes' namespaces by reading and matching these strings, and tools like
+<code>lsns</code> traditionally enumerate the system's namespaces by walking
+<code class="file-path">/proc</code> this way. More importantly, the
+&ldquo;keeps the namespace alive&rdquo; property enables
+<span class="key-term">persistent</span> namespaces with no member process at all: a
+<code>bind</code> mount of a <code class="file-path">/proc/&lt;pid&gt;/ns/</code> link
+onto an ordinary file pins the namespace for as long as the mount exists. This is
+exactly how <code>ip netns add</code> creates a named network namespace—it bind-mounts
+the link under <code class="file-path">/var/run/netns/</code>—so an administrator can
+configure a network namespace, let the creating process exit, and have later processes
+enter it by name. A namespace, in other words, can outlive every process that ever
+lived in it, held open by nothing but a file descriptor or a bind mount.
+</p>
+
+<p>
+Walking <code class="file-path">/proc</code> to enumerate namespaces has always had an
+obvious flaw: it only finds namespaces that some visible process is currently in, and
+a persistent, bind-mounted namespace with no member process is invisible to it. Recent
+kernels close that gap directly with the <code>listns</code> system call
+(<code class="file-path">kernel/nstree.c</code>), which walks a dedicated set of
+red-black trees—one per namespace type, plus a global one—that every namespace
+registers itself in at creation (<code>ns_tree_add</code>) and leaves at destruction
+(<code>ns_tree_remove</code>), independent of whether any process currently has it
+open. A caller passes a <code>struct ns_id_req</code> naming a namespace type to
+filter on and, optionally, an owning user namespace—<code>LISTNS_CURRENT_USER</code>
+asks for exactly the namespaces owned by the caller's own user namespace—and gets
+back an array of stable <code>ns_id</code> values it can resolve further with the
+ioctls above. Seeing every namespace on the host this way—regardless of which
+user namespace owns it—requires <code>CAP_SYS_ADMIN</code> in the initial user
+namespace and residence in the initial PID namespace
+(<code>may_see_all_namespaces</code>): real host-level administration, not merely
+privilege inside a container's own user namespace. Short of that, each candidate
+namespace is only reported back if it happens to be one of the caller's own current
+namespaces (<code>is_current_namespace</code>)—so an unprivileged or contained caller
+can use <code>listns</code> to resolve the stable <code>ns_id</code> of the
+namespaces it already belongs to, but not to discover namespaces it does not. Full,
+container-wide enumeration by <code>ns_id</code>—the kind a host-level monitoring
+agent, <code>lsns</code>, or an orchestrator with real root wants—remains the
+province of a genuine system administrator.
+</p>
+
+<hr>
+<h2 id="userns">User Namespaces and Capabilities</h2>
+
+<p class="chapter-intro">
+Of the eight namespaces, the <span class="key-term">user namespace</span> is the
+keystone, because it is what lets an <em>unprivileged</em> user create the others
+safely. It virtualizes the UID and GID number spaces and the capability model, so
+that a process can be fully privileged inside its namespace while remaining
+unprivileged on the host. This section covers the UID/GID mapping that makes
+&ldquo;fake root&rdquo; possible and the per-namespace capability rules that bound
+what that root can actually do.
+</p>
+
+<p>
+Two structural facts frame everything that follows. First, user namespaces
+nest into a tree: each records its
+<code>parent</code>, its <code>level</code> (the initial namespace is level 0), and
+its <code>owner</code>—the host UID that created it—and nesting is capped at 32
+levels deep (<code class="file-path">kernel/user_namespace.c</code>) so the tree
+cannot grow without bound. Second, the user namespace is the
+<span class="key-term">root of authority</span> for all the others: because every
+other namespace records which user namespace owns it, and every privileged operation
+is checked against that owner, the user namespace is where the question &ldquo;is
+this process allowed to do this?&rdquo; is ultimately answered. That is why it was
+the last namespace to be completed—arriving only in 2013, more than a decade after
+the mount namespace—and why it remains the most scrutinized: getting its permission
+model wrong would compromise every isolation guarantee built on top of it.
+</p>
+
+<h3 id="uidmap">UID/GID Mapping and Fake Root</h3>
+
+<p>
+A user namespace (<code>struct user_namespace</code>,
+<code class="file-path">include/linux/user_namespace.h</code>) carries a
+<span class="key-term">mapping</span> between the UIDs and GIDs seen inside it and
+those of its parent. The mapping is written once, after creation, through
+<code class="file-path">/proc/&lt;pid&gt;/uid_map</code> and
+<code class="file-path">gid_map</code> (<code>proc_uid_map_write</code>,
+<code class="file-path">kernel/user_namespace.c</code>): each line maps a range of
+inside IDs to a range of parent IDs. The classic unprivileged-container mapping
+makes inside UID 0 correspond to the user's own unprivileged host UID, so a process
+that is <em>root inside</em> the container is really running as that ordinary user
+on the host. This is the celebrated <span class="key-term">fake root</span>: full
+administrative identity within the namespace, no added privilege outside it. The
+structure holding all this is compact; it is shown below, and Table 25-6 describes
+its principal fields.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/user_namespace.h (abridged) */
+struct user_namespace {
+	struct uid_gid_map	uid_map;	/* inside &#8596; parent UID ranges */
+	struct uid_gid_map	gid_map;
+	struct uid_gid_map	projid_map;	/* project IDs (quota) */
+	struct user_namespace	*parent;	/* enclosing user namespace */
+	int			level;		/* nesting depth, 0 = initial */
+	kuid_t			owner;		/* host UID that created it */
+	kgid_t			group;		/* host GID that created it */
+	struct ns_common	ns;		/* common namespace header */
+	unsigned long		flags;		/* e.g. USERNS_SETGROUPS_ALLOWED */
+	struct ucounts		*ucounts;	/* per-user resource counters */
+	long ucount_max[UCOUNT_COUNTS];		/* caps on namespaces, etc. */
+	/* ... keyrings, sysctls, work ... */
+};</code></pre></div>
+
+<table>
+<caption>Table 25-6. Fields of struct user_namespace</caption>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uid_map</code>, <code>gid_map</code></td><td>The UID and GID translation tables between this namespace and its parent, written once through <code class="file-path">/proc/&lt;pid&gt;/uid_map</code> and <code class="file-path">gid_map</code>.</td></tr>
+<tr><td><code>projid_map</code></td><td>The project-ID translation table, used by filesystem project quotas.</td></tr>
+<tr><td><code>parent</code></td><td>The enclosing user namespace, forming the nesting tree; <code>NULL</code> for the initial namespace.</td></tr>
+<tr><td><code>level</code></td><td>Nesting depth (0 for the initial namespace), capped at 32.</td></tr>
+<tr><td><code>owner</code>, <code>group</code></td><td>The host <code>kuid_t</code>/<code>kgid_t</code> of the process that created the namespace; <code>owner</code> is what <code>NS_GET_OWNER_UID</code> reports and what owning-namespace checks compare against.</td></tr>
+<tr><td><code>ns</code></td><td>The embedded <code>struct ns_common</code> (&sect;2.1) giving it an inode, a type, and nsfs operations.</td></tr>
+<tr><td><code>flags</code></td><td>Namespace flags, notably <code>USERNS_SETGROUPS_ALLOWED</code>, cleared to gate <code class="file-path">gid_map</code> writing (&sect;3.1).</td></tr>
+<tr><td><code>ucounts</code>, <code>ucount_max</code></td><td>Per-user counters and their ceilings—including <code>max_user_namespaces</code>—that bound how many namespaces and similar objects a user may create.</td></tr>
+</tbody>
+</table>
+
+<p>
+The kernel keeps these two worlds straight with two distinct types. A
+<code>kuid_t</code> (<code class="file-path">include/linux/uidgid.h</code>) is a
+<em>kernel-internal</em> UID, unique across the whole system; the ordinary
+<code>uid_t</code> a process sees is namespace-relative. Every credential check
+translates: <code>make_kuid(ns, uid)</code> converts a namespace-relative UID down
+to a system-wide <code>kuid_t</code> through the namespace's map, and
+<code>from_kuid(ns, kuid)</code> converts back up for display. Because file
+ownership and permission checks operate on <code>kuid_t</code> values, a file owned
+by host UID 1000 is correctly seen as owned by root inside a namespace that maps
+inside-0 to host-1000, and access to a file the host user cannot reach is denied no
+matter what the inside UID claims. The mapping, in other words, is not a bypass of
+permission checks but a relabeling that those checks see through. Figure 25-3
+illustrates the translation.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 400" role="img" aria-labelledby="fig25-3-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig25-3-title">Figure 25-3. User-Namespace UID Mapping</title>
+<defs><marker id="e233" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="828" height="368" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-3. User-Namespace UID Mapping</text>
+
+<rect x="70" y="80" width="300" height="150" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-dasharray="5 3"/>
+<text x="220" y="104" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#6d28d9">inside the user namespace</text>
+<rect x="110" y="124" width="220" height="40" rx="7" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="220" y="149" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">UID 0 (&#8220;root&#8221;)</text>
+<rect x="110" y="176" width="220" height="36" rx="7" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="220" y="199" text-anchor="middle" font-family="Inter,sans-serif" font-size="10">UID 1&#8211;65535</text>
+
+<rect x="490" y="80" width="300" height="150" rx="12" fill="#e0f2fe" stroke="#0369a1" stroke-dasharray="5 3"/>
+<text x="640" y="104" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#0369a1">on the host (parent ns)</text>
+<rect x="530" y="124" width="220" height="40" rx="7" fill="#f0f9ff" stroke="#0369a1"/>
+<text x="640" y="149" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">UID 100000 (unprivileged)</text>
+<rect x="530" y="176" width="220" height="36" rx="7" fill="#f0f9ff" stroke="#0369a1"/>
+<text x="640" y="199" text-anchor="middle" font-family="Inter,sans-serif" font-size="10">UID 100001&#8211;165535</text>
+
+<g stroke="#334155" stroke-width="1.5" fill="none">
+<line x1="330" y1="144" x2="530" y2="144" marker-end="url(#e233)"/>
+<line x1="330" y1="194" x2="530" y2="194" marker-end="url(#e233)"/>
+</g>
+<text x="430" y="136" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#7c3aed" font-weight="700">make_kuid / from_kuid</text>
+<text x="430" y="210" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#64748b">uid_map: 0 100000 65536</text>
+
+<rect x="150" y="290" width="560" height="66" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-dasharray="5 3"/>
+<text x="430" y="314" text-anchor="middle" font-family="Inter,sans-serif" font-size="10.5" font-weight="700" fill="#c2410c">fake root: full privilege inside, ordinary unprivileged user outside</text>
+<text x="430" y="334" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#475569">permission checks operate on the system-wide kuid_t, so the mapping relabels but does not bypass them</text>
+</svg>
+<figcaption>Figure 25-3. User-namespace UID mapping — a uid_map line ("0 100000 65536") maps inside UID 0 to host UID 100000, so a process that is root inside the namespace runs as an unprivileged host user. make_kuid translates a namespace-relative UID down to the system-wide kuid_t used for every permission check, and from_kuid translates back up for display, so the mapping relabels identities without bypassing the checks that operate on the kuid_t.</figcaption>
+</figure>
+
+<p>
+Who may write which mapping is itself a carefully guarded question, because the map
+<em>is</em> the namespace's grant of identity. The rules
+(<code>new_idmap_permitted</code>, <code class="file-path">kernel/user_namespace.c</code>)
+draw a sharp line. An unprivileged process may write only the trivial
+<span class="key-term">single-line self-map</span> that maps one inside ID to its own
+effective UID on the host—enough to become root inside its own namespace but nothing
+more. Mapping a <em>range</em> of IDs (so a container can have many users) requires
+<code>CAP_SETUID</code> or <code>CAP_SETGID</code> over the <em>parent</em> namespace,
+which an ordinary user does not have. This is why containers rely on the small
+setuid helpers <code>newuidmap</code> and <code>newgidmap</code>: an administrator
+pre-assigns each user a block of subordinate IDs in
+<code class="file-path">/etc/subuid</code> and <code class="file-path">/etc/subgid</code>,
+and the helpers—trusted to honor those files—write the wider map on the user's behalf.
+The map is also <span class="key-term">write-once</span>: once set it is immutable
+for the life of the namespace, and any ID with no mapping resolves to the overflow ID
+(<code>overflowuid</code>, normally <code>65534</code>, the conventional <code>nobody</code>,
+and tunable through <code class="file-path">/proc/sys/kernel/overflowuid</code>), so an unmapped file simply
+appears owned by nobody rather than leaking a real identity.
+</p>
+
+<p>
+One mapping rule exists purely to close a security hole and is worth calling out.
+Before a process may write <code class="file-path">gid_map</code>, it must first
+<em>disable</em> the <code>setgroups</code> system call for the namespace by writing
+<code>deny</code> to <code class="file-path">/proc/&lt;pid&gt;/setgroups</code>. The
+reason is subtle: some files grant access by <em>excluding</em> a group (mode bits
+that deny a group permissions the world has), and if a process could enter a user
+namespace, drop a group it was in via <code>setgroups</code>, and then map GIDs
+freely, it could shed a group specifically to gain access it was meant to be denied.
+Requiring <code>setgroups</code> to be turned off before an unprivileged
+<code>gid_map</code> is written removes that avenue. It is a small illustration of
+the general theme that the user namespace's power makes even its bookkeeping
+security-sensitive.
+</p>
+
+<p>
+A second, less well-known guard protects the same mapping from a subtler abuse: a
+namespace whose <code>uid_map</code> assigns inside UID 0 must trace back to a
+creator who could be trusted with file capabilities. When a write to
+<code class="file-path">uid_map</code> maps ID 0
+(<code>verify_root_map</code>, <code class="file-path">kernel/user_namespace.c</code>),
+the kernel checks a flag—<code>parent_could_setfcap</code>—recorded on the namespace
+at creation time from whether the creating credentials held
+<code>CAP_SETFCAP</code>. Without that check, an unprivileged process could <code>unshare</code>
+a user namespace, map its own UID to inside-root, and then use file capabilities
+(Chapter 20) inside the namespace to grant itself abilities its creator was never
+trusted with in the parent namespace. Tying the root mapping to the creator's own
+<code>CAP_SETFCAP</code> closes that path without restricting the ordinary,
+non-file-capability uses of fake root.
+</p>
+
+<p>
+UID/GID mapping as described so far is a property of a whole user namespace, applied
+uniformly to every process and file the namespace can see. Since Linux 5.12, the
+same translation can instead be attached to a single mount, independent of any
+process's user namespace: <code>mount_setattr</code> with the
+<code>MOUNT_ATTR_IDMAP</code> flag (<code class="file-path">fs/namespace.c</code>)
+takes a user-namespace file descriptor and installs an
+<span class="key-term">idmapped mount</span>—a <code>struct mnt_idmap</code>
+(<code class="file-path">include/linux/mnt_idmapping.h</code>) carried on the mount
+itself that reinterprets the UIDs and GIDs stored on disk through that mapping for
+every access through that mount, regardless of which namespace the accessing process
+is in. This is the mechanism behind letting a container engine bind-mount a single
+shared host directory into containers running under different, non-overlapping
+UID/GID ranges and have each container see sensible ownership, without physically
+<code>chown</code>-ing the underlying files or juggling per-container copies; it is
+also how <code>systemd-homed</code> makes a home directory portable across machines
+whose local UID assignment for the same user may differ. The two mechanisms compose
+cleanly: a process's <code>kuid_t</code> is still translated by its own user
+namespace's <code>uid_map</code>, and the VFS additionally translates through the
+mount's <code>mnt_idmap</code> (via <code>vfsuid_t</code>/<code>vfsgid_t</code>,
+the mount-relative analog of <code>kuid_t</code>) when the access crosses that
+mount—so idmapped mounts extend the same relabeling idea from &ldquo;per namespace&rdquo;
+to &ldquo;per mount,&rdquo; without touching <code class="file-path">/proc/&lt;pid&gt;/uid_map</code> at all.
+</p>
+
+<h3 id="caps">Capabilities Per Namespace</h3>
+
+<p>
+Fake root is convincing because Linux long ago split the monolithic power of root
+into roughly forty capabilities—<code>CAP_NET_ADMIN</code>
+to configure networking, <code>CAP_SYS_ADMIN</code> for a grab-bag of
+administrative operations, <code>CAP_BPF</code> to load BPF programs (Chapter 23),
+and so on—and the user namespace makes each capability <em>relative to a
+namespace</em>. When a process creates a new user namespace, the kernel grants it a
+full capability set <em>within that namespace</em> (<code>set_cred_user_ns</code>
+sets <code>cap_effective</code>, <code>cap_permitted</code>, and the bounding set to
+<code>CAP_FULL_SET</code>, <code class="file-path">kernel/user_namespace.c</code>), so
+it can mount filesystems, configure the container's network, and create further
+nested namespaces—all the operations that make a container. But those capabilities
+hold <em>only</em> over resources owned by that user namespace or its descendants.
+The same function clears <code>cap_inheritable</code> and <code>cap_ambient</code>
+to empty, which matters the moment the process <code>exec</code>s: the new full
+capability set governs what the process can do directly, but a subsequently
+executed program only inherits capabilities through the ordinary
+<span class="key-term">file capability</span> and set-user-ID-root rules of
+Chapter 20—an unprivileged program run inside the namespace does not automatically
+pick up the creator's full set just because the namespace itself is fully
+privileged.
+</p>
+
+<p>
+This scoping is exactly what makes unprivileged containers safe. A process with
+<code>CAP_SYS_ADMIN</code> inside its user namespace can mount a filesystem in its
+own mount namespace, but the same capability grants nothing over the host's mounts,
+because those are owned by the initial user namespace where the process has no
+privilege at all. Each namespace records the user namespace that owns it, and every
+privileged operation checks the capability against <em>that</em> owning
+namespace—<code>ns_capable(owning_user_ns, CAP_...)</code>—not against the caller's
+own namespace. Creating a user namespace is itself the one privileged-seeming
+operation any unprivileged process may perform (subject to the per-user limit
+described below and the administrator controls of &sect;8.2), and everything else
+follows from the mappings and the
+owning-namespace capability checks. The user namespace is thus both the enabler of
+unprivileged containers and, as &sect;8.2 notes, historically their largest source
+of kernel security bugs.
+</p>
+
+<p>
+The mechanism behind &ldquo;relative to a namespace&rdquo; is a single distinction in
+the kernel's permission checks. The old <code>capable(CAP_...)</code> asks whether a
+task holds a capability in the <em>initial</em> user namespace—true system-wide
+privilege. The newer <code>ns_capable(ns, CAP_...)</code> asks whether it holds the
+capability in a <em>specific</em> user namespace. Kernel code that acts on a
+namespaced resource was converted to call <code>ns_capable</code> against the user
+namespace that owns the resource, so a process with full capabilities in its own
+user namespace passes checks on resources <em>it</em> owns and fails checks on the
+host's. Each task's capabilities still live in its credentials as the familiar sets
+of Chapter 20—effective, permitted, inheritable, bounding, and ambient—but those
+sets are now interpreted relative to the task's user namespace. Creating a new user
+namespace resets them to full within the new namespace; crucially, it does
+<em>not</em> raise the task's privilege in any ancestor, so the new power is real but
+strictly local.
+</p>
+
+<p>
+Two guardrails keep this from being abused as a denial-of-service or escalation
+vector. The number of user namespaces a user may create is bounded by a per-user
+count (the <code>ucounts</code> mechanism and the
+<code class="file-path">user.max_user_namespaces</code> limit), so a process cannot
+exhaust kernel memory by creating namespaces without end, and the 32-level nesting
+cap of the section intro bounds depth. Those guardrails address resource exhaustion;
+the subtler danger—that granting an unprivileged user a full capability set inside a
+namespace exposes kernel code paths never written for hostile unprivileged
+callers—is the security theme that &sect;8.2 takes up.
+</p>
+
+<hr>
+<h2 id="pidns">PID and the Other Namespaces</h2>
+
+<p class="chapter-intro">
+The user namespace is the most security-critical, but the PID namespace is the most
+conceptually distinctive, because it makes a single process have several identities
+at once. This section examines PID namespaces and the <code>struct pid</code> that
+implements them, then surveys the remaining namespaces—network, mount, IPC, UTS, and
+time—more briefly, since each virtualizes its resource on the same pattern. A useful
+way to read the section is by contrast: the PID namespace shows the hardest case of
+the &ldquo;private copy of a global table&rdquo; idea, where one object must carry
+several identities simultaneously, while the others show progressively simpler
+instances of the same idea—from the network namespace, which duplicates almost the
+entire network stack, down to the UTS namespace, which duplicates a single string.
+</p>
+
+<h3 id="pid-namespace">PID Namespaces and struct pid</h3>
+
+<p>
+A <span class="key-term">PID namespace</span> (<code>struct pid_namespace</code>,
+<code class="file-path">include/linux/pid_namespace.h</code>) gives its processes
+their own PID number space, starting again at 1. PID namespaces
+nest: a namespace has a <code>parent</code> and a
+<code>level</code>, and a process visible in a child namespace is <em>also</em>
+visible in every ancestor, under a different number in each. The kernel represents
+this with a level of indirection that is the key to the whole design. The internal
+handle for a process is a <code>struct pid</code>
+(<code class="file-path">include/linux/pid.h</code>), and it does not hold a single
+number; it holds an array, <code>numbers[]</code>, of <code>struct upid</code>
+entries—one per level, each pairing a number with the namespace it belongs to.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/pid.h (abridged) */
+struct upid {
+	int nr;			/* the PID number at this level */
+	struct pid_namespace *ns;
+};
+
+struct pid {
+	refcount_t count;
+	unsigned int level;	/* how many namespaces deep */
+	/* ... */
+	struct upid numbers[];	/* one entry per level, [0] = init ns */
+};</code></pre></div>
+
+<p>
+So the process a container calls PID 1 might be PID 4217 in the host's initial
+namespace and PID 88 in an intermediate one: one <code>struct pid</code>, three
+<code>upid</code> entries. Translating between a task and a namespace-relative number
+walks this array—<code>pid_nr_ns</code> finds the <code>nr</code> whose <code>ns</code>
+matches, returning 0 if the process is not visible in that namespace at all, which
+is how isolation is enforced (a container simply cannot name a process outside it).
+The process that is number 1 in a namespace is its <span class="key-term">init</span>:
+it becomes the <code>child_reaper</code> that inherits orphaned descendants, and if
+it dies the whole namespace is torn down and its remaining processes killed, as
+described below. Figure 25-4 shows the nesting.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 430" role="img" aria-labelledby="fig25-4-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig25-4-title">Figure 25-4. Nested PID Namespaces</title>
+<defs><marker id="e234" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="848" height="398" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-4. Nested PID Namespaces</text>
+
+<!-- concentric namespaces -->
+<rect x="44" y="86" width="470" height="298" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-dasharray="5 3"/>
+<text x="62" y="110" font-family="Inter,sans-serif" font-size="11" font-weight="700" fill="#2563eb">level 0 &#183; initial PID namespace &#8212; process is PID 4217</text>
+
+<rect x="100" y="128" width="380" height="214" rx="10" fill="#ede9fe" stroke="#7c3aed" stroke-dasharray="4 2"/>
+<text x="118" y="152" font-family="Inter,sans-serif" font-size="10.5" font-weight="700" fill="#6d28d9">level 1 &#183; child ns &#8212; PID 88</text>
+
+<rect x="156" y="170" width="280" height="140" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-dasharray="4 2"/>
+<text x="174" y="194" font-family="Inter,sans-serif" font-size="10.5" font-weight="700" fill="#15803d">level 2 &#183; grandchild ns &#8212; PID 1 (init)</text>
+
+<rect x="236" y="216" width="120" height="66" rx="8" fill="#ffffff" stroke="#16a34a"/>
+<text x="296" y="242" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">the process</text>
+<text x="296" y="262" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">struct pid &#183; level = 2</text>
+
+<!-- struct pid array -->
+<rect x="596" y="150" width="252" height="164" rx="10" fill="#ffffff" stroke="#64748b"/>
+<text x="722" y="174" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">struct pid</text>
+<text x="722" y="189" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">numbers[] &#8212; one nr per level</text>
+<g font-family="Inter,sans-serif" font-size="9.5" font-weight="700" text-anchor="middle">
+<rect x="612" y="200" width="220" height="30" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="722" y="219">numbers[0] &#183; nr = 4217</text>
+<rect x="612" y="236" width="220" height="30" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="722" y="255">numbers[1] &#183; nr = 88</text>
+<rect x="612" y="272" width="220" height="30" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="722" y="291">numbers[2] &#183; nr = 1 (init)</text>
+</g>
+
+<!-- one connector: the process holds this struct pid -->
+<g stroke="#334155" stroke-width="1.5" fill="none">
+<line x1="356" y1="249" x2="596" y2="249" marker-end="url(#e234)"/>
+</g>
+<text x="476" y="240" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#64748b" font-style="italic">its identity at every level</text>
+
+<text x="440" y="404" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">one process nested three deep is PID 4217, 88, and 1; its struct pid holds a number per level, colored to match each namespace</text>
+</svg>
+<figcaption>Figure 25-4. Nested PID namespaces — the process lives in a namespace nested three levels deep (level 0 contains level 1 contains level 2), and is visible in its own namespace and every ancestor under a different number: PID 4217 at level 0, 88 at level 1, and 1 (init) at level 2. Its single struct pid holds a numbers[] array with one entry per level, each colored to match the namespace it names; a process is not visible in sibling or descendant namespaces, which is how PID isolation is enforced.</figcaption>
+</figure>
+
+<p>
+The <code>init</code> of a PID namespace carries special responsibilities that mirror
+the host's <code>init</code> exactly. Signals from an ancestor namespace are
+filtered—the namespace's PID 1 does not receive signals for which it has no handler,
+so it cannot be killed by accident from outside—and when it does exit, the kernel
+does not reparent its orphans upward but runs <code>zap_pid_ns_processes</code>
+(<code class="file-path">kernel/pid_namespace.c</code>), which disables further PID
+allocation and sends <code>SIGKILL</code> to every remaining process in the
+namespace. A container therefore cannot outlive its <code>init</code>: kill PID 1 and
+the whole namespace is emptied, just as killing the host's init would end the system.
+The <code>reboot</code> system call is similarly virtualized—when a namespace's init
+calls it, the kernel records the requested action in <code>pid_ns-&gt;reboot</code>
+and terminates the namespace with a corresponding exit code rather than rebooting the
+host, so a container manager can watch its container's init exit and see that the
+workload asked to restart or power off.
+</p>
+
+<p>
+Two further details round out the picture. The nesting depth is capped at
+<code>MAX_PID_NS_LEVEL</code>, which is 32
+(<code class="file-path">include/linux/pid_namespace.h</code>)—a hard limit precisely
+because <code>struct pid</code>'s <code>numbers[]</code> array grows by one entry per
+level, so unbounded nesting would mean unbounded allocations. And, as &sect;2.2 noted,
+entering a PID namespace does not renumber the entering process itself; only its
+<em>children</em> are born into the new namespace. This is why a container's
+<code class="file-path">/proc</code>, which reports PIDs relative to the reader's PID
+namespace, must be a fresh <code>proc</code> mount made <em>after</em> the fork into
+the new namespace: mounted from inside, it shows only the namespace's own processes,
+numbered from 1, completing the illusion that the container is a machine unto itself.
+</p>
+
+<p>
+One more field of <code>struct pid_namespace</code> is worth calling out because it
+is directly settable and often surprises people: <code>pid_max</code>. Just as the
+host has a global <code class="file-path">/proc/sys/kernel/pid_max</code> ceiling on
+how large a PID number may grow, each PID namespace carries its own
+<code>pid_max</code>, exposed as the same
+<code class="file-path">/proc/sys/kernel/pid_max</code> path but scoped to that
+namespace's own sysctl table (<code>register_pidns_sysctls</code>,
+<code class="file-path">kernel/pid.c</code>). Because a process's identity at each
+level is allocated independently—<code>alloc_pid</code> walks the ancestor chain and
+allocates a number from <em>each</em> level's own <code>idr</code> against
+<em>that level's own</em> <code>pid_max</code>—lowering a container's <code>pid_max</code>
+shrinks only the numbers visible inside it without touching the host's allocator,
+and a container cannot use a generously raised inside value to escape whatever cap
+an ancestor namespace enforces on its own layer of the process's <code>numbers[]</code>
+array.
+</p>
+
+<h3 id="otherns">Network, Mount, and the Rest</h3>
+
+<p>
+The remaining namespaces virtualize their resources on the same principle—give each
+namespace a private instance of some global table—but differ in how much state that
+involves. The <span class="key-term">network namespace</span> (<code>struct net</code>,
+<code class="file-path">include/net/net_namespace.h</code>) is the heaviest: a new
+network namespace begins with nothing but a loopback device and gets its own network
+interfaces, routing tables, netfilter and connection-tracking state, socket ports,
+and per-protocol configuration, so two containers can both bind port 80 without
+conflict. Interfaces are moved between namespaces one at a time, and the usual way to
+connect a container to the host is a <span class="key-term">veth</span> pair—a
+virtual Ethernet cable with one end in each namespace.
+</p>
+
+<p>
+The <span class="key-term">mount namespace</span> (<code>struct mnt_namespace</code>,
+<code class="file-path">fs/mount.h</code>)—the very first namespace Linux gained, hence
+the generic flag name <code>CLONE_NEWNS</code>—gives each namespace its own tree of
+mounts, so a container can have an entirely different root filesystem while
+<em>mount propagation</em> settings control which mount events cross the boundary.
+The <span class="key-term">IPC namespace</span> isolates System V semaphores, message
+queues, and shared memory along with POSIX message queues, so two containers cannot
+see or collide over each other's IPC objects. The <span class="key-term">UTS
+namespace</span> is the simplest, isolating just the hostname and domain name that
+<code>uname</code> reports—which is why each container can have its own hostname.
+Finally the <span class="key-term">time namespace</span> is the newest, virtualizing
+not the wall clock but offsets for the monotonic and boot-time clocks, applied
+cheaply in the vDSO (Chapter 10; Chapter 6 describes the mechanism in full) so that a checkpointed and restored container can
+preserve the illusion of continuous uptime; the offsets themselves are readable and,
+before any process has entered the namespace, writable through
+<code class="file-path">/proc/&lt;pid&gt;/timens_offsets</code>
+(<code class="file-path">fs/proc/base.c</code>), which is exactly the hook a
+checkpoint/restore tool uses to reinstall a container's saved clock skew before its
+processes resume running. Together with the PID, user, and cgroup
+namespaces, these give a container a complete private view of the system on every
+axis that matters.
+</p>
+
+<p>
+Two of these repay a little more detail because containers lean on them heavily. The
+network namespace is not just isolated but starts almost <em>empty</em>: a fresh one
+has only a loopback interface, and even that comes up administratively down, so a
+runtime must move or create interfaces and configure addressing before the container
+has any connectivity. The standard bridge to the host is the veth
+pair mentioned above—two linked virtual interfaces, one left in the host namespace
+and attached to a bridge, the other moved into the container—so the container's
+traffic reaches the host stack over what looks to each side like an ordinary cable.
+The mount namespace, for its part, carries a <span class="key-term">propagation</span>
+setting on every mount that decides whether mount and unmount events cross the
+namespace boundary: a <em>shared</em> mount propagates events to its peers, a
+<em>private</em> mount keeps them to itself, a <em>slave</em> mount receives events
+from its master but sends none back, and an <em>unbindable</em> mount cannot be
+bind-mounted at all. A container runtime typically makes the container's root a slave
+of the host's mounts, so that new host mounts (a plugged-in disk, say) can be made to
+appear inside the container while the container's own mounts stay invisible to the
+host—the fine control that makes a shared-kernel filesystem view both flexible and
+contained.
+</p>
+
+<p>
+A mount namespace is not the only way to build a private mount tree, and modern
+container runtimes increasingly avoid creating one at all. <code>open_tree</code>
+with the <code>OPEN_TREE_CLONE</code> flag
+(<code class="file-path">fs/namespace.c</code>) clones a subtree of mounts into a
+free-floating, unattached copy referenced only by a file descriptor—a
+<span class="key-term">detached mount tree</span> that exists outside every mount
+namespace until something attaches it. That file descriptor can be reshaped in
+place—<code>mount_setattr</code> applies read-only or the
+<code>MOUNT_ATTR_IDMAP</code> idmapping of &sect;3.1 to it before it is ever visible
+to any process—and then <code>move_mount</code> grafts the finished tree onto a
+path in a target mount namespace, or the newer combined <code>open_tree_attr</code>
+system call does the clone-and-configure step in one call. This lets a runtime
+assemble a container's entire root filesystem—bind mounts, an idmapped overlay,
+read-only layers—as an isolated construction project, fully configured and
+validated, and publish it into the container's mount namespace with a single atomic
+graft, rather than building it up mount-by-mount inside a namespace the container's
+processes can already see.
+</p>
+
+<hr>
+<h2 id="cgroups">Control Groups</h2>
+
+<p class="chapter-intro">
+Namespaces control what a process sees; <span class="key-term">control
+groups</span>—cgroups—control what it can use. A cgroup is a group of processes to
+which resource limits and accounting are applied collectively, arranged in a
+hierarchy so that limits nest. Modern Linux uses <span class="key-term">cgroup
+v2</span>, a redesign that replaced the tangled multiple hierarchies of the original
+with a single unified one. This section covers the unified hierarchy and its
+interface, then the kernel data structures—<code>css</code>, <code>css_set</code>,
+and the task's link to them—that implement it.
+</p>
+
+<p>
+A word of history clarifies why there are two versions. The original cgroups
+(retroactively &ldquo;v1&rdquo;) arrived in 2008 and let each controller have its
+<em>own</em> hierarchy, so a process could be in one place for the memory controller
+and another for CPU. That flexibility sounded useful but proved a decade-long
+mistake: controllers could not cooperate (the memory and I/O controllers could not
+agree on which cgroup owned a writeback, for instance), and userspace could not
+reason about a process's resources without consulting every hierarchy at once. Cgroup
+v2, developed to fix this and declared stable in 2016, imposes one hierarchy for all
+controllers—less flexible, but coherent. Both are backed by
+<span class="key-term">kernfs</span>, the same in-kernel pseudo-filesystem library
+that backs <code class="file-path">sysfs</code>, so a cgroup is quite literally a
+directory whose files are the control interface. This chapter describes v2, which is
+what containers use; v1 persists only for backward compatibility.
+</p>
+
+<h3 id="unified">The Unified Hierarchy</h3>
+
+<p>
+In cgroup v1, every resource controller had its own separate hierarchy, and a
+process could sit at different places in each—a flexibility that proved
+unmanageable. Cgroup v2 (mounted as the <code>cgroup2</code> filesystem, normally at
+<code class="file-path">/sys/fs/cgroup</code>) imposes a
+<span class="key-term">single unified hierarchy</span>: one tree of cgroup
+directories, and a process belongs to exactly one cgroup in it, with all controllers
+acting at that one location. Figure 25-5 contrasts this single tree with v1's tangle
+of separate per-controller hierarchies. The tree is a real directory tree in a
+kernfs-backed
+filesystem, so a cgroup is created with <code>mkdir</code> and a process is moved
+into it by writing its PID to the cgroup's <code class="file-path">cgroup.procs</code>
+file. Each cgroup exposes a set of interface files; Table 25-7 lists the core ones,
+which exist in every cgroup independent of any controller.
+</p>
+
+<table>
+<caption>Table 25-7. Core cgroup v2 interface files</caption>
+<thead>
+<tr><th>File</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cgroup.procs</code></td><td>The PIDs in this cgroup; write a PID to move a process in. Reading lists members.</td></tr>
+<tr><td><code>cgroup.threads</code></td><td>Like <code>cgroup.procs</code> but at thread granularity, for threaded subtrees.</td></tr>
+<tr><td><code>cgroup.controllers</code></td><td>Which controllers are available in this cgroup (inherited from the parent's subtree_control).</td></tr>
+<tr><td><code>cgroup.subtree_control</code></td><td>Which of the available controllers are enabled for the <em>children</em> of this cgroup.</td></tr>
+<tr><td><code>cgroup.type</code></td><td>Whether the cgroup is a normal <em>domain</em> or a <em>threaded</em> cgroup.</td></tr>
+<tr><td><code>cgroup.events</code></td><td>State such as whether the cgroup is <code>populated</code> or <code>frozen</code> (the target of <code>cgroup.freeze</code>, below); can be polled for changes.</td></tr>
+<tr><td><code>cgroup.stat</code></td><td>Statistics such as the number of descendant cgroups.</td></tr>
+<tr><td><code>cgroup.max.depth</code>, <code>cgroup.max.descendants</code></td><td>Limits on how deep and how wide the subtree below this cgroup may grow.</td></tr>
+<tr><td><code>cgroup.freeze</code></td><td>Write <code>1</code> to freeze every process in the cgroup (and its descendants) in place, <code>0</code> to thaw them; read to see the current freeze state.</td></tr>
+<tr><td><code>cgroup.kill</code></td><td>Write <code>1</code> to send <code>SIGKILL</code> to every process in the cgroup at once, atomically and recursively.</td></tr>
+</tbody>
+</table>
+
+<p>
+Two rules give the hierarchy its shape. First, controllers are enabled
+<span class="key-term">top-down</span>: a cgroup's
+<code class="file-path">cgroup.subtree_control</code> can enable only controllers that
+its own <code class="file-path">cgroup.controllers</code> lists (which its parent in
+turn enabled for it), so a resource is distributed down the tree, never conjured at a
+leaf. Second, the <span class="key-term">no-internal-process</span> constraint holds
+that, except at the root, a cgroup may not simultaneously contain processes and
+enable controllers for children—processes live only at the leaves. This forces a
+clean picture in which interior cgroups partition resources among their children and
+the actual work runs in the leaves, which is what makes hierarchical resource
+distribution well defined. Together these rules turn the directory tree into a
+predictable resource-division scheme rather than an arbitrary graph.
+</p>
+
+<p>
+The no-internal-process rule has one deliberate exception, the
+<span class="key-term">threaded</span> cgroup, which exists because some resources
+are naturally per-thread. A cgroup's <code class="file-path">cgroup.type</code> is
+normally <code>domain</code>, meaning it holds whole processes; writing
+<code>threaded</code> makes it the root of a <em>threaded subtree</em> in which the
+individual threads of one process may be split across child cgroups. Thread-granular
+controllers such as <code>cpu</code> then act per-thread within the subtree, while
+process-wide controllers such as <code>memory</code> still act only at the subtree's
+domain root—because it makes no sense to charge one thread's memory separately from
+its siblings that share an address space. The kernel tracks this with a
+<code>dom_cgrp</code> back-pointer (a cgroup is threaded when its <code>dom_cgrp</code>
+differs from itself, <code class="file-path">kernel/cgroup/cgroup.c</code>), so the two
+kinds of controller can coexist in one tree.
+</p>
+
+<p>
+The cgroup is also the unit of two whole-group process-lifecycle operations, and
+both matter to anything that manages containers. Writing <code>1</code> to
+<code class="file-path">cgroup.freeze</code> (<code>cgroup_freeze</code>,
+<code class="file-path">kernel/cgroup/freezer.c</code>) stops every process in the
+cgroup and its descendants in place without killing or
+losing any of them—the cgroup-native replacement for signaling each process
+individually with <code>SIGSTOP</code>, and the mechanism behind a container
+runtime's &ldquo;pause&rdquo; operation, since it freezes the whole tree atomically
+rather than racing against processes that fork while being stopped one at a time.
+The freeze is cooperative rather than forcible: each task is flagged with
+<code>JOBCTL_TRAP_FREEZE</code> and parks itself in <code>do_freezer_trap</code>
+(<code class="file-path">kernel/signal.c</code>) on its next trip through the
+signal-delivery path back to user space. There it sleeps interruptibly, so a frozen
+task can still be killed with <code>SIGKILL</code>, and the <code>frozen</code>
+field of <code class="file-path">cgroup.events</code> becomes 1 only once every task
+has actually parked—the event a runtime polls to know the pause is complete.
+Writing <code>1</code> to <code class="file-path">cgroup.kill</code> is the
+symmetric whole-group teardown: it sends <code>SIGKILL</code> to every process in
+the cgroup and its descendants at once, which is both faster and more reliable than
+a caller walking <code class="file-path">cgroup.procs</code> and signaling each PID
+by hand. Each kill also bumps a per-cgroup <code>kill_seq</code> counter that
+<code>cgroup_post_fork</code> rechecks, so a child forked while the kill was in
+progress is killed as it is born instead of escaping.
+</p>
+
+<p>
+A final piece of machinery makes the statistics files affordable at scale. A busy
+server may read <code class="file-path">cpu.stat</code> or
+<code class="file-path">memory.stat</code> for thousands of cgroups, and maintaining
+those totals as shared atomic counters updated on every page fault or scheduler tick
+would be a bottleneck. Cgroup v2 instead uses <span class="key-term">rstat</span>
+(<code class="file-path">kernel/cgroup/rstat.c</code>), which accumulates statistics
+<em>per CPU</em> without shared writes and folds them up the hierarchy lazily—only
+when something reads a stat file—so accounting stays cheap on the hot path and the
+cost of aggregation is paid only by the (rare) reader. It is the same
+&ldquo;keep the fast path lock-free, defer the expensive combine&rdquo; pattern that
+recurs throughout the kernel.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 400" role="img" aria-labelledby="fig25-5-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig25-5-title">Figure 25-5. Cgroup v1 Versus the v2 Unified Hierarchy</title>
+<rect x="16" y="16" width="848" height="368" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-5. Cgroup v1 vs the v2 Unified Hierarchy</text>
+
+<!-- divider -->
+<line x1="440" y1="70" x2="440" y2="372" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 4"/>
+
+<!-- LEFT: v1 -->
+<text x="228" y="90" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#dc2626">cgroup v1 &#8212; a separate tree per controller</text>
+
+<g font-family="Inter,sans-serif" font-size="9" font-weight="700" text-anchor="middle">
+<!-- cpu tree -->
+<rect x="66" y="112" width="60" height="24" rx="5" fill="#fee2e2" stroke="#dc2626"/><text x="96" y="128">cpu</text>
+<rect x="44" y="158" width="46" height="22" rx="5" fill="#fff5f5" stroke="#dc2626"/><text x="67" y="173">sys</text>
+<rect x="102" y="158" width="46" height="22" rx="5" fill="#ffedd5" stroke="#ea580c"/><text x="125" y="173">app</text>
+<!-- memory tree -->
+<rect x="176" y="112" width="72" height="24" rx="5" fill="#fee2e2" stroke="#dc2626"/><text x="212" y="128">memory</text>
+<rect x="166" y="158" width="46" height="22" rx="5" fill="#ffedd5" stroke="#ea580c"/><text x="189" y="173">sys</text>
+<rect x="224" y="158" width="46" height="22" rx="5" fill="#fff5f5" stroke="#dc2626"/><text x="247" y="173">app</text>
+<!-- io tree -->
+<rect x="300" y="112" width="52" height="24" rx="5" fill="#fee2e2" stroke="#dc2626"/><text x="326" y="128">io</text>
+<rect x="290" y="158" width="46" height="22" rx="5" fill="#fff5f5" stroke="#dc2626"/><text x="313" y="173">sys</text>
+<rect x="348" y="158" width="46" height="22" rx="5" fill="#ffedd5" stroke="#ea580c"/><text x="371" y="173">app</text>
+</g>
+<g stroke="#94a3b8" stroke-width="1" fill="none">
+<line x1="96" y1="136" x2="67" y2="158"/><line x1="96" y1="136" x2="125" y2="158"/>
+<line x1="212" y1="136" x2="189" y2="158"/><line x1="212" y1="136" x2="247" y2="158"/>
+<line x1="326" y1="136" x2="313" y2="158"/><line x1="326" y1="136" x2="371" y2="158"/>
+</g>
+<text x="228" y="212" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">the same process sits in a different cgroup in each tree (shaded);</text>
+<text x="228" y="225" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">controllers cannot agree on which cgroup owns it</text>
+
+<!-- RIGHT: v2 -->
+<text x="652" y="90" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#16a34a">cgroup v2 &#8212; one unified hierarchy</text>
+
+<g font-family="Inter,sans-serif" font-size="9.5" font-weight="700" text-anchor="middle">
+<rect x="612" y="112" width="80" height="26" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="652" y="129">/ (root)</text>
+<rect x="536" y="166" width="96" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="584" y="183">/system</text>
+<rect x="688" y="166" width="118" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="747" y="183">/containers</text>
+<rect x="686" y="220" width="140" height="26" rx="6" fill="#ffedd5" stroke="#ea580c"/><text x="756" y="237">/containers/web</text>
+</g>
+<g stroke="#94a3b8" stroke-width="1.1" fill="none">
+<line x1="652" y1="138" x2="584" y2="166"/><line x1="652" y1="138" x2="747" y2="166"/><line x1="747" y1="192" x2="756" y2="220"/>
+</g>
+<rect x="540" y="270" width="230" height="30" rx="7" fill="#ecfdf5" stroke="#16a34a" stroke-dasharray="4 2"/>
+<text x="655" y="289" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700" fill="#15803d">subtree_control enables: cpu &#183; memory &#183; io</text>
+<text x="652" y="322" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">the process lives in one cgroup (shaded); every controller acts there</text>
+
+<text x="440" y="368" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">v1 scattered a process across many per-controller trees; v2 gives one tree where all controllers act at the process's single cgroup</text>
+</svg>
+<figcaption>Figure 25-5. Cgroup v1 versus the v2 unified hierarchy — under v1 (left) each controller has its own tree and a process (P) can occupy a different cgroup in each, so the controllers cannot agree on which cgroup owns it. Under v2 (right) there is a single tree of cgroup directories; a process belongs to exactly one cgroup, controllers are turned on for a subtree through cgroup.subtree_control, and every enabled controller acts at that one location.</figcaption>
+</figure>
+
+<h3 id="cssset">css, css_set, and Task Membership</h3>
+
+<p>
+Underneath the filesystem, three data structures connect a task to its resource
+limits. A <code>struct cgroup</code> represents a node in the tree. For each
+controller active on a cgroup there is a <span class="key-term">cgroup subsystem
+state</span>, <code>struct cgroup_subsys_state</code> (universally abbreviated
+<code>css</code>, <code class="file-path">include/linux/cgroup-defs.h</code>), which is
+that controller's per-cgroup state—the memory controller's <code>css</code>, for
+instance, is embedded in the <code>struct mem_cgroup</code> that holds the group's
+memory counters. A task does not point at its cgroup directly; it points at a
+<span class="key-term">css_set</span> (<code>struct css_set</code>), which is a cached
+bundle of &ldquo;the css for every controller, for this task's cgroup.&rdquo;
+</p>
+
+<p>
+The indirection through <code>css_set</code> exists for efficiency. Every task in the
+same cgroup has identical controller memberships, so they can all
+<em>share one</em> <code>css_set</code>: the kernel deduplicates them, keeping a hash
+of existing sets and pointing each task at the matching one
+(<code>task-&gt;cgroups</code>, <code class="file-path">include/linux/sched.h</code>).
+On a machine with thousands of tasks in a handful of cgroups there are only a handful
+of shared <code>css_set</code> objects, so fork and exit—which just take or drop a reference on the
+shared set—stay cheap, and the mapping from set to cgroups is kept by
+<code>cgrp_cset_link</code> records. Figure 25-6 shows the chain from tasks through a
+shared <code>css_set</code> to the per-controller <code>css</code> objects of their cgroup.
+Moving a process to another cgroup, by writing its PID to
+<code class="file-path">cgroup.procs</code>, runs <code>cgroup_attach_task</code>
+(<code class="file-path">kernel/cgroup/cgroup.c</code>), which migrates the task to the
+<code>css_set</code> matching its new position—creating that set if no other task
+already needed it.
+</p>
+
+<figure>
+<svg viewBox="0 0 880 440" role="img" aria-labelledby="fig25-6-title" style="max-width:800px; width:100%; height:auto;">
+<title id="fig25-6-title">Figure 25-6. Tasks, css_set, and the cgroup Hierarchy</title>
+<defs><marker id="e235" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="16" y="16" width="848" height="408" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="440" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-6. Tasks, css_set, and the cgroup Hierarchy</text>
+
+<g font-family="Inter,sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+<rect x="60" y="120" width="90" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="105" y="142">task A</text>
+<rect x="60" y="164" width="90" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="105" y="186">task B</text>
+<rect x="60" y="208" width="90" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="105" y="230">task C</text>
+</g>
+
+<rect x="230" y="150" width="150" height="62" rx="10" fill="#fef9c3" stroke="#ca8a04"/>
+<text x="305" y="176" text-anchor="middle" font-family="Inter,sans-serif" font-size="11" font-weight="700">css_set</text>
+<text x="305" y="194" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">shared by tasks in the</text>
+<text x="305" y="205" text-anchor="middle" font-family="Inter,sans-serif" font-size="8" fill="#475569">same cgroup</text>
+
+<g font-family="Inter,sans-serif" font-size="9" font-weight="700" text-anchor="middle">
+<rect x="470" y="120" width="120" height="32" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="530" y="140">css: cpu</text>
+<rect x="470" y="160" width="120" height="32" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="530" y="180">css: memory</text>
+<rect x="470" y="200" width="120" height="32" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="530" y="220">css: io</text>
+</g>
+
+<!-- cgroup tree -->
+<g font-family="Inter,sans-serif" font-size="8.5" font-weight="700" text-anchor="middle">
+<rect x="680" y="86" width="130" height="30" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="745" y="105">/ (root cgroup)</text>
+<rect x="650" y="150" width="90" height="30" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="695" y="169">/system</text>
+<rect x="760" y="150" width="90" height="30" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="805" y="169">/containers</text>
+<rect x="720" y="212" width="120" height="30" rx="6" fill="#bbf7d0" stroke="#16a34a"/><text x="780" y="231">/containers/web</text>
+</g>
+
+<g stroke="#334155" stroke-width="1.3" fill="none">
+<line x1="150" y1="137" x2="230" y2="172" marker-end="url(#e235)"/>
+<line x1="150" y1="181" x2="230" y2="181" marker-end="url(#e235)"/>
+<line x1="150" y1="225" x2="230" y2="190" marker-end="url(#e235)"/>
+<line x1="380" y1="171" x2="470" y2="136" marker-end="url(#e235)"/>
+<line x1="380" y1="181" x2="470" y2="176" marker-end="url(#e235)"/>
+<line x1="380" y1="191" x2="470" y2="216" marker-end="url(#e235)"/>
+</g>
+<g stroke="#16a34a" stroke-width="1.1" fill="none">
+<line x1="745" y1="116" x2="695" y2="150"/>
+<line x1="745" y1="116" x2="805" y2="150"/>
+<line x1="805" y1="180" x2="780" y2="212"/>
+</g>
+<line x1="590" y1="176" x2="720" y2="224" stroke="#7c3aed" stroke-width="1.1" stroke-dasharray="3 2" fill="none" marker-end="url(#e235)"/>
+<text x="655" y="196" text-anchor="middle" transform="rotate(20.3 655 196)" font-family="Inter,sans-serif" font-size="8" fill="#7c3aed" font-style="italic">at /containers/web</text>
+
+<text x="440" y="290" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">tasks in one cgroup share a css_set; the set points to the per-controller css of that cgroup in the unified tree</text>
+<rect x="150" y="320" width="580" height="52" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-dasharray="5 3"/>
+<text x="440" y="343" text-anchor="middle" font-family="Inter,sans-serif" font-size="9.5" font-weight="700" fill="#c2410c">deduplication keeps fork/exit cheap: thousands of tasks, only a handful of css_sets</text>
+<text x="440" y="360" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">writing a PID to cgroup.procs migrates a task to the css_set matching its new cgroup</text>
+</svg>
+<figcaption>Figure 25-6. Tasks, css_set, and the cgroup hierarchy — tasks in the same cgroup share one reference-counted css_set, which points to the per-controller cgroup subsystem states (css) — cpu, memory, io — of that cgroup's node in the single unified tree. Deduplicating the css_set across identically-placed tasks keeps fork and exit cheap, and writing a PID to a cgroup's cgroup.procs file migrates the task to the css_set that matches its new position in the tree.</figcaption>
+</figure>
+
+<p>
+Each <code>css</code> has a lifecycle of its own, managed so that runtime code can
+reach it locklessly. A controller's per-cgroup state is created by the controller's
+<code>css_alloc</code> and <code>css_online</code> callbacks when the controller is
+enabled on a cgroup, and it is reference-counted with a <code>percpu_ref</code>
+(<code class="file-path">include/linux/cgroup-defs.h</code>)—a counter split across
+CPUs so that taking a short-lived reference on the hot path (a page being charged to
+a memory cgroup, say) needs no shared write. A <code>css</code> is marked
+<code>CSS_ONLINE</code> between its online and offline callbacks; when a cgroup is
+removed the reference is &ldquo;killed,&rdquo; and once the last outstanding
+reference drops the state is freed after an RCU grace period, so a task that is
+mid-operation on a <code>css</code> never has it vanish underneath it. Every cgroup also
+owns a special <code>self</code> <code>css</code> that carries the base per-cgroup
+statistics through rstat even when no controller is enabled.
+</p>
+
+<p>
+Migration—moving a task from one cgroup to another—is careful precisely because it
+must not fail halfway. When a PID is written to
+<code class="file-path">cgroup.procs</code>, <code>cgroup_attach_task</code> does not
+simply repoint the task; it runs a two-phase migration
+(<code class="file-path">kernel/cgroup/cgroup.c</code>). A
+<span class="key-term">prepare</span> phase first ensures the destination
+<code>css_set</code> exists—allocating it, and any it depends on, up front—so that
+every allocation that could fail happens before anything changes. Only then does a
+<span class="key-term">commit</span> phase move the task (and, for a whole process,
+all its threads) to the new set atomically. This mirrors the prepare/commit
+discipline seen elsewhere in this book and guarantees that a migration either fully
+succeeds or leaves the task exactly where it was, never in a torn state between two
+cgroups.
+</p>
+
+<hr>
+<h2 id="controllers">The Controllers</h2>
+
+<p class="chapter-intro">
+The hierarchy is only scaffolding; the actual limiting and accounting is done by
+<span class="key-term">controllers</span> (also called subsystems), each governing one
+resource and contributing its own interface files to every cgroup where it is
+enabled. This section walks through the three most important—cpu, memory, and
+io—then the pids and cpuset controllers and the delegation model that lets an
+unprivileged user manage a subtree, and finally the rdma, misc, and dmem controllers
+that ration resources owned by device drivers. Table 25-8 summarizes the principal
+controllers.
+</p>
+
+<p>
+Across all of them, cgroup v2 offers the same three <em>kinds</em> of control, and
+recognizing which a given file provides makes the dozens of interface files far
+easier to hold in mind. A <span class="key-term">weight</span> (such as
+<code class="file-path">cpu.weight</code> or <code class="file-path">io.weight</code>)
+divides a resource <em>proportionally</em> among siblings only when they compete,
+leaving it uncapped when idle. A <span class="key-term">limit</span> (such as
+<code class="file-path">cpu.max</code>, <code class="file-path">memory.max</code>, or
+<code class="file-path">io.max</code>) is a hard ceiling enforced even when the
+resource is free. And a <span class="key-term">protection</span> (such as
+<code class="file-path">memory.min</code> and <code class="file-path">memory.low</code>)
+reserves a floor a cgroup keeps even when the rest of the system is starved. Weights
+share, limits cap, protections guarantee; nearly every controller file is one of the
+three.
+</p>
+
+<table>
+<caption>Table 25-8. Principal cgroup v2 controllers</caption>
+<thead>
+<tr><th>Controller</th><th>Implementation</th><th>Key interface files</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cpu</code></td><td>The fair (EEVDF) scheduling class (Chapter 7)</td><td><code>cpu.max</code> (bandwidth), <code>cpu.weight</code> (share), <code>cpu.idle</code>, <code>cpu.stat</code>, <code>cpu.pressure</code></td></tr>
+<tr><td><code>memory</code></td><td><code>struct mem_cgroup</code> (<code class="file-path">mm/memcontrol.c</code>)</td><td><code>memory.current</code>, <code>memory.max</code>, <code>memory.high</code>, <code>memory.min</code>, <code>memory.low</code>, <code>memory.stat</code>, <code>memory.events</code>, <code>memory.peak</code>, <code>memory.oom.group</code></td></tr>
+<tr><td><code>io</code></td><td>The block layer (<code class="file-path">block/blk-cgroup.c</code>)</td><td><code>io.max</code>, <code>io.weight</code>, <code>io.stat</code>, <code>io.pressure</code></td></tr>
+<tr><td><code>pids</code></td><td><code class="file-path">kernel/cgroup/pids.c</code></td><td><code>pids.max</code>, <code>pids.current</code>, <code>pids.peak</code></td></tr>
+<tr><td><code>cpuset</code></td><td><code class="file-path">kernel/cgroup/cpuset.c</code></td><td><code>cpuset.cpus</code>, <code>cpuset.mems</code>, <code>cpuset.cpus.partition</code></td></tr>
+<tr><td><code>rdma</code></td><td><code class="file-path">kernel/cgroup/rdma.c</code></td><td><code>rdma.max</code>, <code>rdma.current</code> (per device: <code>hca_handle</code>, <code>hca_object</code>)</td></tr>
+<tr><td><code>misc</code></td><td><code class="file-path">kernel/cgroup/misc.c</code></td><td><code>misc.max</code>, <code>misc.current</code>, <code>misc.peak</code>, <code>misc.events</code>, <code>misc.capacity</code> (root only)</td></tr>
+<tr><td><code>dmem</code></td><td><code class="file-path">kernel/cgroup/dmem.c</code></td><td><code>dmem.max</code>, <code>dmem.min</code>, <code>dmem.low</code>, <code>dmem.current</code>, <code>dmem.capacity</code> (root only), all per region in bytes</td></tr>
+</tbody>
+</table>
+
+<h3 id="cpu-mem-io">cpu, memory, and io</h3>
+
+<p>
+The <span class="key-term">cpu</span> controller limits processor time, and it offers
+two complementary knobs. <code class="file-path">cpu.weight</code> sets a
+<em>proportional share</em>—a cgroup with twice the weight of its sibling gets twice
+the CPU when the two compete, but neither is capped when the machine is idle—by
+feeding into the fair scheduling class of Chapter 7, whose EEVDF
+scheduler weighs the group as a single entity among its siblings. <code class="file-path">cpu.max</code>
+sets a <em>hard bandwidth</em> ceiling as a quota and period (&ldquo;this much CPU
+time per that much wall-clock time&rdquo;), throttling the cgroup once it exhausts its
+quota in a period even if CPUs are idle. <code class="file-path">cpu.stat</code>
+reports usage and how often the group was throttled. The pair covers the two things an
+operator wants: fair sharing under contention, and firm caps for billing or
+predictability. Two refinements tune the edges: <code class="file-path">cpu.max.burst</code>
+lets a cgroup that has under-used its quota bank a little slack and briefly exceed it,
+smoothing bursty workloads, and <code class="file-path">cpu.uclamp.min</code>/<code class="file-path">cpu.uclamp.max</code>
+clamp the utilization the scheduler perceives for the group—raising it to keep a
+latency-sensitive workload on fast CPU-frequency states, or lowering it to let a
+background one run cool. A third refinement is qualitative rather than
+quantitative: writing <code class="file-path">cpu.idle</code> marks the whole cgroup
+as a background, best-effort consumer—effectively giving it
+<code>SCHED_IDLE</code> at the group level (Chapter 7)—so it runs only when nothing
+else wants the CPU at all, which is a cleaner way to express &ldquo;never get in the
+way&rdquo; than trying to pick a weight low enough to approximate it.
+</p>
+
+<p>
+The <span class="key-term">memory</span> controller is the most elaborate, because
+memory cannot simply be throttled—once granted it must be reclaimed or the workload
+killed. Its accounting lives in <code>struct mem_cgroup</code>
+(<code class="file-path">mm/memcontrol.c</code>), and every charge to a page or slab
+object is billed to the <code>mem_cgroup</code> of the allocating task as the
+allocation happens. Four thresholds shape its behavior:
+<code class="file-path">memory.max</code> is a hard limit that triggers reclaim and,
+if that fails, the cgroup OOM killer; <code class="file-path">memory.high</code> is a
+soft limit that throttles the workload by forcing it into reclaim as it approaches,
+without killing; and <code class="file-path">memory.min</code> and
+<code class="file-path">memory.low</code> are <em>protections</em> that shield a
+cgroup's memory from reclaim when the system is under pressure elsewhere.
+<code class="file-path">memory.current</code> reports usage and
+<code class="file-path">memory.events</code> counts significant events such as
+hitting the limit or an OOM kill—the signals an orchestrator watches to size a
+workload. Its accounting reaches beyond user pages: kernel memory charged on a
+cgroup's behalf—slab objects, socket buffers, page tables—is billed too, so a
+workload cannot escape its limit by pushing allocation into the kernel. Swap is
+bounded separately by <code class="file-path">memory.swap.max</code>, so a container
+cannot quietly convert memory pressure into swap thrashing, and
+<code class="file-path">memory.reclaim</code> lets an operator ask the kernel to
+proactively reclaim from a cgroup—shrinking an idle workload's footprint before its
+neighbors need the memory. Two further files round out the picture.
+<code class="file-path">memory.peak</code> records the cgroup's historical
+high-water mark of usage—useful for right-sizing a
+<code class="file-path">memory.max</code> after the fact, since
+<code class="file-path">memory.current</code> alone cannot say how close a workload
+ever came to its limit—and, like <code class="file-path">memory.swap.max</code>'s
+sibling <code class="file-path">memory.swap.peak</code>, can be reset by writing to
+it. And <code class="file-path">memory.oom.group</code>, if set, changes what
+happens when the cgroup OOM killer fires: instead of picking a single victim task
+within the cgroup, it kills every process in the cgroup together, which is what a
+container runtime wants for a workload that is only meaningful as a whole—killing
+half of a database cluster's threads and leaving the rest to run in an
+inconsistent state is rarely better than killing all of it. Where memory itself is
+compressed rather than paged out, <code class="file-path">memory.zswap.max</code>
+bounds how much of a cgroup's swapped-out memory <span class="key-term">zswap</span>
+(Chapter 8) may hold in its compressed pool, keeping one cgroup's compression
+activity from starving its neighbors' pool space.
+</p>
+
+<p>
+The <span class="key-term">io</span> controller limits block-device I/O, integrating
+with the multiqueue block layer of Chapter 14.
+<code class="file-path">io.max</code> caps bandwidth and IOPS per device (as
+bytes-per-second and operations-per-second limits keyed by device number), while
+<code class="file-path">io.weight</code> gives proportional sharing of a device's
+throughput under contention, and <code class="file-path">io.stat</code> reports
+per-device bytes and operations. Because a single logical request can generate I/O
+long after the process that issued it has moved on—writeback of dirty pages is the
+classic case—the io and memory controllers cooperate to attribute such deferred I/O
+back to the responsible cgroup, so that a container cannot escape its I/O limit
+simply by dirtying pages and letting the kernel flush them later. Behind the two
+files sit different mechanisms: <code class="file-path">io.max</code> is enforced by a
+simple throttle (<code class="file-path">block/blk-throttle.c</code>), while
+<code class="file-path">io.weight</code>'s proportional sharing is driven by a
+cost model (<code class="file-path">block/blk-iocost.c</code>) that estimates each
+device's capacity so shares are meaningful across very different disks. A third,
+latency-oriented controller, <code class="file-path">io.latency</code>
+(<code class="file-path">block/blk-iolatency.c</code>), protects a cgroup's I/O
+latency target by throttling <em>competing</em> cgroups when it is missed—useful when
+the goal is not a bandwidth cap but a responsiveness guarantee.
+</p>
+
+<h3 id="delegation">pids, cpuset, and Delegation</h3>
+
+<p>
+Two smaller controllers round out the common set. The
+<span class="key-term">pids</span> controller
+(<code class="file-path">kernel/cgroup/pids.c</code>) caps the number of processes a
+cgroup may contain through <code class="file-path">pids.max</code>, with
+<code class="file-path">pids.current</code> reporting the count and
+<code class="file-path">pids.peak</code> its historical high—a simple but essential
+defense against fork bombs, since a runaway process that cannot fork past its limit
+cannot exhaust the host's PID space. The <span class="key-term">cpuset</span>
+controller (<code class="file-path">kernel/cgroup/cpuset.c</code>) instead
+<em>pins</em> a cgroup to particular CPUs and memory nodes through
+<code class="file-path">cpuset.cpus</code> and <code class="file-path">cpuset.mems</code>,
+which matters on large NUMA machines where confining a workload to CPUs near its
+memory avoids cross-node penalties. It can go further and turn a cgroup into a
+<span class="key-term">partition</span> root by writing
+<code class="file-path">cpuset.cpus.partition</code>, which comes in two strengths:
+writing <code>root</code> gives the cgroup exclusive use of the CPUs named in
+<code class="file-path">cpuset.cpus.exclusive</code> while those CPUs still take part
+in the kernel's normal load-balancing machinery, while writing <code>isolated</code>
+removes them from load balancing entirely, so a latency-critical or real-time
+workload owns them outright with no interference even from the scheduler's own
+housekeeping. Beyond these, the kernel provides the hugetlb
+controller, whose per-size limits <a href="chapter-8.html#hugetlb-pages">Chapter 8, Section 4.4</a>
+describes, and the three device-resource controllers of &sect;6.3, each following the
+same pattern of interface files.
+</p>
+
+<p>
+Finally, <span class="key-term">delegation</span> is what lets an unprivileged
+user—or an unprivileged container—safely manage its own subtree of the hierarchy. An
+administrator delegates a cgroup by granting the user write access to its directory
+and to a specific few of its files: <code class="file-path">cgroup.procs</code>,
+<code class="file-path">cgroup.threads</code>, and
+<code class="file-path">cgroup.subtree_control</code>. The delegatee can then create
+sub-cgroups, move its own processes among them, and enable controllers for them, but
+cannot affect anything above its delegated root, because it lacks write access there.
+The containment is enforced by the migration rule itself: moving a process requires
+write access to the destination <code class="file-path">cgroup.procs</code> <em>and</em>
+to the <code class="file-path">cgroup.procs</code> of the common ancestor of the source
+and destination, so a delegatee can shuffle tasks freely <em>within</em> its subtree
+but cannot pull a process in from outside it or push one out. The
+<code>nsdelegate</code> mount option ties this to cgroup namespaces (&sect;2.1), so
+that a container's cgroup namespace root becomes a natural delegation boundary it
+cannot escape. Delegation is what makes cgroup v2 usable inside unprivileged
+containers: a container can run its own systemd, managing a private cgroup subtree,
+without any power over the host's.
+</p>
+
+<h3 id="device-ctrls">rdma, misc, and dmem: Controllers for Device Resources</h3>
+
+<p>
+The controllers so far govern resources that the core kernel allocates itself:
+CPU time, pages, block I/O, and tasks. Three smaller controllers govern resources
+that belong to device drivers, and they share one design. The controller only
+counts. The driver that hands out the resource calls a <em>try-charge</em> function
+before allocating and an <em>uncharge</em> function after freeing, and the charge
+fails if it would take this cgroup or any ancestor past its limit. The cgroup
+charged is the one the calling task belongs to at that moment, and the charge
+stays with that cgroup until the resource is freed. Table 25-8 lists the files each
+controller adds. What separates the three is what each can do when a limit is hit.
+</p>
+
+<p>
+The <span class="key-term">rdma</span> controller
+(<code class="file-path">kernel/cgroup/rdma.c</code>, Linux 4.11) limits the objects
+user space creates on an RDMA adapter through the verbs interface. It counts two
+resources per device. <code>hca_handle</code> is the number of open device contexts,
+charged by <code>ib_rdmacg_try_charge()</code> when user space allocates a
+<code>ucontext</code>. <code>hca_object</code> is the number of verbs objects of every
+kind (queue pairs, completion queues, memory regions, protection domains), charged
+when each user object is created
+(<code class="file-path">drivers/infiniband/core/rdma_core.c</code>). An adapter
+joins the controller through <code>rdmacg_register_device()</code>, and the limits are
+written per device, as in <code>mlx5_0 hca_handle=2 hca_object=2000</code>. A charge
+that would exceed <code class="file-path">rdma.max</code> fails with
+<code>-EAGAIN</code>, which the verbs call returns to user space. There are no weights
+or protections, because the kernel cannot take a queue pair back from the process
+that owns it.
+</p>
+
+<p>
+The <span class="key-term">misc</span> controller
+(<code class="file-path">kernel/cgroup/misc.c</code>, 5.13) is for scalar resources
+with a host-wide capacity that would not justify a controller of their own. The
+resource types are a compile-time list, <code>enum misc_res_type</code> in
+<code class="file-path">include/linux/misc_cgroup.h</code>. In 7.0 it holds the AMD
+SEV and SEV-ES address-space IDs and, since 6.16, the Intel TDX host key IDs:
+hardware slots that each confidential virtual machine consumes and that the processor
+provides only in limited number. The owner declares the total with
+<code>misc_cg_set_capacity()</code>, which appears in the root's
+<code class="file-path">misc.capacity</code>. KVM charges one slot with
+<code>misc_cg_try_charge()</code> when it creates an SEV or TDX guest. A charge that would exceed
+the capacity or any ancestor's <code class="file-path">misc.max</code> fails with
+<code>-EBUSY</code> and is counted in <code class="file-path">misc.events</code>.
+Version 6.11 added <code class="file-path">misc.events.local</code> for events in the
+cgroup itself and <code class="file-path">misc.peak</code> for its high-water mark.
+</p>
+
+<p>
+The <span class="key-term">dmem</span> controller
+(<code class="file-path">kernel/cgroup/dmem.c</code>, 6.14, <code>CONFIG_CGROUP_DMEM</code>)
+is the newest, and it addresses a long-standing gap: memory on a device, above all
+the video memory (VRAM) of a discrete GPU. The memory controller counts only system
+RAM, so before 6.14 a container could fill a GPU's memory and push every other
+tenant's buffers out to system memory without any cgroup noticing. A driver now
+describes each pool of device memory as a <em>region</em> by calling
+<code>dmem_cgroup_register_region()</code> with its size and a name. DRM drivers do
+this through <code>drmm_cgroup_register_region()</code>, which names the region
+<code>drm/&lt;device&gt;/&lt;region&gt;</code>, for example
+<code>drm/0000:03:00.0/vram0</code>. In 7.0.12 the Intel xe driver registers each VRAM
+region (6.14) and amdgpu registers its <code>vram</code> (6.15). The interface files
+are keyed by region name, one line per region. The root's
+<code class="file-path">dmem.capacity</code> lists every region and its size, and
+<code class="file-path">dmem.current</code> reports usage.
+<code class="file-path">dmem.max</code>, <code class="file-path">dmem.min</code>, and
+<code class="file-path">dmem.low</code> set a limit and two protections with the same
+meaning as their memory-controller namesakes. All values are in bytes, because a
+device's allocation granularity need not match the CPU's page size.
+</p>
+
+<div class="code-block code-lang" data-lang="c"><pre><code>/* include/linux/cgroup_dmem.h */
+struct dmem_cgroup_region *dmem_cgroup_register_region(u64 size, const char *name_fmt, ...);
+int  dmem_cgroup_try_charge(struct dmem_cgroup_region *region, u64 size,
+                            struct dmem_cgroup_pool_state **ret_pool,
+                            struct dmem_cgroup_pool_state **ret_limit_pool);
+void dmem_cgroup_uncharge(struct dmem_cgroup_pool_state *pool, u64 size);
+bool dmem_cgroup_state_evict_valuable(struct dmem_cgroup_pool_state *limit_pool,
+                                      struct dmem_cgroup_pool_state *test_pool,
+                                      bool ignore_low, bool *ret_hit_low);</code></pre></div>
+
+<p>
+Each pairing of a cgroup and a region has a <code>struct dmem_cgroup_pool_state</code>.
+It is created on the first charge or limit write, and it wraps the same
+<code>page_counter</code> the memory controller uses, here counting bytes instead of
+pages. Each pool's counter is chained to the pool for the same region in the parent
+cgroup, so one <code>page_counter_try_charge()</code> enforces every ancestor's
+<code class="file-path">dmem.max</code>. <code>dmem_cgroup_try_charge()</code> charges
+the current task's cgroup and, on success, returns the pool. The driver stores the
+pool with the allocation (TTM keeps it in <code>ttm_resource-&gt;css</code>) so that
+<code>dmem_cgroup_uncharge()</code> credits the right cgroup however much later the
+buffer is freed. On failure the function returns <code>-EAGAIN</code> and, if asked,
+the <em>limit pool</em>: the pool, possibly an ancestor's, whose limit was hit.
+</p>
+
+<p>
+The limit pool exists because device memory, unlike a queue pair or an ASID, can be
+taken back. A GPU buffer can be evicted to system memory and brought back when it is
+next needed, so a charge that fails should first evict, the way an allocation that
+crosses <code class="file-path">memory.max</code> reclaims before it gives up. The TTM
+memory manager shared by most discrete-GPU drivers, whose wound/wait locking
+<a href="chapter-5.html#ww-mutexes-wound-wait-deadlock-avoidance">Chapter 5, Section 5.15</a>
+describes, does exactly that. <code>ttm_resource_alloc()</code> turns
+<code>-EAGAIN</code> into <code>-ENOSPC</code>, the same error a full VRAM produces,
+so the allocation falls into TTM's normal eviction walk with the limit pool passed
+along. For each candidate buffer, <code>ttm_bo_evict_cb()</code> first asks
+<code>dmem_cgroup_state_evict_valuable()</code>, which answers with three rules:
+</p>
+
+<ul>
+<li>A buffer may be evicted only if it is charged to the limit pool or to one of its
+descendants. A cgroup that is over its own limit therefore evicts its own buffers, or
+those of its children, and never those of a neighbor that is within its share.</li>
+<li>A buffer whose pool is at or below its effective <code class="file-path">dmem.min</code>
+is never evicted. The effective values come from
+<code>page_counter_calculate_protection()</code>, the same function that distributes
+<code class="file-path">memory.min</code> and <code class="file-path">memory.low</code>
+down the hierarchy.</li>
+<li>A buffer whose pool is at or below its effective <code class="file-path">dmem.low</code>
+is skipped on the first pass. If that pass evicts nothing and some buffer was skipped
+for this reason, TTM walks again with <code>ignore_low</code> set.</li>
+</ul>
+
+<p>
+When the device itself is full and no cgroup limit was hit, there is no limit pool.
+The function then uses the root as the limit, so the protections still decide which
+tenants' buffers move first. The result is the memory controller's model, limits
+that trigger reclaim and protections that shield a working set, applied to memory
+the CPU's page allocator never sees.
+</p>
+
+<hr>
+<h2 id="psi">Pressure Stall Information</h2>
+
+<p class="chapter-intro">
+Limiting resources raises a question: how does an operator know when a workload is
+<em>starved</em>—waiting on CPU, memory, or I/O it cannot get? Classic metrics like
+load average and free memory answer this poorly. Linux's answer is
+<span class="key-term">Pressure Stall Information</span> (PSI,
+<code class="file-path">kernel/sched/psi.c</code>), which measures directly how much
+time work is lost to resource contention. This section covers what PSI measures and
+the trigger mechanism that lets software react to pressure the moment it appears.
+</p>
+
+<p>
+PSI exists because the old indicators mislead. Load average counts runnable tasks
+but cannot tell a busy-and-healthy system from an overloaded one, and free-memory
+counts say nothing about a machine that has just enough memory to avoid the OOM
+killer yet spends its time thrashing pages in and out. PSI, merged in Linux 4.20
+from work at Meta to pack data-center machines closer to their limits, answers the
+question the operator actually has—&ldquo;how much useful work is my hardware
+losing to contention right now?&rdquo;—by timing stalls directly. Because that
+timing adds a small per-task cost, PSI is a build option
+(<code>CONFIG_PSI</code>) and can be turned off at boot (<code>psi=0</code>) on
+systems that do not need it; the static key <code>psi_disabled</code> makes the
+accounting free when it is off. A kernel can also be built with
+<code>CONFIG_PSI_DEFAULT_DISABLED</code>, shipping PSI compiled in but dormant until
+<code>psi=1</code> is passed on the command line, which lets a distribution offer it
+without imposing its cost on every machine.
+</p>
+
+<h3 id="psi-measure">Measuring Contention</h3>
+
+<p>
+PSI tracks, for each of three resources—CPU,
+memory, and <span class="key-term">I/O</span>—the
+fraction of time that tasks are stalled waiting for it, and reports two levels of
+severity. The <span class="key-term">some</span> metric is the fraction of time at
+least one task is stalled on the resource (work is delayed); the
+<span class="key-term">full</span> metric is the fraction of time
+<em>every</em> runnable task is stalled on it (no work is progressing at all, a sign
+of severe contention). Each is reported as a percentage averaged over 10-second,
+60-second, and 300-second windows, plus a running total in microseconds. The
+distinction is what makes PSI actionable: a little &ldquo;some&rdquo; memory pressure
+is normal, but rising &ldquo;full&rdquo; memory pressure means the machine is
+thrashing and a workload should be shed. Figure 25-7 contrasts the two.
+</p>
+
+<p>
+What counts as a stall is chosen carefully, which is why PSI sees problems the old
+metrics miss. A task is counted as memory-stalled while it waits in reclaim or for a
+page that was evicted to be read back—that is, while it is <em>thrashing</em>—so
+memory pressure rises exactly when a workload is technically within its limit yet
+getting no work done, the case free-memory counts cannot detect. Likewise a task is
+I/O-stalled while blocked waiting for a device, and CPU-stalled while runnable but
+not scheduled. The <em>some</em>/<em>full</em> distinction has a subtlety worth
+noting for CPU: at the whole-system level a runnable task essentially always gets a
+CPU eventually, so system-wide CPU <em>full</em> is not meaningful; it becomes
+meaningful only <em>within a cgroup</em>, where every one of a group's tasks can be
+runnable yet none scheduled because another cgroup is holding the processors—precisely
+the throttling a <code class="file-path">cpu.max</code> or a low
+<code class="file-path">cpu.weight</code> produces. The system-wide
+<code class="file-path">/proc/pressure/cpu</code> file nevertheless prints a
+<code>full</code> line, always zero, so that every pressure file has the same
+two-line format and one parser handles them all.
+</p>
+
+<p>
+Memory stalls in particular are not inferred from task state alone; they are
+<em>declared</em> by the code that causes them. Every path where a task is held up
+for want of memory brackets the wait with <code>psi_memstall_enter()</code> and
+<code>psi_memstall_leave()</code>
+(<code class="file-path">kernel/sched/psi.c</code>), which set and clear the task's
+<code>TSK_MEMSTALL</code> flag: direct reclaim and compaction in the page allocator
+(<code class="file-path">mm/page_alloc.c</code>,
+<code class="file-path">mm/vmscan.c</code>, Chapter 17), waiting for a page to be
+read back in <code class="file-path">mm/filemap.c</code> and
+<code class="file-path">mm/page_io.c</code>—but only when the page is marked as
+recently part of the working set, so ordinary first-time reads do not count while
+genuine refaults do—and the throttling a cgroup suffers above
+its <code class="file-path">memory.high</code> in
+<code class="file-path">mm/memcontrol.c</code>. Because direct reclaim keeps the
+stalled task <em>on</em> the CPU, PSI tracks such tasks under a separate count,
+<code>NR_MEMSTALL_RUNNING</code> (<code class="file-path">include/linux/psi_types.h</code>):
+a task busily scanning LRU lists looks productive to the scheduler, but PSI correctly
+counts it as stalled, so memory <em>full</em> can be reported even while every CPU is
+busy—busy doing nothing but reclaim.
+</p>
+
+<p>
+The accounting itself is cheap by design. Each CPU keeps its own running stall
+totals (a per-CPU <code>psi_group_cpu</code>), updated without shared locks as tasks
+change state, and the kernel folds them together only when someone reads a pressure
+file—the same defer-the-combine pattern as cgroup rstat (&sect;5.1). The three
+percentages an average file shows are resampled on a slow two-second cadence, while
+the underlying microsecond total accumulates continuously, so the averages are a
+smoothed view and the total is the exact figure a careful monitor integrates itself.
+When the per-CPU figures are combined, each CPU's stall time is weighted by how long
+that CPU was non-idle, so an idle CPU does not dilute pressure on a busy one and a
+machine with one thrashing core out of sixty-four still reports meaningful
+contention.
+</p>
+
+<p>
+The per-CPU updates happen on every relevant scheduler event—enqueue, dequeue,
+context switch, entry to and exit from a memory stall—through
+<code>psi_task_change()</code>, which publishes the change under a per-CPU sequence
+counter and then walks the task's cgroup and every one of its ancestors, updating
+each level's <code>struct psi_group</code> in turn. A stall is therefore charged to
+the whole chain at once: a parent cgroup's pressure reflects all of its
+descendants, and the root group is the system-wide figure behind
+<code class="file-path">/proc/pressure</code>. The price is that the cost of each
+update grows with nesting depth, which is why an administrator can switch PSI off for
+an individual cgroup by writing <code>0</code> to its
+<code class="file-path">cgroup.pressure</code> file (Linux 6.1): its pressure files
+disappear and the kernel stops accumulating stall time for that level, while
+accounting continues for its ancestors. Booting with
+<code>cgroup_disable=pressure</code> does the same for every cgroup at once, keeping
+only the system-wide files.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 360" role="img" aria-labelledby="fig25-7-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig25-7-title">Figure 25-7. PSI Some Versus Full</title>
+<rect x="16" y="16" width="828" height="328" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-7. PSI Some Versus Full</text>
+
+<!-- some -->
+<text x="90" y="96" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#ca8a04">some</text>
+<text x="90" y="112" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">&#8805; 1 task stalled</text>
+<g>
+<rect x="200" y="80" width="120" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="260" y="98" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: running</text>
+<rect x="330" y="80" width="120" height="26" rx="4" fill="#fef9c3" stroke="#ca8a04"/><text x="390" y="98" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: stalled</text>
+<rect x="460" y="80" width="120" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="520" y="98" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: running</text>
+<rect x="200" y="112" width="180" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="290" y="130" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 2: running</text>
+<rect x="390" y="112" width="190" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="485" y="130" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 2: running</text>
+</g>
+<rect x="330" y="76" width="120" height="66" rx="4" fill="none" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text x="620" y="112" font-family="Inter,sans-serif" font-size="9" fill="#64748b">some pressure here:</text>
+<text x="620" y="126" font-family="Inter,sans-serif" font-size="9" fill="#64748b">work is delayed</text>
+
+<!-- full -->
+<text x="90" y="216" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#dc2626">full</text>
+<text x="90" y="232" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">all tasks stalled</text>
+<g>
+<rect x="200" y="200" width="120" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="260" y="218" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: running</text>
+<rect x="330" y="200" width="120" height="26" rx="4" fill="#fee2e2" stroke="#dc2626"/><text x="390" y="218" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: stalled</text>
+<rect x="460" y="200" width="120" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="520" y="218" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 1: running</text>
+<rect x="200" y="232" width="130" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="265" y="250" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 2: running</text>
+<rect x="330" y="232" width="120" height="26" rx="4" fill="#fee2e2" stroke="#dc2626"/><text x="390" y="250" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 2: stalled</text>
+<rect x="460" y="232" width="120" height="26" rx="4" fill="#dcfce7" stroke="#16a34a"/><text x="520" y="250" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" font-weight="700">task 2: running</text>
+</g>
+<rect x="330" y="196" width="120" height="66" rx="4" fill="none" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text x="620" y="232" font-family="Inter,sans-serif" font-size="9" fill="#64748b">full pressure here:</text>
+<text x="620" y="246" font-family="Inter,sans-serif" font-size="9" fill="#64748b">no work progresses</text>
+
+<text x="430" y="316" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">&#8220;some&#8221; counts time any task is stalled on a resource; &#8220;full&#8221; counts time every task is stalled at once</text>
+</svg>
+<figcaption>Figure 25-7. PSI some versus full — the "some" metric accumulates whenever at least one task is stalled waiting for a resource, indicating that work is being delayed; the "full" metric accumulates only when every runnable task is stalled at once, indicating that no work is progressing. Both are reported per resource (CPU, memory, I/O) as percentages over 10-, 60-, and 300-second windows, and the gap between them tells an operator whether contention is a nuisance or a crisis.</figcaption>
+</figure>
+
+<p>
+PSI is exposed both system-wide and per cgroup. The files
+<code class="file-path">/proc/pressure/cpu</code>,
+<code class="file-path">/proc/pressure/memory</code>, and
+<code class="file-path">/proc/pressure/io</code> give whole-system pressure, while
+each cgroup carries <code class="file-path">cpu.pressure</code>,
+<code class="file-path">memory.pressure</code>, and
+<code class="file-path">io.pressure</code> files reporting the same metrics for just
+that cgroup's tasks—so an orchestrator can attribute contention to the exact
+workload causing it. A fourth resource, <span class="key-term">IRQ pressure</span>
+(Linux 6.1), appears as <code class="file-path">/proc/pressure/irq</code> and a
+per-cgroup <code class="file-path">irq.pressure</code> on kernels built with
+<code>CONFIG_IRQ_TIME_ACCOUNTING</code>. It charges a cgroup for the time
+its running task lost to hard- and soft-interrupt processing (Chapter 4) on that CPU
+(<code>psi_account_irqtime()</code>), and it reports only a <code>full</code> line:
+while an interrupt handler runs, the interrupted task makes no progress at all, so
+there is no &ldquo;some&rdquo; case to distinguish. It is the metric that exposes a
+workload slowed not by its own demands but by a network card or storage device
+flooding its CPU with interrupts. Table 25-9 lists the metrics and where they appear.
+</p>
+
+<table>
+<caption>Table 25-9. PSI metrics and files</caption>
+<thead>
+<tr><th>Aspect</th><th>Detail</th></tr>
+</thead>
+<tbody>
+<tr><td>Resources</td><td>CPU, memory, I/O; IRQ (<code>full</code> only) with <code>CONFIG_IRQ_TIME_ACCOUNTING</code></td></tr>
+<tr><td>Metrics</td><td><code>some</code> (&#8805; 1 task stalled) and <code>full</code> (all tasks stalled)</td></tr>
+<tr><td>Averages</td><td>Percentages over 10 s, 60 s, and 300 s, plus a total in microseconds</td></tr>
+<tr><td>System-wide files</td><td><code class="file-path">/proc/pressure/{cpu,memory,io,irq}</code></td></tr>
+<tr><td>Per-cgroup files</td><td><code>cpu.pressure</code>, <code>memory.pressure</code>, <code>io.pressure</code>, <code>irq.pressure</code></td></tr>
+<tr><td>Per-cgroup switch</td><td><code>cgroup.pressure</code> (<code>0</code> disables accounting for that cgroup); <code>cgroup_disable=pressure</code> at boot for all</td></tr>
+<tr><td>Notification</td><td><code>poll</code> on a pressure file with a written threshold and window</td></tr>
+<tr><td>Trigger limits</td><td>Window &#8804; 10 s; unprivileged writers limited to multiples of 2 s; one trigger per open file</td></tr>
+</tbody>
+</table>
+
+<h3 id="psi-triggers">Triggers and Notifications</h3>
+
+<p>
+Polling a pressure file periodically would miss brief spikes and waste CPU, so PSI
+adds a <span class="key-term">trigger</span> mechanism for event-driven reaction. A
+program writes a threshold to a pressure file—&ldquo;tell me when stall time exceeds
+X microseconds within a Y-microsecond window&rdquo;—which creates a
+<code>struct psi_trigger</code> (<code class="file-path">kernel/sched/psi.c</code>), and
+then blocks in <code>poll</code> (or <code>epoll</code>) on the file descriptor. The
+kernel, which is already accumulating stall times, wakes the waiter the moment the
+threshold is crossed, so the program reacts to pressure in milliseconds rather than
+at the next poll interval. This is the foundation of userspace
+out-of-memory managers such as <code>oomd</code> and <code>systemd-oomd</code>: rather
+than waiting for the kernel OOM killer to fire when memory is already exhausted, they
+watch <code class="file-path">memory.pressure</code> triggers and shed load
+<em>before</em> the machine thrashes, choosing which workload to stop by policy
+instead of leaving it to the kernel's heuristics. PSI thus closes the loop that the
+controllers open: cgroups impose the limits, and PSI reports, precisely and
+promptly, when those limits are starting to hurt.
+</p>
+
+<p>
+The trigger's two numbers—a <span class="key-term">threshold</span> and a
+<span class="key-term">window</span>—give it its precision. The window may be up to
+ten seconds, the threshold must be positive and no larger than the window, and the
+meaning is &ldquo;wake me if stall time reaches the threshold within any window of
+that length.&rdquo; Crucially, triggers are <em>not</em> evaluated on the slow
+two-second cadence of the average files; the kernel monitors armed triggers on a
+faster internal poll timer whose period is one-tenth of the smallest window in use
+(<code class="file-path">kernel/sched/psi.c</code>), so a program watching a
+half-second window learns of a spike within a fraction of a second. That fast path is
+driven by a per-group kernel thread, <code>psimon</code>, running at a low
+<code>SCHED_FIFO</code> real-time priority (Chapter 7) so that it can sample
+stall times even when the machine is under exactly the pressure it is meant to
+report. Because a
+trigger can be created on a cgroup's own <code class="file-path">memory.pressure</code>
+just as easily as on the system-wide file, a supervisor can arm a different threshold
+for each workload—tight for a latency-critical service, loose for a batch job—and be
+notified about exactly the one that is suffering. It is this combination of
+per-workload scope and sub-second latency that lets modern userspace act on
+contention as a first-class signal rather than a statistic read after the fact.
+</p>
+
+<p>
+A real-time thread is not something an arbitrary user should be able to spawn, so
+since Linux 6.5 PSI distinguishes privileged from unprivileged trigger writers. The
+<code class="file-path">/proc/pressure</code> files are world-writable, and
+<code>psi_trigger_create()</code> checks <code>CAP_SYS_RESOURCE</code> in the
+credentials of whoever <em>opened</em> the file—so a privileged supervisor can open
+it and hand the descriptor to a less-privileged helper. A privileged trigger joins
+the <code>psimon</code>-driven fast path. An unprivileged one is accepted only if its
+window is a whole multiple of two seconds, and it is then evaluated by the ordinary
+two-second averaging work instead, so ordinary users get pressure notifications
+without being able to create real-time load. Either way the contract with userspace
+is the same and deliberately narrow. Each open file descriptor holds at most one
+trigger (a second write fails with <code>EBUSY</code>); closing the descriptor
+destroys it. A crossed threshold is reported as <code>EPOLLPRI</code>, and events are
+rate-limited to at most one per window: a stall that keeps growing does not produce a
+storm of wakeups, but one that crosses the threshold again during the quiet period is
+remembered and delivered once the window has elapsed, so no breach is silently lost.
+If the cgroup is removed while a program is polling its pressure file, the poll
+returns <code>EPOLLERR</code>, telling a supervisor to stop watching a workload that
+no longer exists.
+</p>
+
+<hr>
+<h2 id="container">The Anatomy of a Container</h2>
+
+<p class="chapter-intro">
+With namespaces and cgroups in hand, we can finally answer what a container
+<em>is</em>. It is not a kernel object but a <em>recipe</em>: a particular
+combination of the primitives this chapter has described, assembled by a user-space
+runtime. This closing section walks through what that runtime actually does to start
+a container, and then looks honestly at where the isolation's limits—and its risks—
+lie.
+</p>
+
+<p>
+Because the recipe lives in user space, it has been standardized there rather than
+in the kernel. The <span class="key-term">Open Container Initiative</span> (OCI)
+specifications define an image format—a stack of filesystem layers plus a JSON
+configuration listing the namespaces, cgroup limits, capabilities, and seccomp
+profile to apply—so that any compliant runtime can run any compliant image. This is
+why the same image runs under Docker, Podman, and Kubernetes: those tools differ in
+how they build and orchestrate containers, but underneath they drive a small
+low-level runtime (most commonly <code>runc</code>) that turns the OCI configuration
+into exactly the kernel calls of this chapter. The kernel, true to form, knows
+nothing of any of this; it sees only a process that unshared some namespaces, joined
+a cgroup, and dropped some privileges.
+</p>
+
+<h3 id="runtime">What a Container Runtime Does</h3>
+
+<p>
+When a runtime such as <code>runc</code> (the low-level engine under Docker and
+Kubernetes) starts a container, it performs, in essence, a carefully ordered
+sequence of the operations from this chapter. It creates a new
+user namespace and writes its UID/GID maps, so the rest
+of the setup can proceed unprivileged (&sect;3). It creates fresh
+<span class="key-term">mount, PID, network, IPC, UTS</span>, and often cgroup and time
+namespaces (&sect;2), giving the container its private
+view. Inside the mount namespace it assembles the container's root filesystem and calls <code>pivot_root</code> into it, so the container sees only its own files. It creates
+a <span class="key-term">cgroup</span> for the container and writes the configured
+<code class="file-path">memory.max</code>, <code class="file-path">cpu.max</code>,
+<code class="file-path">pids.max</code>, and the rest (&sect;5&#8211;&sect;6), then
+moves the container's first process into it. It drops
+capabilities to the minimal set the workload needs
+(&sect;3.2) and installs a seccomp filter (Chapter 20)
+restricting which system calls the container may make. Only then does it
+<code>exec</code> the container's actual program as PID 1 of its new PID namespace.
+Figure 25-8 shows the layers that result.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 450" role="img" aria-labelledby="fig25-8-title" style="max-width:760px; width:100%; height:auto;">
+<title id="fig25-8-title">Figure 25-8. The Layers of a Container</title>
+<rect x="16" y="16" width="828" height="418" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="46" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure 25-8. The Layers of a Container</text>
+
+<!-- nested layers, outermost first -->
+<rect x="50" y="72" width="760" height="334" rx="14" fill="#ede9fe" stroke="#7c3aed"/>
+<rect x="90" y="120" width="680" height="270" rx="12" fill="#e0e7ff" stroke="#4f46e5"/>
+<rect x="130" y="168" width="600" height="206" rx="12" fill="#dcfce7" stroke="#16a34a"/>
+<rect x="170" y="216" width="520" height="142" rx="10" fill="#fef3c7" stroke="#ca8a04"/>
+<rect x="290" y="286" width="280" height="60" rx="10" fill="#fee2e2" stroke="#dc2626"/>
+
+<!-- labels, each in its own top band -->
+<text x="430" y="96" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#6d28d9">user namespace &#8212; UID/GID maps, fake root</text>
+<text x="430" y="112" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">makes the rest of the setup unprivileged</text>
+
+<text x="430" y="144" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#4338ca">namespaces &#8212; mount, PID, net, IPC, UTS, time, cgroup</text>
+<text x="430" y="160" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">the private view: own root fs, own PID 1, own network</text>
+
+<text x="430" y="192" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#15803d">cgroup &#8212; memory.max, cpu.max, pids.max, io.max</text>
+<text x="430" y="208" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">the bounded appetite</text>
+
+<text x="430" y="240" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#a16207">capabilities + seccomp</text>
+<text x="430" y="256" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">minimal privileges, restricted syscall surface</text>
+
+<text x="430" y="312" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" font-weight="700" fill="#b91c1c">the container process</text>
+<text x="430" y="330" text-anchor="middle" font-family="Inter,sans-serif" font-size="8.5" fill="#475569">exec'd as PID 1 of its namespace</text>
+
+<text x="430" y="424" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">each layer wraps the one inside it; the process runs at the center, contained by all of them &#8212; composed by a user-space runtime, not a kernel object</text>
+</svg>
+<figcaption>Figure 25-8. The layers of a container — the primitives of this chapter nest around the process: the user namespace (outermost) makes the setup unprivileged and encloses the other namespaces that provide the private view, which enclose the cgroup that bounds resource use, which encloses the capability set and seccomp filter that narrow what the process may do; at the center is the container's program, exec'd as PID 1 and contained by every layer around it. No layer is a "container"; the container is their composition.</figcaption>
+</figure>
+
+<p>
+The <em>order</em> of those steps is not arbitrary; each depends on the last. The
+user namespace comes first because it is what grants the capabilities the remaining
+setup needs. The other namespaces come next, and only inside the new mount namespace
+can the runtime safely assemble the root filesystem—typically an
+<span class="key-term">overlay</span> mount (Chapter 12) stacking the image's
+read-only layers under a writable one—and <code>pivot_root</code> into it.
+<code>pivot_root</code> itself imposes two preconditions that shape the runtime's
+first mount operations. The new root must be a mount point, so the runtime
+bind-mounts the root filesystem onto itself. And the call fails with
+<code>EINVAL</code> if the mounts involved have <em>shared</em> propagation
+(<code>path_pivot_root()</code> in <code class="file-path">fs/namespace.c</code>), so
+the runtime first remounts the whole inherited tree recursively private or slave
+(&sect;4.2). That also guarantees that nothing it mounts inside the container leaks
+back into the host's mount table. It then
+mounts a fresh <code class="file-path">/proc</code> (which, as &sect;4.1 explained,
+must be created after the fork into the new PID namespace to show only the
+container's processes), a restricted <code class="file-path">/dev</code>, and
+<code class="file-path">/sys</code>, and masks a handful of dangerous paths such as
+<code class="file-path">/proc/sysrq-trigger</code> so the container cannot reach them.
+The masks are ordinary bind mounts: an empty file or <code class="file-path">/dev/null</code>
+mounted over each sensitive file, and read-only bind mounts over trees such as
+<code class="file-path">/proc/sys</code>.
+</p>
+
+<p>
+The kernel adds its own rules about what a container may mount. A
+<code class="file-path">proc</code> or <code class="file-path">sysfs</code> instance
+could reveal far more than the runtime intended, so when the caller's mount namespace
+is owned by a non-initial user namespace, <code>mount_too_revealing()</code>
+(<code class="file-path">fs/namespace.c</code>) allows a new instance only if one is
+already <em>fully visible</em> in that namespace. That means no locked mount covers
+anything but an empty directory, and the new mount is no less restrictive than
+the existing one in its locked read-only and access-time settings. The rule
+explains a common surprise. Once a runtime has masked paths in a container's
+<code class="file-path">/proc</code>, a rootless container engine running <em>inside</em> it, which
+creates its own user namespace, cannot mount a fresh <code class="file-path">/proc</code> for a nested PID namespace,
+because every <code class="file-path">/proc</code> it can see has files covered.
+Nested container setups therefore often run with an unmasked
+<code class="file-path">/proc</code>. The covering mounts count as locked because
+whenever a mount namespace is copied into a less-privileged user namespace, the
+kernel marks the inherited mounts <code>MNT_LOCKED</code> and locks their read-only,
+<code>nosuid</code>, <code>nodev</code>, and <code>noexec</code> flags
+(<code>lock_mnt_tree()</code>). A process that is &ldquo;root&rdquo; only inside its
+user namespace cannot unmount or loosen a mount it inherited from a more privileged
+namespace to uncover what lies beneath.
+</p>
+
+<p>
+Networking is wired up—often by a separate plugin, the CNI plugins of Kubernetes
+being the common case—by moving one end of a veth pair into the new network
+namespace. Since Linux 6.7, performance-sensitive deployments can use
+<span class="key-term">netkit</span> devices
+(<code class="file-path">drivers/net/netkit.c</code>) instead: a paired virtual
+device like veth, but its transmit routine runs a BPF program attached through the
+multi-program BPF framework. That program can redirect a packet leaving the container
+straight to the physical device (<code>NETKIT_REDIRECT</code>), skipping the per-CPU
+backlog re-queue that a packet crossing a veth pair normally takes. A rootless container, which cannot attach anything to the
+host's own network namespace, usually gets connectivity from a user-space network
+stack such as <code>slirp4netns</code> or <code>pasta</code>, which carries the
+container's traffic over ordinary host sockets. Dropping capabilities and installing
+the seccomp filter come <em>last</em>,
+just before <code>exec</code>, so that all the privileged setup happens while the
+runtime still holds privilege and the container's own code begins life already
+confined. A <code>no_new_privs</code> bit is set along the way so that no later
+<code>exec</code> of a setuid binary can regain what was dropped. The bit is also a
+kernel requirement: <code>seccomp</code> refuses to install a filter with
+<code>EACCES</code> unless the caller either has <code>no_new_privs</code> set or holds
+<code>CAP_SYS_ADMIN</code> in its user namespace
+(<code class="file-path">kernel/seccomp.c</code>). Otherwise a filter could make
+a setuid program misbehave by failing chosen system calls under it.
+</p>
+
+<p>
+Two additions to <code>clone3()</code> (&sect;2.2) let a runtime close races that
+older runtimes had to tolerate. With <code>CLONE_INTO_CGROUP</code> (Linux 5.7),
+the runtime passes a file descriptor for the container's cgroup directory and the
+child is created <em>already inside</em> it. <code>cgroup_css_set_fork()</code>
+(<code class="file-path">kernel/cgroup/cgroup.c</code>) checks the same write
+permissions a <code class="file-path">cgroup.procs</code> migration would and
+chooses the child's <code>css_set</code> before the task becomes visible, so there
+is no window in which the child runs, allocates memory, or forks while still
+charged to the runtime's cgroup. With <code>CLONE_PIDFD</code> the runtime receives
+a pidfd for the container's PID 1 at the moment of creation. It can then wait on,
+signal, and later <code>setns()</code> into the container through a handle that
+cannot be redirected to an unrelated process if the PID number is reused.
+</p>
+
+<h3 id="container-security">Security and the Attack Surface</h3>
+
+<p>
+Because a container shares the host kernel, its isolation is only as strong as that
+kernel's enforcement—and this is the fundamental difference from a virtual machine.
+A VM escape must defeat the hardware virtualization boundary; a container escape need
+only find one kernel bug reachable from inside the container. The attack surface is
+the entire system-call interface, which is why the seccomp
+filter of Chapter 20 matters so much in practice: by forbidding the system calls a
+workload does not need, it removes large swaths of kernel code from the container's
+reach, shrinking the surface where a bug could be exploited. Dropping unnecessary
+capabilities does the same for privileged operations. A flat deny-list is sometimes
+too blunt, because some workloads legitimately need an operation a container must
+not perform directly, such as creating a device node or mounting a particular
+filesystem. For these, a filter can return <code>SECCOMP_RET_USER_NOTIF</code>
+(Linux 5.0, Chapter 20). The system call is suspended and handed to a supervisor
+process over a notification file descriptor. The supervisor examines the arguments,
+performs a safe, vetted version of the operation on the container's behalf, and can
+even install a file descriptor into the container (<code>SECCOMP_IOCTL_NOTIF_ADDFD</code>)
+before supplying the result. Container managers such as LXD use this to emulate
+selected privileged calls without granting the privilege itself.
+</p>
+
+<p>
+In practice, then, real containers are hardened in <span class="key-term">depth</span>:
+namespaces and cgroups are only the first two of several layers. A
+<span class="key-term">Linux Security Module</span>—SELinux or AppArmor—confines what
+files and operations the container's processes may touch even within their
+namespaces, a read-only root filesystem keeps a compromised process from modifying
+its own image, and <code>no_new_privs</code> blocks privilege regain. Because the
+kernel stacks LSMs, these major policies can be combined with
+<span class="key-term">Landlock</span> (Chapter 20). Landlock is an unprivileged
+LSM that lets a process, or the runtime acting for it, restrict its own filesystem
+and network access further, with a ruleset that only ever narrows and is inherited
+across <code>fork</code> and <code>exec</code>. The most
+security-conscious deployments go further and run
+<span class="key-term">rootless</span>: the entire container, runtime included, runs
+as an unprivileged user via a user namespace, so even a total escape yields only
+that unprivileged user's authority on the host. Several kernel changes made this
+practical. Overlayfs has been mountable inside a user namespace since Linux 5.11
+(<code>FS_USERNS_MOUNT</code> in <code class="file-path">fs/overlayfs/super.c</code>),
+so rootless engines no longer need the slower FUSE-based
+<code>fuse-overlayfs</code>. Idmapped mounts (&sect;3.1) let a rootless container
+share a host volume with file ownership translated correctly instead of
+<code>chown</code>-ing it. And cgroup delegation (&sect;6.2) lets the unprivileged
+user manage the container's resource limits. Each layer is independently
+imperfect, but an attacker must defeat all of them at once, which is what makes the
+composition defensible even though no single primitive is a hard boundary.
+</p>
+
+<p>
+Where that is not enough, the industry reaches back up the isolation spectrum of
+&sect;1.1. Sandboxes such as <span class="key-term">gVisor</span> interpose a
+user-space kernel that services the container's system calls itself, so the
+container almost never touches the host kernel directly; lightweight virtual
+machines such as <span class="key-term">Kata Containers</span> and
+<span class="key-term">Firecracker</span> wrap each container in a fast-booting VM,
+buying a hardware-enforced boundary at a fraction of a traditional VM's cost. Both
+trade some of the container's density and speed for isolation nearer a virtual
+machine's—a reminder that &ldquo;container&rdquo; names a point on a continuum, not a
+fixed guarantee. The far end of that continuum is the
+<em>confidential container</em>. A lightweight VM of the Kata kind runs under AMD
+SEV-SNP or Intel TDX, so its memory is encrypted even against the host kernel. That
+is where the misc controller's limits on SEV ASIDs and TDX HKIDs (&sect;6.3) come in:
+they ration the scarce hardware slots such guests consume.
+</p>
+
+<p>
+The user namespace deserves a final, honest word. It is
+what makes unprivileged containers possible, and it is also, historically, one of the
+larger sources of Linux privilege-escalation bugs—because it lets an unprivileged
+user reach code paths (in filesystems, networking, and elsewhere) that once assumed
+their caller was already privileged. That tension is real: the same feature that
+lets an ordinary user safely run a container also exposes kernel code that was never
+written with hostile unprivileged callers in mind. The mainline kernel gives
+administrators two levers. The <code class="file-path">user.max_user_namespaces</code>
+limit (&sect;3.2) can be lowered, or set to zero to forbid new user namespaces
+entirely. And since Linux 6.1, <code>create_user_ns()</code> calls the
+<code>userns_create</code> LSM hook (<code>security_create_user_ns()</code>), so
+SELinux (through the <code>user_namespace { create }</code> permission), AppArmor
+profiles, or a BPF LSM program can decide per process who may create one.
+Distributions layer their own policy on top. Debian's long-standing
+<code class="file-path">kernel.unprivileged_userns_clone</code> sysctl, for example,
+is a distribution patch, not a mainline interface, and the kernel continues to
+harden the code paths themselves. The larger point closes the chapter:
+Linux's containers are not a security boundary of the same kind as a virtual machine,
+but a set of composable isolation primitives whose strength is exactly the strength
+of the one kernel beneath them—which is why the subsystems of this entire book, and
+their correctness, are ultimately what a container's isolation rests on.
+</p>
+
+<hr>
+<h2 id="chapter-summary">Summary</h2>
+
+<p class="chapter-intro">
+This chapter described how Linux 7.0 isolates and limits processes to build
+containers, and stressed the fact that the kernel has no
+container object at all. Isolation rests on two orthogonal mechanisms.
+Namespaces control what a process can see. Linux has
+eight types: mount, UTS, IPC, PID, network, user, cgroup, and time. Six of them are
+reached through the shared, reference-counted <code>struct nsproxy</code>, while the
+user namespace hangs off the task's credentials and the active PID namespace off its
+<code>struct pid</code>. Namespaces are created and joined with <code>clone</code>,
+<code>unshare</code>, and <code>setns</code>, the last committing a whole set
+all-or-nothing. Each one embeds a <code>struct ns_common</code> whose
+<code>proc_ns_operations</code> let one body of generic code serve all eight types,
+and whose split memory and active reference counts decide how long it lives and
+whether it can still be found. Through nsfs every namespace is a first-class object:
+a link under <code class="file-path">/proc/&lt;pid&gt;/ns</code>, an fd that pins it,
+a bind mount that keeps it alive with no member process, and a stable 64-bit ID that
+the <code>NS_GET_*</code> ioctls and the <code>listns</code> system call report.
+</p>
+
+<p>
+The user namespace is the keystone. By mapping UIDs and
+GIDs through a write-once <code>uid_map</code> and <code>gid_map</code>, it lets an
+unprivileged user become root inside a container (&ldquo;fake root&rdquo;) without
+gaining any privilege on the host. The map-writing rules, the <code>setgroups</code>
+guard, and the <code>CAP_SETFCAP</code> check on a root mapping keep that grant from
+leaking, and idmapped mounts apply the same translation to a single mount. Its
+capabilities are full but relative: <code>ns_capable</code> checks them against the
+user namespace that owns the resource, so they never reach an ancestor. The
+PID namespace gives each container its own numbering, its own
+<code>pid_max</code>, and an init whose death empties the namespace, all implemented
+by a <code>struct pid</code> that carries one number per nesting level. The network,
+mount, IPC, UTS, and time namespaces each virtualize their own table, from a whole
+network stack down to a pair of clock offsets, and the new mount API lets a runtime
+build a detached mount tree and graft it into place in one step.
+</p>
+
+<p>
+Control groups control what a process can use. Cgroup v2
+arranges all processes in a single unified hierarchy of kernfs directories, links each
+task through a shared, deduplicated <code>css_set</code> to the per-controller state of
+its cgroup, migrates tasks with the same prepare-then-commit discipline, and
+distributes resources top-down under the no-internal-process rule. It also makes the
+cgroup the unit of whole-group lifecycle operations,
+<code class="file-path">cgroup.freeze</code> and <code class="file-path">cgroup.kill</code>.
+Its controllers (cpu, memory, io, pids, cpuset, rdma, misc, dmem, and more)
+share, cap, or protect each resource through weights, limits, and protections such as
+<code class="file-path">cpu.weight</code>, <code class="file-path">memory.max</code>, and
+<code class="file-path">memory.low</code>. Cpuset partitions hand CPUs to a workload
+outright, and delegation lets an unprivileged container manage its own subtree
+safely. Resources that drivers own are charged by the driver itself. RDMA objects and
+confidential-VM key slots can only be refused, but GPU memory under the dmem
+controller can be reclaimed: a charge over <code class="file-path">dmem.max</code>
+makes TTM evict buffers from the over-limit subtree, sparing those protected by
+<code class="file-path">dmem.min</code> and <code class="file-path">dmem.low</code>.
+Pressure Stall Information completes the picture.
+It reports how much time work is lost to CPU, memory, I/O, and interrupt contention,
+charges each stall to every ancestor cgroup, and wakes userspace managers such as
+<code>systemd-oomd</code> as soon as a trigger's threshold is crossed.
+</p>
+
+<p>
+A container, finally, is the composition of all these: namespaces, a cgroup, dropped
+capabilities, <code>no_new_privs</code>, and a seccomp filter, described by the OCI
+specifications and applied by a user-space runtime in a deliberate order. The kernel
+enforces its own rules on that composition. <code>pivot_root</code> refuses shared
+propagation, inherited mounts are locked, a fresh <code>proc</code> may be mounted only
+where one is already fully visible, and <code>clone3</code> can place a child directly
+into its cgroup. Because a container shares the host kernel, it is hardened in depth
+with security modules, Landlock, seccomp user notification, read-only images, and
+rootless operation. Administrators can limit or police user-namespace creation itself,
+and where even that is too weak a boundary, user-space kernels and lightweight or
+confidential virtual machines sit further up the isolation spectrum. But a container's
+isolation is ultimately only as strong as the single kernel beneath it, which is why
+everything else in this book, and its correctness, underlies the container abstraction
+that so much of modern computing now runs on.
+</p>
+
+<p class="source-trail-pointer">The kernel source files this chapter works from are collected by topic in <a href="source-trails.html#ch25">Source Trails</a>.</p>
+</main>
+
+<footer class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>v0.1</p>
+  <p>© 2026 Lianwei Wang. All rights reserved.</p>
+</footer>
+
+</div><!-- .book-container -->
+<script src="assets/progress.js" defer></script>
+</body>
+</html>

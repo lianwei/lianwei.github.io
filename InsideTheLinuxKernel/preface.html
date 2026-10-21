@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Preface to Inside the Linux Kernel: the book's audience, organization, level of description, a chapter-by-chapter overview, assumed background, and typographic conventions, targeting Linux kernel 7.0.12 on x86_64 and ARM64.">
+  <meta property="og:title" content="Preface — Inside the Linux Kernel">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <title>Preface — Inside the Linux Kernel</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+</head>
+<body>
+<progress class="chapter-progress" max="100" value="0" aria-hidden="true"></progress>
+<nav class="chapter-nav">
+  <a class="book-title" href="index.html" title="Table of Contents">Inside the Linux Kernel</a>
+  <span class="nav-sep">|</span>
+  <a href="index.html">&larr; Contents</a>
+  <span class="nav-sep">|</span>
+  <a href="#top">Preface</a>
+  <span class="nav-sep">|</span>
+  <a href="chapter-1.html">Chapter 1 &rarr;</a>
+</nav>
+<a href="#top" class="back-to-top" aria-label="Back to top">&uarr;</a>
+<div class="book-container" id="top" style="margin-top: 3.5rem;">
+<header class="chapter-header">
+  <div class="chapter-number">Preface</div>
+  <h1 class="chapter-title" style="border:none; margin-top:0.5rem;">Preface</h1>
+  <p class="chapter-subtitle">A book about Linux 7.0.12, with x86_64 and ARM64 as its reference architectures — what it covers, how it is organized, and the conventions it follows.</p>
+</header>
+
+<main class="chapter-body">
+<nav class="toc">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#about">About This Book</a></li>
+<li><a href="#audience">The Audience for This Book</a></li>
+<li><a href="#organization">Organization of the Material</a></li>
+<li><a href="#level">Level of Description</a></li>
+<li><a href="#overview">Overview of the Book</a></li>
+<li><a href="#background">Background Information</a></li>
+<li><a href="#conventions">Conventions in This Book</a></li>
+</ol>
+</nav>
+
+<p class="chapter-intro">
+This book describes the Linux kernel as it is today:
+<span class="key-term">Linux 7.0.12</span>, traced through its source on the two
+architectures that dominate contemporary computing,
+<span class="key-term">x86_64</span> (AMD64) and <span class="key-term">ARM64</span>
+(AArch64). Since the 2.6 series the kernel has been transformed. Whole subsystems
+have been rewritten, security has become a pervasive design constraint, and the
+target hardware has moved from 32-bit PCs to 64-bit, many-core, NUMA servers,
+phones, and embedded SoCs.
+</p>
+
+<h2 id="about">About This Book</h2>
+
+<p class="chapter-intro">
+The book explains how the Linux kernel works from the inside. It is not a manual
+for configuring a system, nor a reference to the system-call API. It is an
+explanation of the <em>mechanisms</em>&mdash;the data structures, algorithms, locking
+rules, and design decisions&mdash;by which the kernel manages memory, schedules
+processes, handles interrupts, serves files, and turns programs into running
+tasks. Each mechanism is traced through the 7.0.12 source on both architectures
+at once, so that the reader can see which parts of the kernel are generic and
+which are shaped by the machine beneath them.
+</p>
+
+<p>
+Much of the material covers mechanisms that did not exist in the 2.6 series:
+five-level page tables, folios, control groups and namespaces, the EEVDF fair
+scheduler and sched_ext, pervasive RCU, extent-based and copy-on-write
+filesystems, the block multi-queue layer, io_uring, address-space layout
+randomization, stacked Linux Security Modules, seccomp, Landlock, module signing,
+eBPF and BTF, and livepatching. The book presents them on their own terms,
+building from memory addressing and processes up through the subsystems that
+make a running system.
+</p>
+
+<p>
+Where a mechanism replaced an older one, a short <strong>Version history</strong>
+note or a comparison table records what Linux 2.6 did and which release
+introduced the change. That history has practical value: it explains identifiers
+that survive in older drivers, out-of-tree code, documentation, and mailing-list
+discussions, and it shows how far back a backport has to reach.
+</p>
+
+<h2 id="audience">The Audience for This Book</h2>
+
+<p class="chapter-intro">
+This book is written for anyone who wants to understand how a real, production
+operating-system kernel is built. Its readers include systems programmers who
+must reason about how their code interacts with the kernel; students of operating
+systems who want to see the concepts of their courses embodied in a kernel that
+runs on billions of machines; kernel and driver developers who need a map of the
+territory before diving into the source; and simply the curious, who want to know
+what happens between pressing the power button and reaching a shell prompt.
+</p>
+
+<p>
+The book assumes that its reader is comfortable reading C, since the kernel is
+written in C (with a modest amount of architecture-specific assembly), and that
+they have met the basic vocabulary of operating systems—processes, files, virtual
+memory, interrupts—at the level of an undergraduate course or equivalent
+experience. It does not assume prior knowledge of the Linux kernel itself, nor
+deep expertise in either of the reference architectures; the hardware background
+each topic needs is introduced where it is first required. What the book cannot
+do is teach C or the fundamentals of computer architecture from scratch; readers
+who want to strengthen that foundation will find suggestions in the
+&sect;6 (&ldquo;Background Information&rdquo;) section below.
+</p>
+
+<h2 id="organization">Organization of the Material</h2>
+
+<p class="chapter-intro">
+The book is organized as a sequence of chapters that build upon one another,
+grouped into broad thematic parts, followed by two appendices. It begins with the
+<span class="key-term">foundations</span>: the way the processor and kernel handle
+memory addresses, the representation of processes, the handling of interrupts and
+exceptions, kernel synchronization, and timing. It then turns to
+<span class="key-term">memory management</span>—the page allocator, the slab
+allocator, non-contiguous memory, the process address space, and the page
+cache—which is the heart of the kernel and the substrate on which everything else
+rests. From there it covers the <span class="key-term">virtual filesystem</span>
+and the concrete filesystem and <span class="key-term">block I/O</span> layers
+that give processes durable storage, and then the several forms of
+<span class="key-term">interprocess communication</span>. It reaches
+<span class="key-term">program execution</span>—how an executable file becomes a
+running, secured process—which draws on nearly every subsystem that came before.
+Part III ends with two subsystems that cut across the whole machine:
+<span class="key-term">power management</span>, from system suspend and runtime PM to
+CPU frequency and idle states, and <span class="key-term">networking</span>, from the
+socket layer through <code>sk_buff</code> and the protocol stack to the device queues.
+The book then closes with a group of advanced topics that show where the modern kernel is
+going: the <span class="key-term">eBPF</span> in-kernel virtual machine,
+the <span class="key-term">io_uring</span> asynchronous-I/O interface, the
+<span class="key-term">namespaces and control groups</span> that underpin containers,
+the new support for writing kernel code in <span class="key-term">Rust</span>, the
+<span class="key-term">security infrastructure</span> of cryptography, keys, integrity, and
+audit, <span class="key-term">KVM</span> virtualization, and the
+<span class="key-term">tracing and diagnostic</span> facilities through which the kernel
+reports on itself.
+</p>
+
+<p>
+Two appendices stand slightly apart from this progression because they describe
+the kernel from its edges rather than its interior.
+<span class="key-term">Appendix A</span> follows the system from power-on to the
+first user process—firmware, boot loaders, decompression, and the architecture
+startup code that reaches <code>start_kernel</code>. <span class="key-term">Appendix
+B</span> describes loadable kernel modules—how code is linked into a running
+kernel and, increasingly, how modules carry far more than device drivers. The
+chapters are meant to be read in order on a first pass, since later ones freely
+use concepts established earlier, but each is also written to serve as a reference
+to its subsystem once the whole has been absorbed.
+</p>
+
+<h2 id="level">Level of Description</h2>
+
+<p class="chapter-intro">
+This book describes the kernel at the level of its <span class="key-term">data
+structures and algorithms</span>. For each subsystem it explains what problem the
+kernel is solving, the structures it uses to represent the problem, the algorithms
+that operate on those structures, and—crucially—the reasoning behind the design,
+including the trade-offs that led the kernel's developers to one approach rather
+than another. It names the real functions, structures, and macros of the Linux
+7.0.12 source and points to the files that contain them, so that a reader can move
+from the book's explanation to the code itself. It is not, however, a line-by-line
+commentary on the source: the kernel is far too large for that, and a faithful
+transcription would obscure the very structure the book aims to reveal. The goal
+is understanding that outlives any single release, anchored in—but not drowned
+by—the details of one.
+</p>
+
+<p>
+Because this book targets two architectures, it takes care to separate the
+<span class="key-term">architecture-independent</span> core of each subsystem from
+its <span class="key-term">architecture-specific</span> realization. Where the
+kernel's generic code is what matters, the book describes that; where a mechanism
+is inescapably tied to the hardware—page-table formats, exception entry, memory
+barriers, the boot sequence—it shows how both x86_64 and ARM64 implement it, and
+what the differences reveal. Seeing the same idea expressed twice, in two
+processor idioms, is one of the most instructive things about studying a portable
+kernel, and this book uses that comparison deliberately throughout.
+</p>
+
+<h2 id="overview">Overview of the Book</h2>
+
+<p class="chapter-intro">
+The chapters and appendices, in order, are as follows.
+</p>
+
+<ul>
+<li><span class="key-term">Chapter 1, Introduction</span>, sets the scene: the history and philosophy of Linux, the architecture of the kernel, the operating-system concepts the book assumes, and an overview of the subsystems and how they fit together.</li>
+<li><span class="key-term">Chapter 2, Memory Addressing</span>, explains how the processor and kernel translate addresses—segmentation's vestigial role, multi-level paging up to five levels, the TLB, and the kernel's own address space—on x86_64 and ARM64.</li>
+<li><span class="key-term">Chapter 3, Processes</span>, describes the process descriptor, how processes and threads are created and destroyed, context switching, and the namespaces that virtualize a process's view of the system.</li>
+<li><span class="key-term">Chapter 4, Interrupts and Exceptions</span>, covers how the kernel responds to asynchronous events from hardware and synchronous faults from software, and the deferred-work mechanisms that keep interrupt handling short.</li>
+<li><span class="key-term">Chapter 5, Kernel Synchronization</span>, examines the primitives—atomic operations, spinlocks, mutexes, RCU, and memory barriers—by which the kernel coordinates concurrent access on multiprocessor systems.</li>
+<li><span class="key-term">Chapter 6, Timing Measurements</span>, describes how the kernel keeps time, schedules deferred work, and maintains the system clock across a range of timer hardware.</li>
+<li><span class="key-term">Chapter 7, Process Scheduling</span>, explains how the kernel decides which task runs next, the scheduling classes, and how load is balanced across processors.</li>
+<li><span class="key-term">Chapter 8, Memory Management</span>, presents the page allocator, the slab allocator, and the machinery that manages the kernel's own use of physical memory.</li>
+<li><span class="key-term">Chapter 9, Process Address Space</span>, describes how each process's virtual memory is represented, how regions are mapped, and how page faults are resolved.</li>
+<li><span class="key-term">Chapter 10, System Calls</span>, traces the boundary between user space and the kernel and the mechanics of entering and leaving it.</li>
+<li><span class="key-term">Chapter 11, Signals</span>, covers the kernel's oldest interprocess notification mechanism and how signals are generated, delivered, and handled.</li>
+<li><span class="key-term">Chapter 12, The Virtual Filesystem</span>, explains the abstraction layer that lets a single set of system calls operate on many different filesystems.</li>
+<li><span class="key-term">Chapter 13, I/O Architecture and Device Drivers</span>, describes how the kernel talks to hardware devices and the driver model that organizes them.</li>
+<li><span class="key-term">Chapter 14, Block Device Drivers</span>, covers the path from a filesystem request to a physical disk, including the multi-queue block layer.</li>
+<li><span class="key-term">Chapter 15, The Page Cache</span>, explains how the kernel caches file data in memory to make I/O fast.</li>
+<li><span class="key-term">Chapter 16, Accessing Files</span>, follows read and write operations through the kernel, from the system call to the storage device.</li>
+<li><span class="key-term">Chapter 17, Page Frame Reclaiming</span>, describes how the kernel reclaims memory under pressure and the policies that decide what to evict.</li>
+<li><span class="key-term">Chapter 18, The Ext4 Filesystem</span>, examines one concrete on-disk filesystem in depth and how it realizes the VFS abstractions.</li>
+<li><span class="key-term">Chapter 19, Process Communication</span>, surveys pipes, System&nbsp;V and POSIX IPC, futexes, and the file-descriptor-based notification mechanisms.</li>
+<li><span class="key-term">Chapter 20, Program Execution</span>, explains how an executable file becomes a running process—formats, the exec pipeline, memory layout, dynamic linking, credentials, and the security frameworks that constrain it.</li>
+<li><span class="key-term">Chapter 21, Power Management</span>, explains how the kernel saves energy at every scale—suspending and hibernating the whole system, powering devices and power domains down at runtime, and scaling CPU frequency and idle states under the guidance of the Energy Model and thermal management.</li>
+<li><span class="key-term">Chapter 22, Networking</span>, explains how Linux carries data between applications and network hardware: the socket layer and its proto_ops/proto split, the sk_buff, network devices and NAPI, GRO and receive steering, the IP layer, qdiscs and the transmit path, TCP and UDP, netfilter and netlink, and the page_pool, devmem and AF_XDP data paths.</li>
+<li><span class="key-term">Chapter 23, The eBPF Subsystem</span>, describes the in-kernel virtual machine that lets user-supplied programs run safely at kernel hooks—the verifier, maps, program types, and the JIT—turning the kernel into a programmable platform.</li>
+<li><span class="key-term">Chapter 24, io_uring</span>, presents the shared-memory ring interface for asynchronous I/O, how submission and completion queues eliminate per-operation system calls, and the registration and polling features that make it fast.</li>
+<li><span class="key-term">Chapter 25, Containers, Namespaces, and Cgroups</span>, explains the two kernel mechanisms—namespaces for isolation and control groups for resource limits—that together let a single kernel present many isolated views of the system.</li>
+<li><span class="key-term">Chapter 26, Rust in the Kernel</span>, covers the ability to write kernel code in Rust—the build integration, the safe/unsafe boundary and the <span class="key-term">kernel</span> crate, the ownership and locking abstractions, and the real drivers already merged.</li>
+<li><span class="key-term">Chapter 27, Kernel Security Infrastructure</span>, describes the layers beyond credentials and the LSM framework: the major security modules, the crypto API, keys and keyrings, integrity measurement and verity, audit, kernel lockdown, and the hardening that protects the kernel from its own bugs on x86_64 and ARM64.</li>
+<li><span class="key-term">Chapter 28, Virtualization: KVM</span>, explains how Linux becomes a hypervisor: the /dev/kvm file-descriptor API, the vCPU run loops on x86 (VMX, SVM) and ARM64 (VHE, nVHE, pKVM), memslots and second-stage page tables, guest_memfd and confidential computing, interrupt and timer virtualization, and the virtio, vhost, and VFIO device paths.</li>
+<li><span class="key-term">Chapter 29, Tracing, Debugging, and Kernel Diagnostics</span>, explains how the kernel reports on itself, from printk, oops and panic handling and the lockup detectors to ftrace's live code patching, tracepoints, kprobes and uprobes, perf_events, the latency tracers, runtime verification and kgdb, on both x86_64 and ARM64.</li>
+<li><span class="key-term">Appendix A, System Startup</span>, follows the machine from power-on through firmware, boot loader, and kernel initialization to the first user process.</li>
+<li><span class="key-term">Appendix B, Kernel Modules</span>, describes how loadable modules extend a running kernel, from linking and signing to their modern roles carrying BTF and livepatches.</li>
+<li><span class="key-term"><a href="source-trails.html">Source Trails</a></span> closes the book with a chapter-by-chapter guide to the Linux 7.0.12 source files worth reading alongside the text.</li>
+</ul>
+
+<h2 id="background">Background Information</h2>
+
+<p class="chapter-intro">
+To get the most from this book, a reader should be fluent in the
+<span class="key-term">C programming language</span>, since every structure and
+function discussed is written in it, and should recognize a little assembly
+language, which appears at the boundaries where the kernel meets the hardware. A
+grounding in <span class="key-term">operating-system concepts</span>—what a
+process is, what virtual memory does, how a filesystem presents files, why
+concurrency requires synchronization—will make the discussion far easier to
+follow; readers new to these ideas will find Chapter 1 a useful orientation but
+may wish to supplement it with an introductory operating-systems text.
+</p>
+
+<p>
+Some familiarity with <span class="key-term">computer architecture</span> is also
+valuable, particularly the notions of privilege levels, memory-management units,
+caches, and interrupts. The book introduces the architecture-specific details of
+x86_64 and ARM64 as they become relevant, but readers who want the full picture of
+either processor will find the vendors' architecture manuals—Intel's and AMD's for
+x86_64, Arm's Architecture Reference Manual for AArch64—to be the authoritative
+references. Above all, the ultimate companion to this book is the
+<span class="key-term">Linux source code itself</span>, which is freely available
+and which the book everywhere invites the reader to consult.
+</p>
+
+<h2 id="conventions">Conventions in This Book</h2>
+
+<p class="chapter-intro">
+The book follows a small set of typographic conventions. <em>Italic</em> is used
+for emphasis and to introduce new terms; important terms also appear as
+<span class="key-term">key terms</span> where they are first defined. A
+constant-width font marks the names of functions, variables, structures, and
+macros drawn from the source—for example <code>task_struct</code>,
+<code>kmalloc</code>, or <code>MODULE_LICENSE</code>—as well as literal command
+lines and code. File and directory paths appear in a distinct style, such as
+<code class="file-path">kernel/sched/core.c</code> or
+<code class="file-path">include/linux/mm.h</code>, always relative to the root of
+the kernel source tree.
+</p>
+
+<p>
+Figures and tables are numbered per chapter (Figure 2-1, Table 8-3, and so on),
+and each is referred to from the surrounding text. Set-off notes call attention to
+subtleties, cross-architecture differences, and points that are easy to
+misunderstand. One convention deserves particular emphasis, because the whole book
+depends on it: every reference to the source code names a specific, fixed version
+of the kernel.
+</p>
+
+<div class="note"><p>All source paths and macro names in this book refer to the Linux 7.0.12 tree at <code class="file-path">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/?h=v7.0.12</code>.
+Where the kernel uses runtime variables instead of preprocessor constants,
+the text calls that out explicitly.</p></div>
+
+<p>
+Pinning every citation to Linux 7.0.12 means that a reader can always follow a
+reference from the page to the exact line of code it describes, in a tree that
+will not shift underneath them. The kernel moves quickly, and details will change
+in later releases; but the structures and algorithms this book explains, and the
+reasoning behind them, are stable enough that understanding them for 7.0.12 is
+understanding them for the kernels that follow. With the conventions established,
+we can begin—Chapter 1 opens with the question of what, exactly, the Linux kernel
+is.
+</p>
+
+</main>
+
+<footer class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>v0.1</p>
+  <p>© 2026 Lianwei Wang. All rights reserved.</p>
+</footer>
+
+</div><!-- .book-container -->
+<script src="assets/progress.js" defer></script>
+</body>
+</html>

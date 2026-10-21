@@ -1,0 +1,2656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Appendix B of Inside the Linux Kernel: Kernel Modules — what modules are, the struct module object and module memory layout, symbol export and versioning, the load and unload pipeline, module signing and compression, on-demand loading, and modern uses such as BTF and livepatch in Linux 7.0.12.">
+  <meta property="og:title" content="Appendix B: Kernel Modules — Inside the Linux Kernel">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <title>Appendix B: Kernel Modules — Inside the Linux Kernel</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Merriweather:ital,wght@0,300;0,400;0,700;1,400&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+</head>
+<body>
+<progress class="chapter-progress" max="100" value="0" aria-hidden="true"></progress>
+<nav class="chapter-nav">
+  <a class="book-title" href="index.html" title="Table of Contents">Inside the Linux Kernel</a>
+  <span class="nav-sep">|</span>
+  <a href="appendix-a.html">&larr; Appendix A</a>
+  <span class="nav-sep">|</span>
+  <a href="#top">Appendix B</a>
+  <span class="nav-sep">|</span>
+  <a href="source-trails.html">Source Trails &rarr;</a>
+</nav>
+<a href="#top" class="back-to-top" aria-label="Back to top">&uarr;</a>
+<div class="book-container" id="top" style="margin-top: 3.5rem;">
+<header class="chapter-header">
+  <div class="chapter-number">Appendix B</div>
+  <h1 class="chapter-title" style="border:none; margin-top:0.5rem;">Kernel Modules</h1>
+  <p class="chapter-subtitle">How Linux 7.0.12 extends a running kernel with loadable code — the struct module object and its memory layout, exporting and versioning symbols, the load and unload pipeline, module signing, compression, and tainting, on-demand loading through modprobe and udev, module parameters, and the modern roles modules play as contributors to other subsystems, carriers of BTF type information, and livepatches.</p>
+</header>
+
+<main class="chapter-body">
+<nav class="toc">
+<h2 id="contents">Contents</h2>
+<ol>
+<li><a href="#whatis">What a Module Is</a>
+  <ul class="toc-sub">
+    <li><a href="#to-be">1.1 To Be a Module or Not to Be</a></li>
+    <li><a href="#loader-jobs">1.2 The Loader's Two Jobs</a></li>
+  </ul>
+</li>
+<li><a href="#anatomy">Anatomy of a Loaded Module</a>
+  <ul class="toc-sub">
+    <li><a href="#struct-module">2.1 The struct module Object</a></li>
+    <li><a href="#memory-layout">2.2 Module Memory Layout</a></li>
+    <li><a href="#metadata">2.3 Module Metadata</a></li>
+  </ul>
+</li>
+<li><a href="#symbols">Symbols: Exporting and Resolving</a>
+  <ul class="toc-sub">
+    <li><a href="#export">3.1 Exporting Symbols</a></li>
+    <li><a href="#namespaces">3.2 Symbol Namespaces</a></li>
+    <li><a href="#versioning">3.3 Symbol Versioning</a></li>
+  </ul>
+</li>
+<li><a href="#loadunload">Loading and Unloading</a>
+  <ul class="toc-sub">
+    <li><a href="#syscalls">4.1 The init_module and finit_module System Calls</a></li>
+    <li><a href="#load-module">4.2 Inside load_module</a></li>
+    <li><a href="#refcount">4.3 Reference Counting and Unloading</a></li>
+  </ul>
+</li>
+<li><a href="#trust">Trust: Signing, Compression, and Tainting</a>
+  <ul class="toc-sub">
+    <li><a href="#signing">5.1 Module Signing</a></li>
+    <li><a href="#compression">5.2 Module Compression</a></li>
+    <li><a href="#tainting">5.3 Tainting</a></li>
+  </ul>
+</li>
+<li><a href="#ondemand">On-Demand Loading and Parameters</a>
+  <ul class="toc-sub">
+    <li><a href="#request-module">6.1 request_module and modprobe</a></li>
+    <li><a href="#aliases">6.2 Aliases, depmod, and Autoloading</a></li>
+    <li><a href="#params">6.3 Module Parameters</a></li>
+  </ul>
+</li>
+<li><a href="#infra">Modules as Kernel Infrastructure</a>
+  <ul class="toc-sub">
+    <li><a href="#btf">7.1 Module BTF</a></li>
+    <li><a href="#livepatch">7.2 Livepatch</a></li>
+  </ul>
+</li>
+<li><a href="#appendix-summary">Summary</a></li>
+</ol>
+</nav>
+
+<p class="chapter-intro">
+Chapter 1 introduced <span class="key-term">modules</span> as Linux's way of gaining
+many of the structural advantages of a microkernel—optional, replaceable
+components—without paying the performance cost of running them as separate
+processes. A module is a piece of kernel code, compiled separately, that can be
+loaded into and unloaded from a running kernel on demand, executing in kernel mode
+with full access to the kernel's data structures once it is linked in. This appendix
+examines how that mechanism works in Linux 7.0.12, roughly in the order a module
+encounters it. It begins with what a module is—how one is built, the build-time
+choice between built-in and modular code, and the two jobs, linking and lifetime
+management, that the loader must perform (&sect;1)—and then dissects a module's
+anatomy: the <code>struct module</code> descriptor, the typed memory regions the
+loader carves out for code and data, and the <code class="file-path">.modinfo</code>
+metadata that describes it (&sect;2). Next come the symbols that bind module and
+kernel together—exports, namespaces, and the version checksums that guard binary
+compatibility (&sect;3)—and the system calls and states through which a module is
+loaded, reference-counted, and removed (&sect;4). The kernel's defenses follow:
+cryptographic signatures, in-kernel decompression, and the taint flags that record
+anything it cannot vouch for (&sect;5); then the machinery that loads modules
+automatically when hardware or a feature calls for them, and the parameters that
+configure them (&sect;6); and finally the infrastructure that has turned modules
+from a device-driver packaging convenience into a general vehicle for extending the
+kernel, contributing tracing hooks, test suites, and BPF type information to other
+subsystems, and even delivering live patches for the running kernel itself
+(&sect;7). Where Linux 2.6.11 had a simpler world of <code>insmod</code>
+and a single <code class="file-path">kernel/module.c</code>, the 7.0 module
+subsystem lives in its own <code class="file-path">kernel/module/</code> directory,
+takes its memory from the same allocator that serves BPF and kprobes, collapses
+concurrent requests to load the same file into one, accepts post-quantum signatures,
+and loads modules written in Rust (Chapter 26) through the same path as C ones; this
+appendix follows those changes throughout.
+</p>
+
+<hr>
+<h2 id="whatis">What a Module Is</h2>
+
+<p class="chapter-intro">
+Before examining the machinery, it is worth being clear about what a module is,
+what it is good for, and what the kernel must do to support it. A module is not a
+program in the ordinary sense—it has no <code>main</code>, is never a process,
+and cannot run on its own. It is a relocatable object file—an ELF file of type
+<code>ET_REL</code>, which is the first thing the loader checks—that, once loaded,
+becomes an extension of the kernel: its code runs in kernel mode, shares the
+kernel's address space, and calls kernel functions directly. This section
+first follows a module from source file to <code class="file-path">.ko</code>,
+then examines the decision of whether to build code as a module at all (&sect;1.1)
+and the two fundamental jobs the kernel's module loader must perform to make
+loadable code safe (&sect;1.2).
+</p>
+
+<p>
+The design tension modules resolve is the one Chapter 1 framed as monolithic
+versus microkernel. A microkernel gains flexibility by running subsystems as
+separate, isolated servers that communicate by message passing—at the cost of
+crossing a protection boundary on every interaction. Linux keeps the performance
+of a monolithic kernel, where every subsystem shares one address space and calls
+another directly, but recovers much of the microkernel's modularity by letting
+those subsystems be <em>loaded and unloaded at run time</em> rather than compiled
+in permanently. The price of that bargain is that a module, once loaded, enjoys no
+isolation whatsoever: it runs with full kernel privilege and can touch any kernel
+data structure, so a buggy module can corrupt the whole system and a malicious one
+can own it. That absence of isolation is precisely why the later sections devote
+so much attention to a module's provenance—its license, its signature, its version
+compatibility—for the kernel's only real defense is to be careful about what it
+agrees to load in the first place.
+</p>
+
+<p>
+Concretely, a module begins as ordinary kernel C—or, since Linux 6.1, Rust
+(Chapter 26)—with two distinguished entry points: <code>module_init</code> names
+the function to run when the module is loaded, and <code>module_exit</code> the
+one to run before it is removed (<code class="file-path">include/linux/module.h</code>).
+A license declaration is mandatory—since Linux 5.11 the build fails for any
+module that omits <code>MODULE_LICENSE</code>—and since 6.5 a missing
+<code>MODULE_DESCRIPTION</code> draws a warning. The kernel's build system,
+Kbuild, compiles each object named on an <code>obj-m</code> line (a module built
+from several files lists its parts in a <code>foo-y</code> line) and then runs
+the <code>modpost</code> tool over the results. <code>modpost</code> checks every
+module's imports against the exports of <code>vmlinux</code> and of the other
+modules, and writes a small generated source file,
+<code class="file-path">foo.mod.c</code>, that defines the module's descriptor—a
+<code>struct module</code> named <code>__this_module</code>, placed in the
+<code class="file-path">.gnu.linkonce.this_module</code> section where the loader
+will look for it—together with the module's export table, version CRCs, device
+aliases, and list of the modules it depends on. The final link
+(<code class="file-path">scripts/Makefile.modfinal</code>) combines
+<code class="file-path">foo.o</code>, the compiled
+<code class="file-path">foo.mod.o</code>, and a shared
+<code class="file-path">.module-common.o</code> carrying the version-magic string
+(compiled once per build rather than once per module since Linux 6.12) under the
+linker script <code class="file-path">scripts/module.lds</code>, and the result is
+<code class="file-path">foo.ko</code>. Finally, <code>make modules_install</code>
+copies the <code class="file-path">.ko</code> files under
+<code class="file-path">/lib/modules/</code><em>release</em> and runs
+<code>depmod</code> to build the index files that &sect;6 relies on. A driver
+maintained outside the kernel tree is built the same way, against an installed
+kernel's build directory, with <code>make -C /lib/modules/$(uname -r)/build
+M=$PWD</code>.
+</p>
+
+<h3 id="to-be">To Be a Module or Not to Be</h3>
+
+<p>
+When a kernel developer adds new functionality, they face a basic choice: compile
+it as a module, or statically link it into the kernel image. As a rule, code that
+can be a module is written as one. Because modules load on demand, the kernel
+image stays small and boots quickly, carrying only what a given machine actually
+needs; the thousands of drivers a distribution ships sit as
+<code class="file-path">.ko</code> files on disk, and only the few matching the
+hardware present are ever loaded. Nearly every higher-level component—filesystems,
+device drivers, network protocols, executable-format handlers—can be built
+modular, which is why a stock distribution kernel is a small core surrounded by a
+large library of loadable parts.
+</p>
+
+<p>
+Some code, however, must be linked statically. The classic reason is that a
+module cannot change a data structure or a piece of machine code that the
+statically linked kernel has already fixed in memory. Code that must add a field
+to <code>task_struct</code>, or replace the page allocator, cannot be a module:
+the rest of the kernel was compiled against the original definitions and would
+not see the change. There is also a deliberate policy dimension. Some core
+facilities are kept non-modular precisely so that they cannot be supplanted by a
+proprietary binary-only replacement—a software-freedom decision rather than a
+technical one, enforced through the license and symbol machinery of &sect;3 and
+&sect;5. The practical upshot is that the module boundary falls where code can be
+cleanly added or removed at run time without disturbing the kernel's fixed
+foundations.
+</p>
+
+<p>
+In practice the choice is expressed directly in the kernel's configuration
+system, where most components are <span class="key-term">tristate</span>: each can
+be built into the kernel image (<code>=y</code>), built as a loadable module
+(<code>=m</code>), or omitted entirely (<code>=n</code>). The core scheduler and
+the page allocator are not optional at all, and features that reshape the core
+kernel rather than plug into it—SMP support, swapping, the networking core—are
+offered only as plain booleans, on or off. A crucial point, and the reason modules are chosen so
+freely, is that building a component as a module costs almost nothing at run time:
+once loaded and relocated, its functions are called exactly as if they had been
+compiled in, with none of the boundary-crossing overhead a microkernel's separate
+servers would incur. The one real caveat is bootstrapping. A driver needed to
+reach the root filesystem itself—the disk or storage controller—cannot be an
+ordinary module sitting on that very filesystem, so it is either built in or
+placed in the initramfs that Appendix A described, the small early root image from
+which such modules are loaded before the real root is mounted.
+</p>
+
+<p>
+The third state is itself switchable. The <code>MODULES</code> option
+(<code class="file-path">kernel/module/Kconfig</code>) carries Kconfig's special
+<code>modules</code> attribute, and in a kernel configured without it every
+tristate collapses to a boolean—there is no <code>m</code> to choose. The
+dependency rules respect the same hierarchy: an option that depends on another
+set to <code>m</code> can itself be only <code>m</code> or <code>n</code>, because
+code linked into the kernel image cannot call into a module that might never be
+loaded. Linux 7.0.12 declares nearly twelve thousand tristate options. Choosing
+<code>y</code> does not erase a component's identity as a module, either. The same
+source serves both builds: compiled in, <code>module_init</code> becomes an
+ordinary device-level initcall that runs during boot (Appendix A, &sect;6.2), and
+<code>module_exit</code> is discarded, because built-in code can never be
+removed. The build records every built-in "module" in
+<code class="file-path">modules.builtin</code>, with its metadata in
+<code class="file-path">modules.builtin.modinfo</code>, so that
+<code>modprobe</code> treats a request for a built-in driver as already
+satisfied, and the component's parameters are set on the kernel command line as
+<em>name</em><code>.</code><em>param</em><code>=</code><em>value</em> and, like a
+loaded module's, appear under <code class="file-path">/sys/module/</code><em>name</em><code class="file-path">/parameters</code>
+(&sect;6.3).
+</p>
+
+<p>
+At the far end of the spectrum, a system may decline to load modules at all.
+Building with <code>CONFIG_MODULES</code> disabled removes the loader and its
+system calls from the kernel entirely, a choice favored by small embedded systems
+and hardened appliances whose hardware never changes. A general-purpose kernel can
+reach nearly the same state after boot by loading everything it needs and then
+writing 1 to the one-way <code class="file-path">modules_disabled</code> sysctl
+(&sect;6.1), or can refuse every load from the start with the
+<code>nomodule</code> boot parameter, which sets the same switch. Short of that,
+turning off <code>CONFIG_MODULE_UNLOAD</code> lets modules be loaded but never
+removed (&sect;4.3). Each step trades flexibility for a smaller attack surface,
+and the choice belongs to whoever builds and administers the system.
+</p>
+
+<h3 id="loader-jobs">The Loader's Two Jobs</h3>
+
+<p>
+To turn a relocatable object file into a working part of the kernel, the loader
+has two fundamental responsibilities, and almost everything else in this appendix
+is in service of one or the other. The first is
+<span class="key-term">linking</span>: a module refers to kernel functions and
+variables by name—<code>printk</code>, <code>kmalloc</code>, and so on—and it in
+turn may offer functions of its own for other modules to call. The loader must
+resolve every symbol the module imports to the address where that symbol actually
+lives, and record the symbols the module exports so that later modules can find
+them. Unlike a user program's dynamic linker, this happens once, at load time:
+<code>simplify_symbols</code> (<code class="file-path">kernel/module/main.c</code>)
+looks up each undefined symbol—waiting up to 30 seconds if the module that exports
+it is itself still initializing—and a reference that cannot be resolved fails the
+load with an "Unknown symbol" message, unless it was declared weak, in which case
+it simply resolves to zero. Once resolved, a module's references are patched into
+place and, apart from the deliberate run-time code patching described below,
+never revisited.
+</p>
+
+<p>
+Patching happens in two steps, because a relocatable object records its
+references indirectly. <code>simplify_symbols</code> writes each resolved address
+into the module's own ELF symbol table; <code>apply_relocations</code> then walks
+the relocation sections—each entry names a location in the module, a symbol, and a
+relocation type—and hands them to the architecture's
+<code>apply_relocate_add</code> (<code class="file-path">arch/x86/kernel/module.c</code>,
+<code class="file-path">arch/arm64/kernel/module.c</code>) to compute and store the
+final values. The relocation types explain a constraint that shapes where modules
+live. x86-64 kernel code, modules included, is compiled with
+<code>-mcmodel=kernel</code> and reaches its callees through 32-bit PC-relative
+displacements (<code>R_X86_64_PC32</code> and <code>R_X86_64_PLT32</code>), which
+span only ±2 GB, so the module area begins immediately above the kernel
+image mapping and ends where the fixmap begins, keeping every module within 2 GB of
+the kernel text it calls. ARM64's direct branch instructions reach only
+±128 MB, so the kernel first tries to place modules in a 128 MB window
+that includes its own text and otherwise falls back to a 2 GB window, in which the
+loader inserts small PLT veneers (<code>module_emit_plt_entry</code>) to bridge
+the longer distances; both windows are randomized when KASLR is active
+(<code class="file-path">arch/arm64/mm/init.c</code>). After relocation, the
+architecture's <code>module_finalize</code> performs on the module the same code
+patching the kernel applied to itself at boot: on x86 it applies CPU alternatives,
+rewrites retpoline and return-thunk call sites, sets up or seals the
+indirect-branch-tracking landing pads, and registers the module's ORC unwind
+tables; on ARM64 it applies alternatives, patches in shadow-call-stack instructions
+when that protection is enabled at boot, and sets up ftrace trampolines. Later
+still, static keys, ftrace, and livepatch (&sect;7.2) may rewrite module text
+again, but always through the kernel's controlled text-patching interfaces rather
+than by revisiting the link.
+</p>
+
+<p>
+The second responsibility is <span class="key-term">lifetime management</span>.
+A module may be in use—its code executing, its data referenced, or another module
+depending on it—and unloading it at such a moment would corrupt the kernel. The
+loader therefore tracks each module through a small set of
+<span class="key-term">states</span> and maintains a
+<span class="key-term">reference count</span> and a dependency graph so that no
+module is removed while anything still needs it. A module progresses from
+<code>MODULE_STATE_UNFORMED</code> (still being set up), through
+<code>MODULE_STATE_COMING</code> (fully formed, running its initializer), to
+<code>MODULE_STATE_LIVE</code> (the normal running state), and finally
+<code>MODULE_STATE_GOING</code> (being removed)—the four values of
+<code>enum module_state</code> (<code class="file-path">include/linux/module.h</code>).
+Figure B-1 shows these states and the operations that move a module between them.
+</p>
+
+<p>
+Linux 2.6.11 had only three of these states—<code>LIVE</code>,
+<code>COMING</code>, and <code>GOING</code>. <code>UNFORMED</code> was added in
+Linux 3.8 to solve a race: the loader wants to publish a module's name early, so
+that a second attempt to load the same module finds the first, but must not let
+anyone resolve symbols against a module whose code is not yet in place.
+An <code>UNFORMED</code> module is therefore on the module list yet invisible to
+symbol lookup—<code>find_symbol</code> skips it. The states are also not purely
+internal. Each transition into <code>COMING</code>, <code>LIVE</code>, or
+<code>GOING</code> is announced on a notifier chain, <code>module_notify_list</code>,
+to which a long list of subsystems subscribe: jump labels and static calls patch
+the new module's code, tracepoints and kprobes track its probe points, and BPF
+records its type information (&sect;7.1). Two subsystems that must act at a
+precise moment are called directly by the loader instead: ftrace, which records
+the module's traceable functions while it is still <code>UNFORMED</code>, and
+livepatch, which applies any pending patch to it just before it becomes
+<code>COMING</code> (&sect;7.2). A module whose initializer fails takes a short
+detour that Figure B-1 compresses into a single arrow: it is marked
+<code>GOING</code> so that those subscribers can undo their work, and
+<code>free_module</code> then returns it to <code>UNFORMED</code> while it is torn
+down, still listed so that a concurrent duplicate load keeps waiting rather than
+racing it.
+</p>
+
+<p>
+It is illuminating to contrast these two jobs with the user-space dynamic linking
+of Chapter 20. Both take a relocatable object with unresolved references and bind
+it to symbols provided elsewhere—but the differences are as telling as the
+similarity. A user program's dynamic linker runs in that program's own private
+address space and may resolve symbols lazily, the first time each is called;
+module loading happens once, eagerly, in the single shared kernel address space,
+and any unresolved symbol aborts the load outright rather than deferring the
+failure. There is no per-process indirection table, because there is only one
+kernel: a resolved reference is simply the callee's real address, patched into the
+caller's code. And lifetime management has no user-space analogue at all. A shared
+library can be left mapped in a process even after nothing uses it, at worst
+wasting memory; a kernel module that were freed while still in use would not waste
+memory but corrupt the kernel, so the loader must actively refuse to remove
+anything that is still referenced. These two jobs—bind the references, and never
+free code that is in use—organize everything the rest of this appendix describes.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 300" role="img" aria-labelledby="figB-1-title" style="max-width:780px; width:100%; height:auto;">
+<title id="figB-1-title">Figure B-1. The Life Cycle of a Module</title>
+<defs><marker id="eb1" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="260" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure B-1. The Life Cycle of a Module</text>
+
+<g font-family="JetBrains Mono,monospace" font-size="11" text-anchor="middle">
+<rect x="60" y="120" width="150" height="48" rx="8" fill="#f1f5f9" stroke="#94a3b8"/><text x="135" y="142" font-weight="700">UNFORMED</text><text x="135" y="158" font-size="8" fill="#64748b">being set up</text>
+<rect x="290" y="120" width="150" height="48" rx="8" fill="#fef9c3" stroke="#ca8a04"/><text x="365" y="142" font-weight="700">COMING</text><text x="365" y="158" font-size="8" fill="#64748b">running init</text>
+<rect x="520" y="120" width="150" height="48" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="595" y="142" font-weight="700">LIVE</text><text x="595" y="158" font-size="8" fill="#64748b">normal state</text>
+<rect x="520" y="212" width="150" height="44" rx="8" fill="#fee2e2" stroke="#dc2626"/><text x="595" y="232" font-weight="700">GOING</text><text x="595" y="247" font-size="8" fill="#64748b">being removed</text>
+</g>
+<g stroke="#334155" stroke-width="1.4" fill="none">
+<line x1="210" y1="144" x2="290" y2="144" marker-end="url(#eb1)"/>
+<line x1="440" y1="144" x2="520" y2="144" marker-end="url(#eb1)"/>
+<line x1="595" y1="168" x2="595" y2="212" marker-end="url(#eb1)"/>
+</g>
+<g font-family="JetBrains Mono,monospace" font-size="9" fill="#334155" stroke="none">
+<text x="250" y="112" text-anchor="middle">complete_</text><text x="250" y="136" text-anchor="middle">formation</text>
+<text x="480" y="112" text-anchor="middle">do_init_</text><text x="480" y="136" text-anchor="middle">module</text>
+<text x="655" y="194" text-anchor="start">delete_module</text>
+</g>
+<g stroke="#dc2626" stroke-width="1.3" stroke-dasharray="4 3">
+<path d="M365,168 V196 H135 V168" fill="none" marker-end="url(#eb1)"/>
+</g>
+<text x="250" y="210" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#dc2626" font-style="italic">init failure &#8594; unwind and free</text>
+<text x="430" y="272" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">load_module drives UNFORMED &#8594; COMING &#8594; LIVE; delete_module (with refcount 0) drives LIVE &#8594; GOING</text>
+</svg>
+<figcaption>Figure B-1. The life cycle of a module — load_module builds the module in the UNFORMED state, promotes it to COMING as it runs the module's initializer, and marks it LIVE once initialization succeeds; if the initializer fails the module is unwound and freed. Later, delete_module moves a LIVE module with a zero reference count to GOING and runs its exit function before the memory is released.</figcaption>
+</figure>
+
+<hr>
+<h2 id="anatomy">Anatomy of a Loaded Module</h2>
+
+<p class="chapter-intro">
+A loaded module is not just its code; it is a bundle of code, data, metadata, and
+bookkeeping that the kernel tracks through a single descriptor. This section
+opens that descriptor—the <code>struct module</code> object—then looks at how a
+module's memory is carved into regions with different protections, and finally at
+the self-describing metadata every module carries. Together these determine how
+the kernel sees a module and how it enforces the safety and provenance rules of
+later sections.
+</p>
+
+<p>
+All three have changed substantially since Linux 2.6. The descriptor is no
+longer a separate allocation but a variable compiled into the module itself and
+checked byte-for-byte against the running kernel's own idea of its layout; the
+old pair of core and init areas became seven typed memory regions in Linux 6.4,
+each sealed with its own page protections; and the metadata, once little more
+than a license and an author, now carries the facts that drive namespaces,
+dependencies, and the taints of &sect;5.3. Each of these is decided at build time
+by the compiler and <code>modpost</code> (&sect;1) and merely checked and honored
+by the loader, which is why a module built against one kernel's headers cannot
+simply be dropped into another.
+</p>
+
+<h3 id="struct-module">The struct module Object</h3>
+
+<p>
+Every loaded module is represented by a <code>struct module</code>
+(<code class="file-path">include/linux/module.h</code>), which is linked into a
+global list that <code class="file-path">/proc/modules</code>
+and <code>lsmod</code> report. The structure has grown large, but its fields fall
+into a handful of groups: identity and lifecycle, the exported-symbol tables, the
+module's memory regions, its parameters and init/exit hooks, its reference count
+and dependency lists, and a long tail of optional features (tracepoints, BTF,
+livepatch state, and more) present only when the corresponding kernel option is
+configured. Table B-1 lists the most important fields.
+</p>
+
+<table>
+<caption>Table B-1. Principal fields of struct module</caption>
+<thead>
+<tr><th>Field</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>state</code></td><td>The lifecycle state (UNFORMED, COMING, LIVE, GOING)</td></tr>
+<tr><td><code>list</code></td><td>Links the module into the global list of loaded modules</td></tr>
+<tr><td><code>name</code></td><td>The module's unique name, at most 55 characters (<code>MODULE_NAME_LEN</code> is 56 on 64-bit)</td></tr>
+<tr><td><code>build_id</code></td><td>The module's GNU build ID, printed in stack traces (<code>CONFIG_STACKTRACE_BUILD_ID</code>)</td></tr>
+<tr><td><code>mkobj</code>, <code>holders_dir</code></td><td>The kobject behind <code class="file-path">/sys/module/&lt;name&gt;/</code> and its <code>holders/</code> directory</td></tr>
+<tr><td><code>version</code>, <code>srcversion</code></td><td>Version and source-checksum strings from the module's metadata</td></tr>
+<tr><td><code>syms</code>, <code>crcs</code>, <code>num_syms</code></td><td>The symbols this module exports, and their version CRCs</td></tr>
+<tr><td><code>gpl_syms</code>, <code>gpl_crcs</code>, <code>num_gpl_syms</code></td><td>The GPL-only exported symbols</td></tr>
+<tr><td><code>mem[MOD_MEM_NUM_TYPES]</code></td><td>The module's memory regions, one per memory type (see &sect;2.2)</td></tr>
+<tr><td><code>arch</code></td><td>Architecture-specific state, such as the PLT bookkeeping of ARM64 (&sect;1.2)</td></tr>
+<tr><td><code>extable</code>, <code>num_exentries</code></td><td>The module's exception table, searched when a uaccess or similar fixup faults</td></tr>
+<tr><td><code>percpu</code>, <code>percpu_size</code></td><td>The module's per-CPU variables, allocated separately from <code>mem[]</code></td></tr>
+<tr><td><code>init</code>, <code>exit</code></td><td>The module's initialization and cleanup functions; <code>exit</code> exists only with <code>CONFIG_MODULE_UNLOAD</code></td></tr>
+<tr><td><code>kp</code>, <code>num_kp</code>, <code>args</code></td><td>The module's parameters and the argument string it was loaded with (see &sect;6.3)</td></tr>
+<tr><td><code>taints</code></td><td>Taint bits this module raised (see &sect;5.3)</td></tr>
+<tr><td><code>sig_ok</code></td><td>Whether the module's signature verified, with <code>CONFIG_MODULE_SIG</code> (see &sect;5.1)</td></tr>
+<tr><td><code>refcnt</code>, <code>source_list</code>, <code>target_list</code></td><td>Reference count and the dependency graph, with <code>CONFIG_MODULE_UNLOAD</code> (see &sect;4.3)</td></tr>
+<tr><td><code>kallsyms</code>, <code>core_kallsyms</code></td><td>The module's symbol table, for backtraces and debugging (see &sect;2.2)</td></tr>
+</tbody>
+</table>
+
+<p>
+The structure is annotated <code>__randomize_layout</code>, so the compiler may
+shuffle its field order at build time as a hardening measure—one small sign of
+how much more security-conscious the module subsystem has become since Linux 2.6.11, whose <code>struct module</code> had no such protection. When <code>CONFIG_RANDSTRUCT</code> is enabled the shuffle is driven by
+a per-build seed, and a module compiled with a different seed would see a different
+layout of every randomized structure it shares with the kernel; the seed's hash is
+therefore folded into the module's version magic (&sect;2.3) so that such a
+mismatch is refused rather than silently corrupting memory. Many of the optional
+members, such as the BTF pointers and the livepatch state, correspond directly to
+the modern uses of modules that &sect;7 describes; others—the jump-label, static-call,
+tracepoint, ftrace, kprobe, and KUnit tables—record where the subsystems that
+patch or register a module as it loads (&sect;1.2) should look inside it.
+</p>
+
+<p>
+It is worth distinguishing the descriptor from the module it describes, and it
+is less separate than it looks. The <code>struct module</code> is not allocated
+by the loader at all: it is the <code>__this_module</code> variable that
+<code>modpost</code> emitted into the module's own
+<code class="file-path">.gnu.linkonce.this_module</code> section (&sect;1), so it
+arrives inside the <code class="file-path">.ko</code> already holding the module's
+name and its init and exit pointers. Because it is compiled from the kernel
+headers, its size must match the running kernel's <code>sizeof(struct
+module)</code> exactly, and the loader refuses the module with
+<code>-ENOEXEC</code> when it does not—one of the first and bluntest compatibility
+checks. During loading the section is laid out like any other writable data, so the
+descriptor ends up living in the module's own <code>MOD_DATA</code> region,
+alongside the code and data that the <code>mem[]</code> array describes; that is
+why <code>free_mod_mem</code> releases <code>MOD_DATA</code> last—freeing it frees
+the descriptor too.
+</p>
+
+<p>
+All the loaded descriptors are threaded onto one global list,
+<code>modules</code>, protected by <code>module_mutex</code> for modification and
+traversable under RCU for the many readers that only inspect it. The reverse
+question—which module, if any, contains a given address—is asked constantly, by an
+oops attributing a backtrace frame, by kallsyms, by perf and ftrace, sometimes from
+NMI context, so the kernel answers it without walking the list. Each
+<code>module_memory</code> region carries a node in a latched red-black tree,
+<code>mod_tree</code> (<code class="file-path">kernel/module/tree_lookup.c</code>,
+built in whenever perf events, tracing, or CFI are), and
+<code>__module_address</code> first checks the address against the lowest and
+highest module addresses ever seen and only then searches the tree, a lookup that
+is safe from any context without taking a lock. Much of what the descriptor holds is
+surfaced to user space: <code class="file-path">/proc/modules</code> (which
+<code>lsmod</code> formats) prints one line per module—name, total size, use count,
+the modules that depend on it, a state of <code>Live</code>, <code>Loading</code>, or
+<code>Unloading</code>, the text base address (shown as zero to readers who may not
+see kernel addresses), and any taint letters—while the richer
+<code class="file-path">/sys/module/&lt;name&gt;/</code> tree exposes individual
+fields as files: <code>coresize</code>, <code>initsize</code>,
+<code>initstate</code>, <code>refcnt</code>, <code>taint</code>,
+<code>version</code>, and <code>srcversion</code>, the dependents under
+<code>holders/</code>, the parameters under <code>parameters/</code>, the ELF notes
+under <code>notes/</code>, and the section addresses under <code>sections/</code>,
+readable only by root. That tree is how tools inspect and, where permitted, tune a
+running module, and how a debugger finds where each section landed.
+</p>
+
+<h3 id="memory-layout">Module Memory Layout</h3>
+
+<p>
+A module's code and data are not placed in one undifferentiated block. Modern
+kernels divide a module's memory into several regions by their access needs, so
+that each can be given the tightest possible protection—executable but not
+writable for code, writable but not executable for data, read-only for
+constants. The regions are enumerated by <code>enum mod_mem_type</code>
+(<code class="file-path">include/linux/module.h</code>), and the module descriptor
+holds one <code>struct module_memory</code> slot for each in its
+<code>mem[]</code> array. Table B-2 lists them.
+</p>
+
+<table>
+<caption>Table B-2. Module memory types (enum mod_mem_type)</caption>
+<thead>
+<tr><th>Type</th><th>Holds</th><th>Protection</th></tr>
+</thead>
+<tbody>
+<tr><td><code>MOD_TEXT</code></td><td>The module's executable code</td><td>Read + execute, not writable</td></tr>
+<tr><td><code>MOD_DATA</code></td><td>Writable data</td><td>Read + write, not executable</td></tr>
+<tr><td><code>MOD_RODATA</code></td><td>Read-only constants</td><td>Read-only, not executable</td></tr>
+<tr><td><code>MOD_RO_AFTER_INIT</code></td><td>Data writable during init, then sealed</td><td>Read-only after initialization</td></tr>
+<tr><td><code>MOD_INIT_TEXT</code></td><td>Code needed only during initialization</td><td>Read + execute; freed after init</td></tr>
+<tr><td><code>MOD_INIT_DATA</code></td><td>Data needed only during initialization</td><td>Read + write; freed after init</td></tr>
+<tr><td><code>MOD_INIT_RODATA</code></td><td>Read-only data needed only during init</td><td>Read-only; freed after init</td></tr>
+</tbody>
+</table>
+
+<p>
+This per-type layout, which replaced the older split of a module
+into just a core section and an init section (the change from
+<code>module_layout</code> to <code>module_memory</code> came in Linux 6.4), serves
+two purposes. The first is memory economy: the three <code>INIT</code> regions hold
+code and data used only while the module's initializer runs—one-time setup
+routines, probe tables—and are freed once initialization completes, exactly as the
+kernel frees its own <code>__init</code> code after boot (Appendix A, &sect;7.3).
+The second is hardening. With <code>CONFIG_STRICT_MODULE_RWX</code>—which on both
+x86-64 and ARM64 is not even offered as a choice, but always on—the loader applies
+real page-level protections through the helpers in
+<code class="file-path">kernel/module/strict_rwx.c</code>. In
+<code>complete_formation</code>, before the module enters the COMING state and
+before any of its code runs, <code>module_enable_rodata_ro</code> makes the
+read-only regions read-only, <code>module_enable_data_nx</code> makes every data
+region non-executable, and <code>module_enable_text_rox</code> makes text
+read-execute; only after the initializer returns does
+<code>module_enable_rodata_ro_after_init</code> seal <code>MOD_RO_AFTER_INIT</code>.
+Earlier still, <code>module_enforce_rwx_sections</code> rejects any module that
+contains a section flagged both writable and executable, since no single protection
+could honor it. A bug or attack that tries to write to module code, or execute
+module data, then faults instead of silently succeeding. (Booting with
+<code>rodata=off</code> leaves the read-only data regions writable, for debugging;
+text is still sealed and data still non-executable.)
+</p>
+
+<p>
+How a module's sections come to be distributed across these regions is worth
+seeing, because it explains why the separation is possible at all. A relocatable
+object file is already divided into ELF sections, each tagged with flags
+describing how it is used, and the loader sorts them by those flags:
+<code>layout_sections</code> (<code class="file-path">kernel/module/main.c</code>)
+places executable sections into the text region, writable ones into data,
+read-only ones into rodata, and those marked read-only-after-init into their own
+region, while <code>module_init_layout_section</code> routes any section whose
+name marks it as initialization-only into the matching <code>INIT</code> variant.
+Once the regions are sized, <code>module_memory_alloc</code> obtains each one
+from the kernel's shared <span class="key-term">execmem</span> allocator
+(<code class="file-path">mm/execmem.c</code>)—as <code>EXECMEM_MODULE_TEXT</code>
+for code and <code>EXECMEM_MODULE_DATA</code> for data, so that every architecture
+can steer them into the part of the address space it reserves for modules, the
+same allocator that also places BPF programs, kprobes, and ftrace trampolines.
+Then <code>move_module</code> copies each section's
+contents into its assigned region and records the final address, so that the
+relocation step of &sect;4.2 can patch references to where the code and data
+actually landed. The reason the whole scheme works is that the compiler and
+linker have <em>already</em> segregated code from writable data from constants; the
+loader merely honors that segregation with hardware protections. The
+<code>MOD_RO_AFTER_INIT</code> region is a nice illustration of the payoff: it
+holds data that must be writable while the module initializes—function-pointer
+tables that are filled in once and then never legitimately change—and is sealed
+read-only afterward, the same technique the core kernel uses for its own
+<code>__ro_after_init</code> data to deny attackers a writable target.
+</p>
+
+<p>
+Several regions have a more varied life than Table B-2 suggests. The module's
+symbol table is loaded twice over: the full ELF symbol and string tables are placed
+at the end of <code>MOD_INIT_DATA</code>, while <code>layout_symtab</code>
+(<code class="file-path">kernel/module/kallsyms.c</code>) reserves room at the end
+of <code>MOD_DATA</code> for a trimmed copy holding only the symbols that point into
+core regions; while the initializer runs, <code>mod-&gt;kallsyms</code> points at
+the full table, and <code>do_init_module</code> switches it to
+<code>core_kallsyms</code> under RCU just before the init regions go away (a
+livepatch module keeps every symbol, since its relocations may still need them).
+The init regions themselves are not freed synchronously: <code>do_init_module</code>
+queues them on a list that a work item, <code>do_free_init</code>, releases after an
+RCU grace period, so that a concurrent kallsyms or backtrace walker never touches
+freed memory. When <code>CONFIG_MODULE_UNLOAD</code> is off, a module can never be
+removed, so <code>module_init_layout_section</code> sends its exit sections to the
+init regions too, and they are discarded with them. Two kinds of content live
+outside <code>mem[]</code> altogether. The module's per-CPU variables are allocated
+from a small area reserved for modules in the first per-CPU chunk
+(<code>PERCPU_MODULE_RESERVE</code>, 8 KB on SMP builds), which is why a module
+with large per-CPU data can fail to load with an allocation error long before
+memory is short. And <code>MOD_RO_AFTER_INIT</code> collects more than data
+explicitly marked <code>__ro_after_init</code>: <code>module_mark_ro_after_init</code>
+also routes the module's <code class="file-path">__jump_table</code> and
+<code class="file-path">.static_call_sites</code> sections there, since both are
+fixed up during loading and must never change afterward.
+</p>
+
+<p>
+The allocator underneath has its own architecture-specific twist on x86-64. Since
+Linux 6.15 (a first attempt was reverted before 6.13 shipped), a 64-bit kernel with
+strict module protections takes module text from an execmem <em>ROX cache</em>:
+<code>execmem</code> maps 2 MB huge pages read-only and executable, pre-fills them
+with <code>INT3</code> trap instructions, and carves module text out of them, so
+that many modules share a few large mappings, relieving pressure on the
+instruction TLB and sparing the kernel's direct map the fragmentation that
+per-module 4 KB permission changes cause. Such a region is marked <code>is_rox</code> in its
+<code>module_memory</code>; <code>execmem_alloc_rw</code> temporarily makes it
+writable so the loader can copy and relocate code into it, and
+<code>module_enable_text_rox</code> calls <code>execmem_restore_rox</code> instead of
+the ordinary <code>set_memory_rox</code> to seal it again. ARM64 keeps using
+ordinary page-granular <code>vmalloc</code> mappings for modules. Either way, the
+sizes are visible from user space: <code>coresize</code> and <code>initsize</code>
+under <code class="file-path">/sys/module/&lt;name&gt;/</code> report the total of
+the core and init regions, and the size column of <code>lsmod</code> is the sum of
+every region.
+</p>
+
+<h3 id="metadata">Module Metadata</h3>
+
+<p>
+Alongside its code and data, every module carries a block of self-describing
+<span class="key-term">metadata</span> in a dedicated
+<code class="file-path">.modinfo</code> ELF section. This is where the familiar
+<code>MODULE_LICENSE</code>, <code>MODULE_AUTHOR</code>,
+<code>MODULE_DESCRIPTION</code>, <code>MODULE_VERSION</code>, and
+<code>MODULE_ALIAS</code> declarations end up: each expands, through the
+<code>MODULE_INFO</code> macro (<code class="file-path">include/linux/moduleparam.h</code>),
+into a static, NUL-terminated <code>key=value</code> string deposited in that
+section—since Linux 6.19 with a compile-time check that the value contains no
+embedded NUL, which would otherwise silently truncate it. User-space tools read
+it with <code>modinfo</code>, and the kernel reads it during loading with
+<code>get_modinfo</code> (<code class="file-path">kernel/module/main.c</code>).
+The section is consulted only while loading: the loader clears its
+<code>SHF_ALLOC</code> flag so that it is never copied into the module's memory
+regions, and only the pieces the kernel still needs—the <code>version</code> and
+<code>srcversion</code> strings exposed in sysfs, the imported namespaces, the
+license-derived taints—are extracted and kept. When the same code is built into
+the kernel instead, <code>MODULE_INFO</code> prefixes each key with the module's
+name and the strings collect in the kernel image's own
+<code class="file-path">.modinfo</code>, from which the build produces the
+<code class="file-path">modules.builtin.modinfo</code> file of &sect;1.1.
+</p>
+
+<p>
+Two pieces of this metadata are load-bearing rather than merely informational.
+The <span class="key-term">license</span> string (<code>MODULE_LICENSE</code>) is
+consulted to decide whether the module may use GPL-only symbols and whether
+loading it taints the kernel (&sect;5.3). The <span class="key-term">version
+magic</span>, or <code>vermagic</code>
+(<code class="file-path">include/linux/vermagic.h</code>), is a string encoding the
+kernel release and a set of configuration options that affect binary
+compatibility, which the loader compares against its own to refuse a module built
+for an incompatible kernel. In 7.0 the string is the release followed by
+<code>SMP</code>, <code>preempt</code> or <code>preempt_rt</code>,
+<code>mod_unload</code>, and <code>modversions</code> when those options are set,
+an architecture tag (<code>aarch64</code> on ARM64, nothing on x86-64), and the
+<code>RANDSTRUCT_</code> seed hash of &sect;2.1; it is compiled once per build into
+<code class="file-path">.module-common.o</code> (&sect;1) and linked into every
+module. A mismatch is reported as <code>version magic '…' should be
+'…'</code> and the load fails with <code>-ENOEXEC</code>. One subtlety ties the
+check to &sect;3.3: when the module carries symbol CRCs, <code>same_magic</code>
+skips the release field and compares only the option flags, leaving it to the
+per-symbol checksums—including one for <code>module_layout</code>, a dummy symbol
+whose CRC stands for the layout of <code>struct module</code> itself—to decide
+whether a module from a different release is compatible. The module aliases, in
+turn, are what let the kernel autoload a driver by capability rather than by name,
+the subject of &sect;6.2; most are not written by hand but generated by
+<code>modpost</code> from the driver's <code>MODULE_DEVICE_TABLE</code>. Metadata, in
+short, is not decoration: it is how the kernel decides whether a module may be
+loaded at all and what it is allowed to do.
+</p>
+
+<p>
+The <code class="file-path">.modinfo</code> section carries more than these
+headline fields. Among the most useful is <code>srcversion</code>, an MD4
+digest of the module's source files that <code>modpost</code> computes at build
+time (<code class="file-path">scripts/mod/sumversion.c</code>), which lets a tool
+confirm that a <code class="file-path">.ko</code> on disk was built from exactly the
+sources expected—handy when several similar kernels are installed. The same build
+step records the module's <code>name</code>, a <code>depends</code> list of the
+modules whose symbols it imports, and the <code>intree</code>,
+<code>staging</code>, and <code>test</code> flags that drive the taints of
+&sect;5.3; on x86 a <code>retpoline</code> entry says the module was compiled with
+that Spectre mitigation, and the loader warns when a module lacking it enters a
+kernel that depends on it. (The build ID and build salt, by contrast, travel as
+ELF notes rather than <code class="file-path">.modinfo</code> strings.) A driver
+author can add arbitrary keys with <code>MODULE_INFO</code>—<code>MODULE_FIRMWARE</code>,
+<code>MODULE_SOFTDEP</code>, <code>MODULE_WEAKDEP</code> (added in 6.11, naming modules that may be requested
+at run time, which <code>modprobe</code> does not load but initramfs generators can
+include), and
+<code>MODULE_IMPORT_NS</code> are all thin wrappers around it—and
+<code>MODULE_PARM_DESC</code> documents each parameter. All of it is
+human-readable through the <code>modinfo</code> command, which simply prints the
+section. Finally, it is worth noting that the version checks driven by this
+metadata are strict but not absolute—though the escape is narrower than it is often
+described. A <em>mismatched</em> version magic or symbol CRC is always refused; what
+an administrator can do is ask, with <code>modprobe --force</code> (or its
+finer-grained <code>--force-vermagic</code> and <code>--force-modversion</code>),
+for the module's version records to be ignored, which <code>finit_module</code>
+receives as the flags <code>MODULE_INIT_IGNORE_VERMAGIC</code> and
+<code>MODULE_INIT_IGNORE_MODVERSIONS</code> (&sect;4.1). The kernel then treats the
+module as unversioned, and <code>try_to_force_load</code> admits it only if the
+kernel was built with <code>CONFIG_MODULE_FORCE_LOAD</code>, off by default, raising
+<code>TAINT_FORCED_MODULE</code> (&sect;5.3) when it does. The metadata thus gives
+the kernel firm defaults with a clearly-marked, self-incriminating escape hatch
+rather than an unconditional prohibition.
+</p>
+
+<hr>
+<h2 id="symbols">Symbols: Exporting and Resolving</h2>
+
+<p class="chapter-intro">
+The first of the loader's two jobs—linking—rests entirely on
+<span class="key-term">symbols</span>: the named functions and variables through
+which a module and the kernel refer to one another. This section examines the
+three aspects of that machinery that matter most in a modern kernel: how the
+kernel and modules deliberately <em>export</em> a controlled subset of their
+symbols, how symbols can be grouped into <em>namespaces</em> that a user must
+explicitly opt into, and how symbol <em>versioning</em> guards against loading a
+module built for a subtly different kernel. Together they turn a flat namespace
+of addresses into a governed interface.
+</p>
+
+<p>
+Each of these rules is enforced twice. <code>modpost</code>, the build step of
+&sect;1, already knows every export in the kernel and every symbol each module
+imports, so it rejects most violations—an undefined symbol, a GPL-only symbol in a
+proprietary module, a missing namespace import—before a
+<code class="file-path">.ko</code> is even produced; the loader then repeats the
+checks against the kernel that is actually running, because a module may be
+loaded long after, and far from, the build that made it. The machinery has also
+been rebuilt piece by piece since Linux 2.6: export tables have been
+generated by <code>modpost</code> rather than by the export macros since Linux 6.5,
+namespaces arrived in 5.4 and became string literals in 6.13, per-module exports
+in 6.16, and DWARF-based version checksums in 6.14.
+</p>
+
+<h3 id="export">Exporting Symbols</h3>
+
+<p>
+Not every function in the kernel is available to modules. A symbol becomes usable
+by a module only if it is explicitly <span class="key-term">exported</span>, with
+one of the <code>EXPORT_SYMBOL</code> macros
+(<code class="file-path">include/linux/export.h</code>). Exporting a symbol
+ultimately places a <code>struct kernel_symbol</code> record—pairing the symbol's
+name with its address and namespace—into a special table, and the loader searches
+those tables to resolve a module's imports. There are two principal forms.
+<code>EXPORT_SYMBOL</code> makes a symbol available to any module and its record
+ends up in the <code class="file-path">__ksymtab</code> section;
+<code>EXPORT_SYMBOL_GPL</code> places it instead in
+<code class="file-path">__ksymtab_gpl</code> and restricts it to modules that
+declare a GPL-compatible license. (Two variants added in Linux 2.6.17 and 2.6.18,
+<code>EXPORT_SYMBOL_GPL_FUTURE</code> and <code>EXPORT_UNUSED_SYMBOL</code>, were
+removed again in Linux 5.12.) When a module is
+loaded, <code>simplify_symbols</code> walks its unresolved references and calls
+<code>resolve_symbol</code> (<code class="file-path">kernel/module/main.c</code>),
+which uses <code>find_symbol</code> to search first the kernel's own export
+tables and then those of each already-loaded module, patching each reference to
+the address it finds. A symbol that is not exported simply cannot be named by a
+module, which is how the kernel keeps its vast internal namespace private while
+offering a deliberate, curated interface.
+</p>
+
+<p>
+The <code>_GPL</code> distinction is the technical expression of the licensing
+policy mentioned in &sect;1.1. A module counts as GPL-compatible only if its
+<code>MODULE_LICENSE</code> is one of six exact strings—<code>"GPL"</code>,
+<code>"GPL v2"</code>, <code>"GPL and additional rights"</code>, and the
+<code>"Dual BSD/GPL"</code>, <code>"Dual MIT/GPL"</code>, and
+<code>"Dual MPL/GPL"</code> forms (<code>license_is_gpl_compatible</code>,
+<code class="file-path">include/linux/license.h</code>); anything else marks it
+proprietary and sets <code>TAINT_PROPRIETARY_MODULE</code> on it. For such a module
+<code>resolve_symbol</code> searches with <code>gplok</code> false, so the GPL-only
+tables are simply invisible to it and a reference to one of their symbols fails as
+"Unknown symbol"—and <code>modpost</code> has already refused to build it,
+with the error "GPL-incompatible module foo.ko uses GPL-only symbol", if it was
+compiled in a kernel tree. Kernel developers can therefore mark an interface as
+available only to free software, and a proprietary module that tries to use it
+fails to load. Since Linux 5.9 the rule also closes the obvious loophole of a GPL
+"shim" module that bridges GPL-only functionality and a proprietary one:
+<code>inherit_taint</code> gives any module that imports a symbol from a
+proprietary module the same proprietary taint, so its later GPL-only lookups
+fail, and refuses the import outright if the importer has already used GPL-only
+symbols (tracked in <code>using_gplonly_symbols</code>). This is not merely advisory—it is enforced in
+the resolver—and it is one of the main levers by which the kernel community keeps
+its core interfaces from becoming the foundation of closed derivative works.
+</p>
+
+<p>
+The scale of that curation is worth appreciating. A kernel has hundreds of
+thousands of functions and variables—all visible to <code>kallsyms</code> for
+backtraces—yet only a deliberately chosen fraction is ever exported for modules to
+use: the 7.0.12 tree contains roughly 40,000 export annotations across all its
+architectures and drivers, of which any one configuration builds a part. How those
+annotations become tables changed in Linux 6.5. Today an <code>EXPORT_SYMBOL</code>
+emits nothing but a small record in a discarded
+<code class="file-path">.export_symbol</code> section, naming the symbol's
+license, namespace, and address; <code>modpost</code> reads those records from the
+object files and generates the real table entries itself—into
+<code class="file-path">.vmlinux.export.c</code> for the kernel and into each
+module's <code class="file-path">foo.mod.c</code>—using the
+<code>KSYMTAB_FUNC</code> and <code>KSYMTAB_DATA</code> macros of
+<code class="file-path">include/linux/export-internal.h</code>, which also lets it
+compute the version CRCs of &sect;3.3 and the namespace checks of &sect;3.2 in one
+place. Each entry goes into its own input section named
+<code class="file-path">___ksymtab+</code><em>name</em>, and the linker scripts
+merge them with <code>SORT</code>, so the final tables come out ordered by name and
+resolution at load time is a binary search (<code>bsearch</code> over
+<code>cmp_name</code>, <code class="file-path">kernel/module/main.c</code>) rather
+than a linear scan, which matters when a module imports hundreds of symbols. On
+x86-64 and ARM64, which select <code>CONFIG_HAVE_ARCH_PREL32_RELOCATIONS</code>,
+each <code>struct kernel_symbol</code> (<code class="file-path">kernel/module/internal.h</code>)
+stores its value, name, and namespace as 32-bit offsets relative to the entry
+itself rather than as absolute pointers, halving the table's size on 64-bit
+machines and sparing a relocatable, KASLR-randomized kernel from having to fix up
+tens of thousands of entries at boot.
+</p>
+
+<p>
+Exports can also be constrained or withdrawn as a whole. When a module is loaded,
+<code>verify_exported_symbols</code> refuses it with <code>-ENOEXEC</code> if it
+exports a name that the kernel or another module already exports—<code>modpost</code>
+catches the in-tree case as "exported twice"—so a symbol always has exactly
+one owner, and <code>resolve_symbol</code> records each import with
+<code>ref_module</code>, the dependency link that keeps the owner from being
+unloaded while the importer is present (&sect;4.3). For an embedded system whose
+complete set of modules is known, <code>CONFIG_TRIM_UNUSED_KSYMS</code> goes
+further and drops from the export tables every symbol that no in-tree module
+uses (with <code>CONFIG_UNUSED_KSYMS_WHITELIST</code> naming any that must stay),
+shrinking the image, giving the compiler more freedom to optimize, and narrowing
+the interface an attacker-supplied module could reach. The everyday path is the
+automatic resolution just described, but the kernel also offers
+<code>symbol_get</code> for the rare case where code must look up an exported symbol
+by name at run time and take a reference to the module providing it—used, for
+instance, when an optional dependency is resolved dynamically rather than at load,
+and released with <code>symbol_put</code>. Since Linux 6.6
+<code>__symbol_get</code> works only on GPL-only exports, so that the dynamic route
+cannot be used to sidestep the licensing rule above.
+</p>
+
+<h3 id="namespaces">Symbol Namespaces</h3>
+
+<p>
+As the number of exported symbols grew into the tens of thousands, a flat export
+namespace became unwieldy, and a newer mechanism—<span class="key-term">symbol
+namespaces</span>, added in Linux 5.4—was introduced to bring order to it. A symbol
+can be exported <em>into</em> a named namespace with <code>EXPORT_SYMBOL_NS</code>
+or <code>EXPORT_SYMBOL_NS_GPL</code>, and a module that wishes to use such a symbol
+must explicitly declare its intent with <code>MODULE_IMPORT_NS</code>
+(<code class="file-path">include/linux/module.h</code>), which simply adds an
+<code>import_ns=</code> string to its <code class="file-path">.modinfo</code>. If
+it does not, the loader refuses to resolve the symbol: <code>resolve_symbol</code>
+calls <code>verify_namespace_is_imported</code>
+(<code class="file-path">kernel/module/main.c</code>), which compares the
+namespace recorded in the symbol's <code>struct kernel_symbol</code> with the
+module's imports and fails the load with <code>-EINVAL</code> and a message naming
+the missing namespace. A kernel built with
+<code>CONFIG_MODULE_ALLOW_MISSING_NAMESPACE_IMPORTS</code> downgrades both this
+check and <code>modpost</code>'s (through its <code>-N</code> flag) to a warning—there
+is, as the option's own help text admits, no technical reason to insist on the
+import—but the default is to enforce it.
+</p>
+
+<p>
+The purpose is not access control but <span class="key-term">clarity of
+dependency</span>. By grouping, say, all the internal interfaces of a subsystem
+into a namespace, maintainers make it visible—both to reviewers and in the
+module's own metadata—exactly which modules reach into that subsystem's internals,
+and they can require a deliberate opt-in before a new caller does so. It is a
+governance tool layered on top of the export mechanism, turning "this symbol is
+exported to everyone" into "this symbol is exported to those who explicitly ask
+for its namespace," and it did not exist in Linux 2.6 at all.
+</p>
+
+<p>
+The mechanism is convenient in practice because most of it is automatic. A source
+file can set <code>DEFAULT_SYMBOL_NAMESPACE</code>
+(<code class="file-path">include/linux/export.h</code>) so that all its exports
+land in one namespace without annotating each, and the enforcement happens as
+early as the build: <code>modpost</code> checks, while assembling a module, that
+every namespaced symbol it uses is matched by a <code>MODULE_IMPORT_NS</code>, and
+fails the build with a message naming the namespace to add if one is missing. A
+developer can even let the build fix the problem: <code>make nsdeps</code> runs
+<code>modpost</code> in a mode that records each module's missing namespaces in
+<code class="file-path">modules.nsdeps</code>, and the
+<code class="file-path">scripts/nsdeps</code> script then inserts the matching
+<code>MODULE_IMPORT_NS</code> lines into the source files—the tool maintainers used
+when they first moved existing exports into namespaces. The same imports are
+recorded in the module's <code class="file-path">.modinfo</code> (visible as
+<code>import_ns</code> in <code>modinfo</code> output) and re-checked at load. A
+representative use is a subsystem that walls off its internal helpers—USB storage,
+for example, exports its internals into the <code>USB_STORAGE</code> namespace so
+that only its own sub-drivers, which explicitly import it, may call them—and some
+namespaces cover widely used cross-subsystem interfaces instead, such as
+<code>DMA_BUF</code>, which some forty files in the 7.0.12 tree import to share
+buffers between devices. Well over two hundred distinct namespaces are imported
+somewhere in the tree, each an otherwise invisible web of dependencies made
+explicit and reviewable.
+</p>
+
+<p>
+Two refinements have arrived recently. Since Linux 6.13 the namespace argument is
+an ordinary string literal—a module writes <code>MODULE_IMPORT_NS("USB_STORAGE")</code>
+rather than a bare identifier—which makes namespaces easy to search for and lets
+the macros be composed. And Linux 6.16 added a narrower form, now spelled
+<code>EXPORT_SYMBOL_FOR_MODULES(sym, "mods")</code>, for an interface meant for one
+or two named consumers rather than a whole subsystem: it exports the symbol GPL-only
+into an implicit namespace spelled <code>module:</code> followed by a
+comma-separated list of permitted module names, where a trailing <code>*</code>
+matches a prefix. <code>verify_module_namespace</code>
+(<code class="file-path">kernel/module/main.c</code>) lets exactly those modules
+resolve the symbol without any import declaration, and the loader rejects with
+<code>-EPERM</code> any module that tries to gain access by naming a
+<code>module:</code> namespace in <code>MODULE_IMPORT_NS</code>. The
+memory-management core uses it, for example, to offer
+<code>filemap_flush_nr</code> to btrfs alone and its task-memory-policy helpers to
+KVM alone—an export that is, in effect, a private handshake between two named
+parts of the kernel.
+</p>
+
+<h3 id="versioning">Symbol Versioning</h3>
+
+<p>
+A module is compiled separately from the kernel it will run in, which raises a long-standing hazard: if the kernel's data structures or
+function signatures have changed since the module was built, loading it could
+corrupt memory in ways no relocation would catch. Linux guards against this with
+two complementary checks. The coarser is the <span class="key-term">version
+magic</span> described in &sect;2.3: <code>check_modinfo</code> compares the
+module's <code>vermagic</code> string against the kernel's and, unless they agree
+on the compatibility-critical options—and, for a module without symbol versions,
+on the exact kernel release as well—refuses the module. The finer-grained check is
+<span class="key-term">symbol versioning</span>, enabled by
+<code>CONFIG_MODVERSIONS</code>.
+</p>
+
+<p>
+Under modversions the build computes, for every exported symbol, a
+<span class="key-term">CRC</span> that captures the layout of its arguments and
+of every type they transitively reference—effectively a checksum of the symbol's
+binary interface, traditionally produced by the <code>genksyms</code> tool from
+the preprocessed C source. These CRCs are
+stored beside the kernel's exported symbols, in the
+<code class="file-path">__kcrctab</code> and
+<code class="file-path">__kcrctab_gpl</code> tables that parallel the symbol tables
+entry for entry, and, for the symbols a module imports, in its
+<code class="file-path">__versions</code> section. At load time
+<code>check_version</code> (<code class="file-path">kernel/module/version.c</code>)
+compares the two as part of resolving each symbol: if the CRC the module was built
+against differs from the kernel's current CRC for that symbol, the interface has
+changed incompatibly, the kernel logs "disagrees about version of symbol", and
+the module is rejected. A related check, <code>check_modstruct_version</code>,
+verifies the layout of <code>struct module</code> itself. Together, version magic
+and per-symbol CRCs let a distribution ship modules that load only on kernels
+with which they are genuinely binary-compatible, and fail cleanly rather than
+dangerously otherwise.
+</p>
+
+<p>
+The CRCs travel through the build in a way that explains how external modules can
+be versioned at all. <code>genksyms</code> runs as each object file is compiled and,
+since Linux 5.19, records its results as <code>#SYMVER</code> lines in the object's
+<code class="file-path">.cmd</code> file; <code>modpost</code> collects them,
+emits the <code class="file-path">__kcrctab</code> entries with the
+<code>SYMBOL_CRC</code> macro, writes a <code>__versions</code> array of name and
+CRC pairs for each module's imports into its
+<code class="file-path">foo.mod.c</code>, and dumps every export—CRC, name,
+owning module, export type, and namespace, one per line—into
+<code class="file-path">Module.symvers</code>. That file is the contract an
+out-of-tree build relies on: <code>make M=</code> reads the kernel's
+<code class="file-path">Module.symvers</code> (plus any listed in
+<code>KBUILD_EXTRA_SYMBOLS</code> for other external modules) to learn the CRCs
+and namespaces of the symbols it imports, and distributions that promise a stable
+kernel ABI compare successive <code class="file-path">Module.symvers</code> files to
+detect breakage. The <code>struct module</code> check works the same way through a
+trick: <code>module_layout</code> is an empty exported function whose parameters
+are pointers to <code>struct module</code>, <code>struct modversion_info</code>,
+<code>struct kernel_param</code>, <code>struct kernel_symbol</code>, and
+<code>struct tracepoint</code>, so its CRC changes whenever any of those core
+loader structures does, and every versioned module carries an entry for it. A
+symbol for which the module carries no version at all is accepted with a one-time
+"no symbol version" warning, on the assumption of a broken toolchain rather
+than a mismatch.
+</p>
+
+<p>
+It helps to see why both checks exist rather than one. The version magic is a blunt
+instrument: it bundles the kernel release with a handful of options that change the
+<em>calling environment</em> so pervasively that no module built against a different
+setting can be trusted—whether the kernel is SMP, whether it is preemptible, the
+module ABI in use. A mismatch there means the module and kernel disagree about
+fundamentals, so it is refused wholesale. Per-symbol CRCs are the scalpel: they let
+a module built for one kernel load on a <em>later</em> one as long as every
+interface it actually touches is byte-for-byte compatible, which is exactly what
+lets a distribution ship a third-party driver that keeps working across a minor
+kernel update that changed unrelated internals. The checks are heuristics, not
+proofs—a behavioral change that leaves every type layout intact would slip past a
+CRC—but they reliably catch the structural breakages that cause the worst
+corruption. They can be waived only through the forced load that &sect;2.3
+described, which treats the module as unversioned—and, as &sect;5.1 explains, as
+unsigned—is honored only under <code>CONFIG_MODULE_FORCE_LOAD</code>, and leaves the
+<code>TAINT_FORCED_MODULE</code> mark behind.
+</p>
+
+<p>
+Linux 6.14 reworked how these checksums are produced and stored, largely to make
+room for Rust. Because <code>genksyms</code> parses C, it cannot compute a CRC for
+a symbol defined in Rust code; the alternative <code>gendwarfksyms</code>
+(<code class="file-path">scripts/gendwarfksyms/</code>), chosen with
+<code>CONFIG_GENDWARFKSYMS</code>, derives the same type fingerprint from the DWARF
+debugging information the compiler emits, which works for any language, and a
+kernel that combines Rust with <code>CONFIG_MODVERSIONS</code> must use it (the
+<code>RUST</code> option depends on it and selects extended versions). It has
+requirements of its own—full, unsplit DWARF debug information, and no LTO, since
+it reads ordinary ELF objects—and, built with <code>KBUILD_GENDWARFKSYMS_STABLE</code>, it
+honors annotations (sketched in
+<code class="file-path">scripts/gendwarfksyms/examples/kabi.h</code>) that let a
+distribution reserve padding or declare a changed field ABI-neutral, so that its
+stable-ABI kernels can evolve without changing the CRCs their partners' modules
+were built against. The classic <code class="file-path">__versions</code> table,
+meanwhile, stores each entry as a fixed 64-byte <code>struct modversion_info</code>
+that leaves room for a name of at most 55 characters—far too short for Rust's
+mangled symbol names—so <code>CONFIG_EXTENDED_MODVERSIONS</code> adds a
+variable-length encoding in a pair of sections,
+<code class="file-path">__version_ext_names</code> and
+<code class="file-path">__version_ext_crcs</code>, which <code>check_version</code>
+consults in preference to the old table when present.
+<code>CONFIG_BASIC_MODVERSIONS</code>, on by default, keeps emitting the old table
+alongside, so that older <code>modprobe</code> and kmod tools can still read a
+module's versions. Chapter 26 shows how a Rust module is built against this
+machinery.
+</p>
+
+<hr>
+<h2 id="loadunload">Loading and Unloading</h2>
+
+<p class="chapter-intro">
+With the vocabulary of symbols, memory, and metadata in place, we can follow a
+module through its life: from the system call that hands the kernel a blob of
+bytes, through the pipeline that turns that blob into running code, to the
+reference counting that decides when it may be removed. This section traces the
+load path in <code class="file-path">kernel/module/main.c</code>, the largest and
+most intricate file in the module subsystem, and then the unload path that
+reverses it.
+</p>
+
+<p>
+Much of this path has been rebuilt since Linux 2.6.11. That kernel offered
+only <code>init_module</code>, and removing a module froze every other CPU with
+<code>stop_machine</code> so that its per-CPU reference counts could be summed
+safely. <code>finit_module</code> arrived in Linux 3.8; the option that let
+<code>rmmod</code> wait for a busy module's users to go away was removed in 3.13;
+<code>stop_machine</code> left the unload path in 3.19, replaced by a single atomic
+counter; in-kernel decompression came in 5.17; the loader moved from the single
+file <code class="file-path">kernel/module.c</code> into the
+<code class="file-path">kernel/module/</code> directory in 5.19; and since 6.4 and
+6.5 the kernel collapses duplicate loads of the same module before they cost any
+memory. All three system calls involved—<code>init_module</code>,
+<code>finit_module</code>, and <code>delete_module</code>—first require
+<code>CAP_SYS_MODULE</code> and fail with <code>-EPERM</code> once the one-way
+<code>modules_disabled</code> sysctl of &sect;1.1 has been set, and the loader and
+<code>delete_module</code> both record the module's name in the audit log.
+</p>
+
+<h3 id="syscalls">The init_module and finit_module System Calls</h3>
+
+<p>
+User space asks the kernel to load a module through one of two system calls. The
+original, <code>init_module</code>
+(<code class="file-path">kernel/module/main.c</code>), takes the entire module
+image in a user-space buffer, which <code>copy_module_from_user</code> copies into
+kernel memory after asking the security modules, through
+<code>security_kernel_load_data</code>, whether loading from a bare buffer is
+allowed at all. The newer and now preferred <code>finit_module</code> takes
+instead a <em>file descriptor</em> for the module file, which must be open for
+reading, and lets the kernel read the file itself—important because it allows the
+kernel to check a signature or apply an authenticity policy against the actual
+file—and it accepts a <span class="key-term">flags</span> argument. Those flags—
+<code>MODULE_INIT_IGNORE_MODVERSIONS</code> (1),
+<code>MODULE_INIT_IGNORE_VERMAGIC</code> (2), and
+<code>MODULE_INIT_COMPRESSED_FILE</code> (4, since Linux 5.17)—let the caller
+relax the version checks of &sect;3.3 (honored only in a kernel built with
+<code>CONFIG_MODULE_FORCE_LOAD</code>, &sect;2.3) or declare that the file is
+compressed and must be decompressed first (&sect;5.2); any other bit is refused
+with <code>-EINVAL</code>. Both calls also take a string of parameters, such as
+<code>"debug=1 max_ports=4"</code>, which the loader parses against the module's
+declared parameters once it is linked (&sect;6.3). Tools such as
+<code>insmod</code> and <code>modprobe</code> are thin wrappers over these
+calls—a current kmod's <code>modprobe</code> uses <code>finit_module</code>, and
+passes the compressed-file flag when <code class="file-path">/sys/module/compression</code>
+shows that the kernel can decompress the module's format itself—and almost all of
+the real work happens in the common back end, <code>load_module</code>, that both
+invoke.
+</p>
+
+<p>
+The reason <code>finit_module</code> is now preferred goes beyond convenience.
+Because the kernel reads the file itself—through the
+<code>kernel_read_file</code> path (<code class="file-path">include/linux/kernel_read_file.h</code>),
+with the purpose tagged <code>READING_MODULE</code> or
+<code>READING_MODULE_COMPRESSED</code>—it can subject the load to the same
+file-based security machinery as any other sensitive read: an LSM can veto it
+(LoadPin, for instance, admits modules only from the filesystem that supplied the
+first one), an integrity-measurement policy (IMA) can measure and appraise the
+file, and kernel lockdown can forbid loading unsigned modules entirely. Passing a
+buffer, as <code>init_module</code> does, hides the file's identity from those
+checks, which is why such policies typically refuse <code>init_module</code>
+outright. The fd-based call also makes concurrent loads cheap. Since Linux 6.5,
+<code>idempotent_init_module</code> treats loads of the same file as
+<span class="key-term">idempotent</span>, keyed on the file's inode: the first
+caller performs the load, and every concurrent caller for the same inode, rather
+than reading, decompressing, and allocating its own copy, waits for that load
+(interruptibly, since 6.11) and returns its result. The motivation was boot on very
+large machines, where user space could fire the same module request once per CPU
+and hundreds of simultaneous copies of one module exhausted the kernel's
+<code>vmalloc</code> space before all but one were thrown away. Either system
+call returns to user space only <em>after</em> the module's own initializer has
+run, so a failure inside the module's <code>init</code> propagates all the way back
+as the error code from <code>insmod</code> or <code>modprobe</code>.
+</p>
+
+<h3 id="load-module">Inside load_module</h3>
+
+<p>
+<code>load_module</code> is where a flat image becomes a live module, and it runs
+a long, ordered pipeline whose stages mirror the concepts of the previous
+sections. Its first act, before it trusts a single byte of the image, is to verify
+the module's signature (<code>module_sig_check</code>, &sect;5.1), which needs only
+the length of the file and strips the appended signature from it. Only then does
+<code>elf_validity_cache_copy</code>—split in Linux 6.13 into a series of small
+checkers for the ELF header, the section table, the string tables, and the symbol
+table—confirm that every offset and size in the image stays inside the buffer, and
+record where the interesting sections lie: <code class="file-path">.modinfo</code>,
+<code class="file-path">__versions</code>, the symbol table, and the
+<code class="file-path">.gnu.linkonce.this_module</code> copy of
+<code>struct module</code> (&sect;2.1). <code>early_mod_check</code> then applies the
+cheap policy tests while the module still exists only as a temporary copy: a name
+listed in the <code>module_blacklist=</code> boot parameter (Linux 4.8) is refused
+with <code>-EPERM</code>, <code>check_modstruct_version</code> and
+<code>check_modinfo</code> compare the version magic, license, and other metadata
+of &sect;2.3, and a module that is already loaded or loading is turned away before
+a single page is allocated. Only a module that has passed all of that reaches
+<code>layout_and_allocate</code>, which assigns its sections to the memory regions
+of &sect;2.2, allocates those regions, and copies the sections into them.
+</p>
+
+<p>
+From there the module is real. <code>add_unformed_module</code> registers it in the
+<code>UNFORMED</code> state so that concurrent loaders see it,
+<code>module_augment_kernel_taints</code> applies the taints its metadata calls for
+(&sect;5.3), its per-CPU area and unload bookkeeping are set up, and the special
+sections—exports, parameters, exception tables, tracepoints, and dozens more—are
+located. Then the linking of &sect;3 happens: <code>simplify_symbols</code> resolves
+every imported symbol, <code>apply_relocations</code> patches the code to its final
+addresses, and <code>post_relocation</code> sorts the exception table, copies in
+the initial per-CPU data, builds the module's kallsyms tables, and lets the
+architecture finish the job in <code>module_finalize</code> (&sect;1.2), after which
+the instruction cache is flushed—a no-op on x86-64, whose caches are coherent, but
+essential on ARM64, where instruction fetch need not see freshly written data.
+With linking done, <code>complete_formation</code> rejects duplicate exports,
+applies the RWX protections of &sect;2.2, and flips the module to
+<code>COMING</code>; <code>prepare_coming_module</code> then enables its ftrace
+call sites, lets livepatch apply any pending patches to it (&sect;7.2), and calls
+the module notifier chain, any member of which may veto the load. Only now, with
+the module's code executable, are its parameters parsed—a parameter's setter can
+be a module function—and its <code class="file-path">/sys/module</code> directory
+created, and finally <code>do_init_module</code> calls the module's own
+initializer and, on success, marks it <code>LIVE</code>—freeing the
+<code>INIT</code> regions afterward. Figure B-2 shows the pipeline.
+</p>
+
+<p>
+Two things about this pipeline are easy to miss but important. The first is
+<span class="key-term">concurrency</span>. The duplicate check runs twice: once in
+<code>early_mod_check</code>, before any memory is committed (since Linux 6.4), and
+again in <code>add_unformed_module</code>, which publishes the module's name under
+<code>module_mutex</code> before the expensive work begins. Both use
+<code>module_patient_check_exists</code>: if an instance of the same name is still
+<code>UNFORMED</code> or <code>COMING</code>, the newcomer waits on
+<code>module_wq</code> until that instance either goes live or fails, and then gives
+up—with <code>-EEXIST</code> if it went live, <code>-EBUSY</code> if it did not,
+since loading the same failing module again at once would only fail the same way—so
+two loads of the same code never proceed in parallel. Together with the
+inode-keyed idempotency of &sect;4.1, this lets a burst of identical requests
+collapse into one load. The second is <span class="key-term">failure
+handling</span>. The pipeline can fail at almost any stage—a bad signature, an
+unresolved symbol, a notifier veto, an <code>init</code> that returns an error—and
+<code>load_module</code>'s error labels unwind in exactly the reverse order of the
+setup: a module that had reached <code>COMING</code> is moved to
+<code>GOING</code> and announced to the notifier chain again so that subscribers
+can undo whatever they did, the module is unlinked from the module list, and an
+RCU grace period passes before its memory is released, because kallsyms or a stack
+unwinder may be reading it concurrently. A rejected load thus leaves no trace
+beyond a counter: with <code>CONFIG_MODULE_STATS</code> (Linux 6.4),
+<code class="file-path">/sys/kernel/debug/modules/stats</code> tallies failed loads
+and the memory they wasted, a tool for spotting a user space that loads modules it
+should not.
+</p>
+
+<p>
+The last stage, <code>do_init_module</code>, is where the module first runs. It
+calls any compiler-generated constructors (<code>do_mod_ctors</code>, used by
+coverage instrumentation), then the module's <code>init</code> function through
+<code>do_one_initcall</code>—the same wrapper that runs built-in initcalls, so
+<code>initcall_debug</code> times module initializers too—in the context of the
+process that issued the system call. A negative return fails the load; a positive
+one, a common bug, draws a warning and is treated as success. The module then
+becomes <code>LIVE</code>, the notifier chain hears
+<code>MODULE_STATE_LIVE</code>, and only now is the <code>KOBJ_ADD</code> uevent
+for its <code class="file-path">/sys/module</code> directory sent, so that udev
+never reacts to a module whose initialization might still fail. Unless the module
+asked for asynchronous probing—with its own <code>async_probe</code> parameter or,
+since Linux 6.0, the <code>module.async_probe=</code> default for all modules—the
+loader next waits in <code>async_synchronize_full</code> for any asynchronous work
+the initializer started, so that a driver's devices have been probed by the time
+<code>modprobe</code> returns. Finally it drops the extra reference held during
+initialization (&sect;4.3), trims init-section entries from the exception table,
+switches kallsyms to the core-only copy (&sect;2.2), seals the
+<code>ro_after_init</code> data, and releases the <code>INIT</code> regions. Even
+that last step has a subtlety: the regions are not freed inline but queued on a
+lock-free list for a work item, <code>do_free_init</code>
+(<code class="file-path">kernel/module/main.c</code>). Kallsyms may still be
+walking the init symbols inside an RCU read-side section, so the memory may be
+freed only after a grace period; waiting for one inline would slow every successful
+load, and an RCU callback will not do because <code>execmem_free</code> must not
+run in interrupt context, so the work item waits for the grace period and frees
+the regions in process context instead. The pipeline, in short, is as much about
+doing nothing harmful when things go wrong as about the happy path Figure B-2
+traces.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 600" role="img" aria-labelledby="figB-2-title" style="max-width:600px; width:100%; height:auto;">
+<title id="figB-2-title">Figure B-2. The load_module Pipeline</title>
+<defs><marker id="eb2" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="560" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure B-2. The load_module Pipeline</text>
+
+<g font-family="JetBrains Mono,monospace" font-size="10" text-anchor="middle">
+<rect x="300" y="74" width="260" height="30" rx="6" fill="#fee2e2" stroke="#dc2626"/><text x="430" y="93">module_sig_check (&#167;5.1)</text>
+<rect x="300" y="120" width="260" height="30" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="430" y="139">elf_validity_cache_copy</text>
+<rect x="300" y="166" width="260" height="30" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="430" y="185">early_mod_check (&#167;2.3, duplicates)</text>
+<rect x="300" y="212" width="260" height="30" rx="6" fill="#ede9fe" stroke="#7c3aed"/><text x="430" y="231">layout_and_allocate (&#167;2.2)</text>
+<rect x="300" y="258" width="260" height="30" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="430" y="277">add_unformed_module &#8594; UNFORMED</text>
+<rect x="300" y="304" width="260" height="30" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="430" y="323">simplify_symbols (&#167;3)</text>
+<rect x="300" y="350" width="260" height="30" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="430" y="369">apply_relocations, post_relocation</text>
+<rect x="300" y="396" width="260" height="30" rx="6" fill="#fef9c3" stroke="#ca8a04"/><text x="430" y="415">complete_formation &#8594; COMING</text>
+<rect x="300" y="442" width="260" height="30" rx="6" fill="#fef9c3" stroke="#ca8a04"/><text x="430" y="461">prepare_coming_module (notifiers)</text>
+<rect x="300" y="488" width="260" height="30" rx="6" fill="#fef9c3" stroke="#ca8a04"/><text x="430" y="507">parse_args, mod_sysfs_setup</text>
+<rect x="300" y="534" width="260" height="34" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="430" y="549">do_init_module &#8594; LIVE</text><text x="430" y="562" font-size="8" fill="#475569">run init, free INIT regions</text>
+</g>
+<g stroke="#334155" stroke-width="1.3">
+<line x1="430" y1="104" x2="430" y2="120" marker-end="url(#eb2)"/>
+<line x1="430" y1="150" x2="430" y2="166" marker-end="url(#eb2)"/>
+<line x1="430" y1="196" x2="430" y2="212" marker-end="url(#eb2)"/>
+<line x1="430" y1="242" x2="430" y2="258" marker-end="url(#eb2)"/>
+<line x1="430" y1="288" x2="430" y2="304" marker-end="url(#eb2)"/>
+<line x1="430" y1="334" x2="430" y2="350" marker-end="url(#eb2)"/>
+<line x1="430" y1="380" x2="430" y2="396" marker-end="url(#eb2)"/>
+<line x1="430" y1="426" x2="430" y2="442" marker-end="url(#eb2)"/>
+<line x1="430" y1="472" x2="430" y2="488" marker-end="url(#eb2)"/>
+<line x1="430" y1="518" x2="430" y2="534" marker-end="url(#eb2)"/>
+<path d="M260,140 H280 V89 H300" fill="none" marker-end="url(#eb2)"/>
+</g>
+<g font-family="Inter,sans-serif" font-size="9" fill="#64748b">
+<rect x="38" y="74" width="222" height="132" rx="10" fill="#fff" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+<text x="149" y="96" text-anchor="middle" font-weight="700" fill="#334155">system call (&#167;4.1)</text>
+<text x="54" y="118">finit_module(fd, params, flags)</text>
+<text x="54" y="136">CAP_SYS_MODULE, modules_disabled</text>
+<text x="54" y="154">one load per inode (idempotent)</text>
+<text x="54" y="172">kernel_read_file: LSM, IMA</text>
+<text x="54" y="190">decompress if flagged (&#167;5.2)</text>
+<rect x="600" y="212" width="222" height="142" rx="10" fill="#fff" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+<text x="711" y="234" text-anchor="middle" font-weight="700" fill="#334155">state during load</text>
+<text x="616" y="256">signature, ELF, early checks: no module</text>
+<text x="616" y="274">add_unformed &#8230; relocate: UNFORMED</text>
+<text x="616" y="292">complete_formation: COMING</text>
+<text x="616" y="310">init succeeds: LIVE</text>
+<text x="616" y="330" font-size="8">any failure: GOING notifiers if needed,</text>
+<text x="616" y="342" font-size="8">unlink, RCU grace period, free</text>
+</g>
+</svg>
+<figcaption>Figure B-2. The load_module pipeline — after the system call has read (and if necessary decompressed) the file, the loader verifies the module's signature, validates its ELF image, applies the early metadata and duplicate checks, lays out and allocates its memory regions, and registers it as UNFORMED; it then resolves the module's symbols and relocates its code, applies memory protections while promoting it to COMING, informs the notifier chain, parses its parameters and creates its sysfs directory, and finally runs the module's initializer to reach the LIVE state, freeing the init-only regions afterward.</figcaption>
+</figure>
+
+<h3 id="refcount">Reference Counting and Unloading</h3>
+
+<p>
+Removing a module is only safe when nothing is using it, and the kernel enforces
+this with a reference count and a dependency graph.
+The count is a single <code>atomic_t</code>, <code>refcnt</code> in
+<code>struct module</code>, which <code>module_unload_init</code> sets to
+<code>MODULE_REF_BASE</code> (1) plus one extra reference that the module holds on
+itself until its initializer finishes; <code>module_refcount</code>, which
+<code class="file-path">/sys/module/</code><em>name</em><code class="file-path">/refcnt</code>
+and <code>lsmod</code> report, subtracts the base. Any code that is about to rely
+on a module—by calling into it, or by holding a pointer into its data—takes a
+reference with <code>try_module_get</code>, which fails only once the module has
+begun to go away (state <code>GOING</code>) or its count has reached zero, and
+releases it later with <code>module_put</code>
+(<code class="file-path">kernel/module/main.c</code>, declared in
+<code class="file-path">include/linux/module.h</code>);
+<code>__module_get</code> is the unconditional form for a caller that already holds
+a reference. Inter-module dependencies are tracked automatically: when the loader
+resolves a symbol that one module imports from another, <code>ref_module</code>
+takes a reference on the provider through <code>strong_try_module_get</code>—which,
+stricter than <code>try_module_get</code>, also refuses a provider still in
+<code>COMING</code> with <code>-EBUSY</code>, so no module can bind to one whose
+initialization has not finished—and records the relationship in a
+<code>struct module_use</code> linked onto the provider's
+<code>source_list</code> and the user's <code>target_list</code>. This is why
+<code>lsmod</code> shows, for each module, both a use count and the list of
+modules that depend on it, and why the provider's
+<code class="file-path">holders/</code> directory in sysfs holds a link for each
+dependent. Every get and put also fires the <code>module_get</code> and
+<code>module_put</code> tracepoints, the usual way of finding out who is pinning a
+module that refuses to unload.
+</p>
+
+<p>
+Unloading runs through the <code>delete_module</code> system call
+(<code class="file-path">kernel/module/main.c</code>), the mechanism behind
+<code>rmmod</code> and <code>modprobe -r</code>. Under <code>module_mutex</code> it
+applies a fixed sequence of refusals: <code>-ENOENT</code> if no module has that
+name; <code>-EWOULDBLOCK</code> if other modules depend on it, so that dependents
+must be removed first; <code>-EBUSY</code> if it is not <code>LIVE</code>—still
+initializing, or already going; and <code>-EBUSY</code> again if it has an
+<code>init</code> function but no <code>exit</code> function, since such a module
+could never undo its own setup and is therefore permanent (marked
+<code>[permanent]</code> in <code class="file-path">/proc/modules</code>). Only then
+does <code>try_stop_module</code> try to subtract the base reference atomically: if
+any other reference remains, it restores the count and fails with
+<code>-EWOULDBLOCK</code>, which <code>rmmod</code> reports as "Module foo is in
+use." The kernel never waits for the count to drain, and no freeze of the other
+CPUs is needed, because the atomic subtraction itself settles the race with a
+concurrent <code>try_module_get</code>, which can no longer raise a count that has
+reached zero. The module then moves to <code>MODULE_STATE_GOING</code>, the mutex
+is dropped, and the module's <code>exit</code> function runs to undo what its
+initializer did. The notifier chain hears <code>MODULE_STATE_GOING</code>,
+livepatch and ftrace release the module, outstanding asynchronous work is flushed,
+and the module's name and taint flags are remembered as the last unloaded—the
+<code>[last unloaded: ...]</code> suffix of the module list in an oops.
+<code>free_module</code> finally removes the sysfs directory, returns the module to
+<code>UNFORMED</code> while leaving it on the module list so that no second copy
+can be loaded during teardown, drops the references it held on the modules it
+depended on, unlinks it and waits for an RCU grace period, and frees its memory.
+With <code>CONFIG_MODULE_UNLOAD_TAINT_TRACKING</code> (Linux 5.19), a module that
+had tainted the kernel leaves its name and taint letters behind, in
+<code class="file-path">/sys/kernel/debug/modules/unloaded_tainted</code> and in
+oops reports, so that the cause of a taint does not vanish with it.
+</p>
+
+<p>
+All of this bookkeeping is compiled in only when <code>CONFIG_MODULE_UNLOAD</code>
+is enabled. A kernel built without it can load modules but never remove them:
+<code>delete_module</code> returns <code>-ENOSYS</code>, every module's
+<code>exit</code> code is discarded at load (&sect;2.2), and
+<code>try_module_get</code> and <code>module_put</code> shrink to inline stubs, so
+the price of every reference taken anywhere in the kernel disappears. It is a
+trade of the ability to unload for slightly less overhead and a smaller attack
+surface—a configuration some hardened and embedded systems choose.
+</p>
+
+<p>
+In practice, most references are taken not by explicit <code>try_module_get</code>
+calls but through the <code>owner</code> field that pervades the kernel's
+callback structures. When a driver registers a <code>struct file_operations</code>,
+a <code>struct device_driver</code>, or any of dozens of similar objects, it sets
+their <code>owner</code> to <code>THIS_MODULE</code>—a pointer to the module's own
+<code>__this_module</code>, or <code>NULL</code> in built-in code, where every get
+trivially succeeds. Some 4,600 such initializers appear in the 7.0.12 sources, and
+registration helpers such as <code>platform_driver_register</code> and
+<code>pci_register_driver</code> are macros that fill in <code>THIS_MODULE</code>
+on the caller's behalf. The kernel then bumps the module's reference count
+automatically whenever one of those objects is used—opening a character device,
+for example, pins the module that owns the <code>cdev</code> and then, through
+<code>fops_get</code>, the owner of its file operations, failing the open with
+<code>-ENXIO</code> if the module is already going, and the last close drops the
+references. This is the everyday mechanism behind the familiar experience that
+<code>rmmod</code> of a driver whose device is open, or whose filesystem is
+mounted, fails with "module in use." A kernel thread started by a module has the
+opposite problem: it must drop its reference to its own module as its very last
+act, without returning into code that may already have been freed, which is what
+<code>module_put_and_kthread_exit</code> (so named since Linux 5.17) does. For the
+situations where an administrator is certain a module is wedged and must go
+regardless, <code>CONFIG_MODULE_FORCE_UNLOAD</code> enables <code>rmmod
+--force</code>, which passes <code>O_TRUNC</code> in the system call's flags and
+bypasses both the reference-count check and the missing-<code>exit</code> check—a
+dangerous operation that can crash the kernel if the module really is still
+active, and one the kernel records by raising <code>TAINT_FORCED_RMMOD</code> and
+declaring lockdep's results unreliable from then on. As with the version and
+signature overrides, the escape hatch exists, but taking it marks the kernel
+indelibly.
+</p>
+
+<hr>
+<h2 id="trust">Trust: Signing, Compression, and Tainting</h2>
+
+<p class="chapter-intro">
+Loading a module is one of the most powerful things a system can be asked to do:
+the new code runs in kernel mode, with no isolation from anything. A modern
+kernel therefore treats the provenance of a module as a first-class security concern, as Linux 2.6 did not. This section covers three
+related facilities: cryptographic <span class="key-term">signing</span>, which
+lets the kernel refuse code it cannot authenticate; <span class="key-term">compression</span>,
+which the kernel now unpacks itself; and <span class="key-term">tainting</span>,
+the long-standing mechanism by which the kernel records that something
+unverifiable or non-free has been loaded.
+</p>
+
+<p>
+The three facilities act at different moments of the load path of &sect;4, and
+the order is deliberate. Decompression comes first, in
+<code>init_module_from_file</code>, before <code>load_module</code> is even
+called, so that every later check sees the real ELF bytes. The signature check is
+the very first step of <code>load_module</code>, ahead of any ELF parsing, so when
+enforcement is on the loader's parser is never exposed to bytes that have not been
+authenticated. Tainting comes last, in <code>module_augment_kernel_taints</code>,
+once a <code>struct module</code> exists on which to record the flags. All three
+have grown up since Linux 2.6. Module signing was merged in Linux 3.7;
+unsigned modules got their own taint letter, <code>E</code>, in 3.15; kernel
+lockdown, which ties signature policy to the integrity of the whole kernel,
+arrived in 5.4; in-kernel decompression came in 5.17, with zstd added in 6.2; the
+<code>.machine</code> keyring in 5.18; SHA-3 digests in 6.7; and Linux 7.0 itself
+adds post-quantum ML-DSA signatures while dropping SHA-1 as a signing digest.
+</p>
+
+<h3 id="signing">Module Signing</h3>
+
+<p>
+A signed module carries a cryptographic <span class="key-term">signature</span>
+appended to the end of its file. Read backward from the end, the layout is the
+marker string <code>~Module signature appended~</code> (with a trailing newline),
+preceded by a 12-byte <code>struct module_signature</code> trailer
+(<code class="file-path">include/linux/module_signature.h</code>), preceded in turn
+by the signature itself: a detached PKCS#7 (CMS) message whose length the
+trailer's big-endian <code>sig_len</code> field records. The trailer's other
+fields (algorithm, hash, signer and key-ID lengths) are left over from an earlier
+format and must now be zero, with <code>id_type</code> set to
+<code>PKEY_ID_PKCS7</code>; <code>mod_check_sig</code>
+(<code class="file-path">kernel/module_signature.c</code>) rejects anything else,
+because the PKCS#7 message itself names the signer, the key, and the algorithms.
+Since the signature is simply appended, the file is still a valid ELF object that
+ordinary tools read unchanged, and <code>modinfo</code> can show the signer, key
+ID, and digest by parsing the signature in user space. The build tool
+<code class="file-path">scripts/sign-file</code> produces it. When a module is
+loaded, <code>module_sig_check</code>
+(<code class="file-path">kernel/module/signing.c</code>) runs before anything else
+in <code>load_module</code>. It detects the marker, trims it, and calls
+<code>mod_verify_sig</code>, which peels off the trailer and the signature,
+shrinking <code>info-&gt;len</code> so that the rest of the loader never sees
+them, and passes the remaining bytes to <code>verify_pkcs7_signature</code>
+(<code class="file-path">certs/system_keyring.c</code>). That function rejects a
+signer whose certificate is blacklisted or on the revocation list, then requires
+the signature to chain to a key on the <code>.secondary_trusted_keys</code>
+keyring, which links in the <code>.builtin_trusted_keys</code> compiled into the
+kernel and, where present, the <code>.machine</code> keyring of keys the platform
+owner has enrolled. On success <code>info-&gt;sig_ok</code> is set; it is later
+copied to <code>mod-&gt;sig_ok</code>, which <code>module_sig_ok</code> reports.
+</p>
+
+<p>
+What happens when verification does not succeed depends on <em>why</em> it did
+not. Only three outcomes count as "no usable signature": the module carries no
+marker at all (<code>-ENODATA</code>), it was signed with crypto the kernel does
+not support (<code>-ENOPKG</code>), or it was signed by a key the kernel does not
+hold (<code>-ENOKEY</code>). For these, policy decides. If signature enforcement
+is on, through <code>CONFIG_MODULE_SIG_FORCE</code> or the
+<code>module.sig_enforce</code> boot parameter (queried via
+<code>is_module_sig_enforced</code>), the module is rejected with
+<code>-EKEYREJECTED</code> and a notice such as "Loading of unsigned module is
+rejected". If not, <code>module_sig_check</code> consults lockdown (below), and
+only if that also permits it does the module load with <code>sig_ok</code> false.
+Then <code>module_augment_kernel_taints</code> taints the kernel with
+<code>TAINT_UNSIGNED_MODULE</code> and logs, once per boot, "module verification
+failed: signature and/or required key missing - tainting kernel". Every other
+failure is fatal whatever the policy. A signature that is present but does not
+verify, a malformed trailer (<code>-EBADMSG</code>), a revoked or blacklisted
+signer, or a memory shortage aborts the load even on a kernel that would accept
+an unsigned module. The asymmetry is intentional: a missing signature may be a
+developer's convenience, but a wrong one is evidence of corruption or tampering.
+Two more details complete the picture. First, enforcement is a one-way switch.
+The parameter has the <code>bool_enable_only</code> type, so root can turn it on
+at run time through <code>/sys/module/module/parameters/sig_enforce</code> but
+never off again (the write fails with <code>-EROFS</code>). Second, a module loaded
+with <code>MODULE_INIT_IGNORE_MODVERSIONS</code> or
+<code>MODULE_INIT_IGNORE_VERMAGIC</code> (<code>modprobe --force</code>) has its
+signature ignored. A module whose version information is being disregarded is no
+longer the module that was signed, so such a load is treated exactly as an
+unsigned one. Figure B-3 shows the decision.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 470" role="img" aria-labelledby="figB-3-title" style="max-width:720px; width:100%; height:auto;">
+<title id="figB-3-title">Figure B-3. Verifying a Module Signature</title>
+<defs><marker id="eb3" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="430" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure B-3. Verifying a Module Signature</text>
+
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<rect x="300" y="70" width="260" height="38" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="430" y="86" font-weight="700">load_module &#8594; module_sig_check</text><text x="430" y="100" font-size="8" fill="#475569">first step; bytes already decompressed</text>
+<rect x="280" y="132" width="300" height="44" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="430" y="150">"~Module signature appended~" marker at the end,</text><text x="430" y="165">and no MODULE_INIT_IGNORE_* flags?</text>
+<rect x="280" y="212" width="300" height="56" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="430" y="229" font-weight="700">mod_verify_sig &#8594; verify_pkcs7_signature</text><text x="430" y="244" font-size="9" fill="#475569">blacklist / revocation check, then chain to</text><text x="430" y="257" font-size="9" fill="#475569">.secondary_trusted_keys (built-in, secondary, .machine)</text>
+<rect x="40" y="212" width="190" height="56" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="135" y="232" font-weight="700">no usable signature</text><text x="135" y="247" font-size="9" fill="#475569">-ENODATA: unsigned, or</text><text x="135" y="260" font-size="9" fill="#475569">ignored with modprobe --force</text>
+<rect x="630" y="212" width="190" height="56" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="725" y="234" font-weight="700">sig_ok = true</text><text x="725" y="250" font-size="9" fill="#475569">load continues; no taint</text>
+<rect x="40" y="310" width="440" height="100" rx="8" fill="#fef3c7" stroke="#ca8a04"/><text x="260" y="330" font-weight="700">policy decides</text><text x="260" y="348" font-size="9" fill="#475569">module.sig_enforce / CONFIG_MODULE_SIG_FORCE &#8594; reject (-EKEYREJECTED)</text><text x="260" y="364" font-size="9" fill="#475569">else lockdown (integrity or confidentiality) &#8594; reject (-EPERM)</text><text x="260" y="380" font-size="9" fill="#475569">else load with sig_ok = false; module_augment_kernel_taints</text><text x="260" y="394" font-size="9" fill="#475569">then sets TAINT_UNSIGNED_MODULE (E)</text>
+<rect x="520" y="310" width="300" height="100" rx="8" fill="#fee2e2" stroke="#dc2626"/><text x="670" y="334" font-weight="700">always rejected</text><text x="670" y="354" font-size="9" fill="#475569">signature present but wrong (-EKEYREJECTED),</text><text x="670" y="370" font-size="9" fill="#475569">malformed (-EBADMSG), revoked or blacklisted,</text><text x="670" y="386" font-size="9" fill="#475569">or out of memory: even when not enforcing</text>
+</g>
+<g stroke="#334155" stroke-width="1.3" fill="none">
+<line x1="430" y1="108" x2="430" y2="132" marker-end="url(#eb3)"/>
+<line x1="430" y1="176" x2="430" y2="212" marker-end="url(#eb3)"/>
+<path d="M280,154 H135 V212" marker-end="url(#eb3)"/>
+<line x1="580" y1="240" x2="630" y2="240" marker-end="url(#eb3)"/>
+<line x1="135" y1="268" x2="135" y2="310" marker-end="url(#eb3)"/>
+<line x1="380" y1="268" x2="380" y2="310" marker-end="url(#eb3)"/>
+<path d="M540,268 V290 H670 V310" marker-end="url(#eb3)"/>
+</g>
+<g font-family="Inter,sans-serif" font-size="9" font-weight="700">
+<text x="438" y="198" fill="#16a34a">yes</text>
+<text x="210" y="148" text-anchor="middle" fill="#ca8a04">no</text>
+<text x="605" y="234" text-anchor="middle" fill="#16a34a">0</text>
+<text x="386" y="294" fill="#ca8a04">-ENOKEY, -ENOPKG</text>
+<text x="605" y="285" text-anchor="middle" fill="#dc2626">any other error</text>
+</g>
+<text x="430" y="436" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">only the absence of a usable signature is a matter of policy; a signature that is present but wrong never loads</text>
+</svg>
+<figcaption>Figure B-3. Verifying a module signature — module_sig_check runs first in load_module, on the already-decompressed bytes. A signature that verifies against the secondary trusted keyring (built-in, secondary, and .machine keys) sets sig_ok. A missing signature (or one ignored because version checks were overridden), an unknown key, or unsupported crypto is left to policy: rejected if sig_enforce is set, refused with -EPERM under lockdown, otherwise loaded with the kernel tainted E. Any other failure, such as a bad, malformed, or revoked signature, is always fatal.</figcaption>
+</figure>
+
+<p>
+Where the trusted keys come from ties module signing into the platform's larger
+chain of trust. The build is given a signing key through
+<code>CONFIG_MODULE_SIG_KEY</code>, either a PEM file or a PKCS#11 URI naming a key
+held in a hardware security module. If the option keeps its default,
+<code class="file-path">certs/signing_key.pem</code>, the build generates a fresh
+key pair automatically, and the public half is compiled into the kernel's
+<span class="key-term">built-in trusted keyring</span>. With
+<code>CONFIG_MODULE_SIG_ALL</code> (the default), modules are signed during
+<code>make modules_install</code>, not when they are compiled
+(<code class="file-path">scripts/Makefile.modinst</code>). Each module is copied,
+stripped if <code>INSTALL_MOD_STRIP</code> asks for it, then signed, so that no
+later strip can invalidate the signature. <code>make modules_sign</code> re-signs
+an installed tree. Beyond the built-in keys, a distribution can add keys to the
+secondary keyring at run time, but only keys that are themselves signed by a key
+it already trusts (and, with
+<code>CONFIG_SECONDARY_TRUSTED_KEYRING_SIGNED_BY_BUILTIN</code>, since 6.7, only
+by a built-in key). On UEFI systems a platform owner can enroll their own key
+into the <code>.machine</code> keyring through the firmware's Machine Owner Key
+list. That keyring is trusted for modules only when the shim boot loader signals
+that it should, through the <code>MokListTrustedRT</code> variable. The firmware's
+own <code>db</code> keys, held in the separate <code>.platform</code> keyring, are
+<em>not</em> trusted for modules (they serve <code>kexec</code>), while its
+<code>dbx</code> revocation list feeds the kernel's blacklist. In this way the
+Secure Boot trust chain of Appendix A, which vouched for the kernel, extends
+onward to vouch for the modules the kernel loads.
+</p>
+
+<p>
+Two mechanisms make the connection binding. The first is kernel
+<span class="key-term">lockdown</span> (<code class="file-path">security/lockdown/</code>):
+when enforcement is off, <code>module_sig_check</code> falls through to
+<code>security_locked_down(LOCKDOWN_MODULE_SIGNATURE)</code>. That is an
+integrity-level reason, so a kernel locked down in either the
+<code>integrity</code> or the <code>confidentiality</code> mode refuses a module
+without a usable signature with <code>-EPERM</code>, even though
+<code>sig_enforce</code> was never set. The same lockdown level also refuses to set any
+module parameter (&sect;6.3) declared with <code>module_param_hw</code>, such as an
+I/O port, IRQ, or memory address, which could point a driver at arbitrary hardware. The dependency runs one way only: on a kernel built without
+<code>CONFIG_MODULE_SIG</code>, <code>module_sig_check</code> is an empty stub, and
+lockdown cannot stop unsigned modules at all. Mainline does not turn lockdown on
+merely because the machine booted under Secure Boot; that coupling is a patch most
+distributions carry. Upstream, lockdown comes from the <code>lockdown=</code> boot
+parameter or a <code>CONFIG_LOCK_DOWN_KERNEL_FORCE_*</code> option. The second
+mechanism is the integrity subsystem's architecture policy. With
+<code>CONFIG_IMA_ARCH_POLICY</code>, <code>arch_get_ima_policy</code>
+(<code class="file-path">security/integrity/ima/ima_efi.c</code>) calls
+<code>set_module_sig_enforced</code> when the firmware reports Secure Boot active,
+switching signature enforcement on for the rest of the boot. On a kernel without
+module signing, the same policy instead requires every module to carry an IMA
+signature of its own. IMA can also appraise a module by the very same appended
+signature (its <code>modsig</code> type), so one signature serves both checks.
+</p>
+
+<p>
+The signatures themselves use whichever algorithm the build selects in
+<code class="file-path">certs/Kconfig</code>: RSA by default; ECDSA with a P-384 key
+(since 5.15), which refuses to pair with a 256-bit digest; or, new in 7.0, the
+post-quantum ML-DSA-44, ML-DSA-65, or ML-DSA-87 schemes of NIST FIPS 204. ML-DSA
+needs OpenSSL 3.5 or later at build time, and with OpenSSL 4 the whole module body
+is signed directly rather than through signed attributes. The digest, chosen in
+<code class="file-path">kernel/module/Kconfig</code>, is SHA-256, SHA-384, or
+SHA-512 (the default since 6.14), or one of the SHA-3 variants added in 6.7. The
+weaker digests have been removed: SHA-224 in 6.7 and SHA-1, long deprecated
+because of practical collision attacks, in 7.0. Only new signing is affected;
+modules already signed with SHA-1 still verify. The digest algorithm must be built
+into the kernel, since a module cannot supply the algorithm needed to check its
+own signature. Adopting a lattice-based scheme well before any quantum computer
+threatens RSA reflects how seriously the kernel treats the integrity of the code
+it admits.
+</p>
+
+<h3 id="compression">Module Compression</h3>
+
+<p>
+Modules can be stored compressed on disk, as <code class="file-path">.ko.gz</code>,
+<code class="file-path">.ko.xz</code>, or <code class="file-path">.ko.zst</code>,
+and, unlike in the past, the kernel can decompress them itself rather than relying
+on user space to do it first. Since Linux 6.12, two separate options govern this.
+<code>CONFIG_MODULE_COMPRESS</code> chooses a single algorithm (gzip, xz, or zstd)
+and, with <code>CONFIG_MODULE_COMPRESS_ALL</code>, has <code>make modules_install</code>
+compress every installed module with it, external modules included.
+<code>CONFIG_MODULE_DECOMPRESS</code> separately builds the matching decompressor
+into the kernel. The kernel deliberately supports only that one algorithm, and it
+names it in <code>/sys/module/compression</code>, so that <code>kmod</code> can
+tell whether a file can be handed over still compressed; if not, kmod
+decompresses it in user space as before. When <code>finit_module</code> is called
+with the <code>MODULE_INIT_COMPRESSED_FILE</code> flag,
+<code>init_module_from_file</code> reads the whole compressed file and passes it to
+<code>module_decompress</code>
+(<code class="file-path">kernel/module/decompress.c</code>) <em>before</em>
+<code>load_module</code> is called, so the loader proper never knows the module
+was compressed. The decompressor writes its output into individually allocated
+pages, growing its array of page pointers as it goes (starting at twice the
+compressed size), and then maps them into one contiguous virtual range with
+<code>vmap</code>. It needs neither the decompressed size in advance nor any large
+contiguous allocation. The compressed buffer is freed as soon as decompression
+finishes, and a failure is counted in the <code>failed_decompress</code>
+statistic of &sect;4.2.
+</p>
+
+<p>
+The ordering with signing matters and is worth remembering.
+<code>modules_install</code> copies each module, strips it if asked, signs it, and
+only then compresses it, so a module is <em>signed first and compressed
+second</em>. The kernel therefore decompresses the file back to its signed form
+before <code>module_sig_check</code> runs, and the signature covers the real module
+bytes rather than the compressed wrapper. A distribution can even recompress its
+modules with a different algorithm without signing them again. The security
+hooks see both forms of the file. The LSM hooks that run as the file is read see
+the compressed bytes, tagged <code>READING_MODULE_COMPRESSED</code>. Since Linux
+6.19, <code>init_module_from_file</code> also calls
+<code>security_kernel_post_read_file</code> a second time on the decompressed
+bytes, tagged <code>READING_MODULE</code>, which lets IMA verify a module's
+appended signature even when the module was stored compressed. In-kernel
+decompression thus saves disk space without giving up the authenticity guarantee
+of &sect;5.1.
+</p>
+
+<p>
+It is worth asking why the kernel took on decompression at all, since user space
+could unpack a module and hand over the plain bytes, as it always used to. The
+answer is the file-based security of &sect;4.1. A policy such as LoadPin trusts a
+module because of <em>where it came from</em>, a particular (typically read-only and
+verified) filesystem, and that judgment needs a file descriptor. Once user space
+has decompressed a module, it can pass the result only as an anonymous buffer
+through <code>init_module</code>, which severs the link between the bytes and
+their origin, so a LoadPin-protected system could not use compressed modules at
+all. Accepting the compressed file through <code>finit_module</code> and unpacking
+it internally restores that link and keeps <code>modprobe</code> simple. The
+choice among algorithms is the same trade-off Appendix A described for the kernel
+image itself: gzip is the conservative default (the first choice offered), xz
+compresses smallest, and zstd balances a good ratio against fast decompression,
+which matters when many modules are unpacked during boot. The xz case is tuned to
+the kernel's decoder. XZ Embedded, the in-kernel implementation, handles neither
+CRC64 integrity checks nor dictionaries larger than 1 MiB, so since 6.6 the build
+compresses modules with exactly those limits. The Kconfig help adds a practical
+note: modules that live inside an initramfs gain little from being compressed one
+by one, since compressing the whole ramdisk is more efficient.
+</p>
+
+<h3 id="tainting">Tainting</h3>
+
+<p>
+Not every questionable module can be refused—users have legitimate reasons to
+load proprietary drivers or force a mismatched module—so the kernel also has a
+softer mechanism: it records the fact. <span class="key-term">Tainting</span>
+sets a flag in a global mask (and in the module's own <code>taints</code> field)
+noting that something has happened which may compromise the kernel's
+supportability or integrity, and that flag is printed in every subsequent oops and
+bug report. The point is honesty rather than prevention: a tainted kernel is one
+whose developers may decline to debug, because its behavior is no longer purely
+that of the released source. Table B-3 lists the taint flags most relevant to
+modules.
+</p>
+
+<table>
+<caption>Table B-3. Module-related taint flags</caption>
+<thead>
+<tr><th>Flag</th><th>Letter</th><th>Set when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>TAINT_PROPRIETARY_MODULE</code></td><td>P</td><td>A module with a non-GPL-compatible (or no) license was loaded, or one on the kernel's list of license offenders</td></tr>
+<tr><td><code>TAINT_FORCED_MODULE</code></td><td>F</td><td>A module was loaded with its version magic or symbol versions missing or ignored (<code>modprobe --force</code>); a mismatch is refused instead</td></tr>
+<tr><td><code>TAINT_FORCED_RMMOD</code></td><td>R</td><td>A module was forcibly removed despite its reference count (see &sect;4.3)</td></tr>
+<tr><td><code>TAINT_OOT_MODULE</code></td><td>O</td><td>An out-of-tree module (built with <code>M=</code>, so lacking modpost's <code>intree</code> tag) was loaded</td></tr>
+<tr><td><code>TAINT_UNSIGNED_MODULE</code></td><td>E</td><td>A module with no usable signature (unsigned, or signed by an unknown key) was loaded because enforcement was off</td></tr>
+<tr><td><code>TAINT_CRAP</code></td><td>C</td><td>A module from <code class="file-path">drivers/staging</code> was loaded</td></tr>
+<tr><td><code>TAINT_LIVEPATCH</code></td><td>K</td><td>A livepatch module was loaded (see &sect;7.2)</td></tr>
+<tr><td><code>TAINT_TEST</code></td><td>N</td><td>A module built from <code class="file-path">tools/testing</code> was loaded, or KUnit or another in-kernel test ran</td></tr>
+</tbody>
+</table>
+
+<p>
+Most of these flags are decided from information the build leaves behind. For
+each module it processes, <code>modpost</code>
+(<code class="file-path">scripts/mod/modpost.c</code>) writes
+<code>MODULE_INFO(intree, "Y")</code> into the generated
+<code class="file-path">.mod.c</code> unless the module is being built externally
+with <code>M=</code>; it adds <code>MODULE_INFO(staging, "Y")</code> for anything
+under <code class="file-path">drivers/staging</code> and
+<code>MODULE_INFO(test, "Y")</code> for anything under
+<code class="file-path">tools/testing</code>. At load time
+<code>module_augment_kernel_taints</code>
+(<code class="file-path">kernel/module/main.c</code>) reads those tags back. A
+missing <code>intree</code> tag raises <code>O</code>, a <code>staging</code> tag
+<code>C</code>, a <code>test</code> tag <code>N</code>, a livepatch module
+<code>K</code>, and a false <code>sig_ok</code> <code>E</code>. The same function
+calls <code>module_license_taint_check</code>, which raises <code>P</code> for a
+license that <code>license_is_gpl_compatible</code> rejects, including no license
+at all, which counts as "unspecified". It also applies two hard-coded exceptions.
+A short list of modules caught declaring a GPL license they do not honor
+(<code>driverloader</code> and <code>lve</code>) is tainted <code>P</code>
+regardless. <code>ndiswrapper</code>, GPL itself but a loader of proprietary
+Windows drivers, taints the kernel globally while keeping its own record clean, so
+that it can still use GPL-only symbols. Elsewhere, <code>try_to_force_load</code>
+raises <code>F</code> when the version magic or symbol versions are missing or
+were ignored on request. A <em>mismatch</em> is simply refused (&sect;3.3), and
+on a kernel built without <code>CONFIG_MODULE_FORCE_LOAD</code> so is the missing
+case. <code>try_force_unload</code> raises <code>R</code> in
+<code>delete_module</code>. The <code>P</code>, <code>F</code>, and
+<code>R</code> taints also switch lock debugging off ("Disabling lock debugging
+due to kernel taint"), because lockdep's view can no longer be trusted once
+unknown code may have taken locks behind its back; the other taints leave lockdep
+running. The letters are exactly those that appear in the "Tainted:" line of a
+kernel oops (<code class="file-path">kernel/panic.c</code>). Together with signing,
+tainting gives the kernel a graduated response to untrusted code: refuse it
+outright when policy demands, or admit it but mark the kernel indelibly so that
+everyone, users and developers alike, knows the running kernel is no longer a
+pristine build.
+</p>
+
+<p>
+Two properties of tainting are worth making explicit. First, taint is a
+<span class="key-term">whole-kernel</span>, monotonic property, not a per-module
+one: <code>add_taint_module</code> records the flag on the module that raised it
+<em>and</em> calls <code>add_taint</code> to set it in the global
+<code>tainted_mask</code>, which persists for the rest of the boot and can never be
+cleared. Even the sysctl that exposes the mask, <code>/proc/sys/kernel/tainted</code>,
+can only add: a write (which needs <code>CAP_SYS_ADMIN</code>) ORs new bits in,
+one <code>add_taint</code> call per bit, so a test harness can mark a kernel but
+no one can clean one. The global mask is what an oops prints, and it is why a
+single proprietary or force-loaded module colors every crash report thereafter.
+The kernel cannot know that the tainting module was innocent of a later failure,
+so it refuses to vouch that it was. Second, the module flags in Table B-3 are only
+a subset of the kernel's 20 taint bits. The others record events unrelated to
+modules, such as a machine check, a bad page, a soft lockup, a warning having
+fired, or (new in 6.15) a request for debug write access to a device's firmware
+through the <code>fwctl</code> interface. A pristine kernel's oops line says
+simply "Not tainted". Otherwise it reads "Tainted:" followed by a fixed-width
+string with one position per flag (<code>print_tainted</code>,
+<code class="file-path">kernel/panic.c</code>), holding the flag's letter if the
+condition occurred and a blank if it did not. The exception is the first,
+proprietary, position, which shows <code>G</code> ("good") when every loaded
+module is GPL-compatible. A 20-column string of mostly blanks is hard to read, so
+since Linux 6.11 <code>dump_stack</code> follows it with a second line naming only
+the flags that are set, such as
+<code>Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE</code>
+(<code>print_tainted_verbose</code>). For a maintainer triaging a bug, those lines
+are the first thing read: a report from a tainted kernel is routinely met with a
+request to reproduce on an untainted one, because the taint may well be the true
+cause.
+</p>
+
+<p>
+Taint is also tracked, and acted on, per module. A module's own flags appear in
+<code>/sys/module/&lt;name&gt;/taint</code>, in parentheses after its name in
+<code>/proc/modules</code>, and in the "Modules linked in:" list of an oops, where
+a <code>+</code> or <code>-</code> also marks a module still loading or being
+unloaded. A tainting module that has since been unloaded is still remembered, in
+the <code>[last unloaded: ...]</code> note and the unloaded-tainted list of
+&sect;4.3. The per-module record has consequences. The tracing subsystem refuses
+to register the tracepoints and trace events of any module carrying a taint other
+than <code>O</code>, <code>C</code>, <code>E</code>, <code>N</code>, or
+<code>K</code> (<code>trace_module_has_bad_taint</code>,
+<code class="file-path">kernel/tracepoint.c</code>), because a proprietary or
+force-loaded module's view of the kernel's structures cannot be trusted. Indeed,
+the separate <code>E</code> letter exists because, before Linux 3.15, unsigned
+modules were marked <code>F</code> and so silently lost their tracepoints. An
+administrator who would rather not run a tainted kernel at all can boot with
+<code>panic_on_taint=</code> (Linux 5.8), giving a hexadecimal mask of taint bits;
+<code>add_taint</code> then panics the moment any of them is set. Appending
+<code>,nousertaint</code> makes writes to <code>/proc/sys/kernel/tainted</code>
+that would trip the mask fail with <code>-EINVAL</code>, so that only a genuine
+kernel event can trigger the panic.
+</p>
+
+<hr>
+<h2 id="ondemand">On-Demand Loading and Parameters</h2>
+
+<p class="chapter-intro">
+Modules would be far less useful if an administrator had to load each one by hand.
+The defining convenience of the module system is that the kernel can load what it
+needs <em>automatically</em>, the moment a device appears or a feature is first
+used. This section covers that on-demand machinery—how the kernel asks user space
+to load a module, how it names the module it wants without knowing the module's
+name, and how modules are configured through parameters.
+</p>
+
+<p>
+Two roads lead to an automatic load, and Figure B-4 shows them side by side. On the
+first, kernel code that finds a feature missing—a filesystem type, a socket family,
+a crypto algorithm—calls <code>request_module</code> with a name it constructs, and
+the kernel starts <code>modprobe</code> itself. On the second, which now carries
+most driver loading, the kernel asks for nothing: it announces a new device in a
+uevent that carries the device's <code>MODALIAS</code> string, and the user-space
+device manager decides what to load. The roads meet in user space, where the same
+alias indexes and configuration files turn a name into a file, and then in the same
+<code>finit_module</code> system call (&sect;4.1), so an autoloaded module passes
+exactly the signature, lockdown, and taint checks of &sect;5 that a hand-loaded one
+does. The kernel never opens a module file on its own initiative. Parameters, the
+third topic, ride along on that same call as its argument string.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 520" role="img" aria-labelledby="figB-4-title" style="max-width:720px; width:100%; height:auto;">
+<title id="figB-4-title">Figure B-4. Two Roads to an Automatic Load</title>
+<defs><marker id="eb4" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="480" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure B-4. Two Roads to an Automatic Load</text>
+
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<text x="230" y="80" font-size="11" font-weight="700" fill="#334155">the kernel asks (&#167;6.1)</text>
+<text x="630" y="80" font-size="11" font-weight="700" fill="#334155">a device announces itself (&#167;6.2)</text>
+<rect x="60" y="90" width="340" height="44" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="230" y="108" font-weight="700">request_module("fs-%s", type)</text><text x="230" y="124" font-size="9" fill="#475569">missing filesystem, socket family, crypto algorithm&#8230;</text>
+<rect x="460" y="90" width="340" height="44" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="630" y="108" font-weight="700">device_add &#8594; KOBJ_ADD uevent (netlink)</text><text x="630" y="124" font-size="9" fill="#475569">MODALIAS=pci:v00008086d&#8230;, also in sysfs modalias</text>
+<rect x="60" y="160" width="340" height="56" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="230" y="178" font-weight="700">__request_module</text><text x="230" y="193" font-size="9" fill="#475569">LSM veto &#183; one of 50 slots (5 s timeout) &#183; tracepoint</text><text x="230" y="206" font-size="9" fill="#475569">usermode helper: root, initial namespaces</text>
+<rect x="460" y="160" width="340" height="56" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="630" y="178" font-weight="700">systemd-udevd</text><text x="630" y="193" font-size="9" fill="#475569">loads every match in-process through libkmod</text><text x="630" y="206" font-size="9" fill="#475569">coldplug: udevadm trigger replays boot-time devices</text>
+<rect x="60" y="244" width="340" height="36" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="230" y="266" font-weight="700">/sbin/modprobe -q -- fs-xfs</text>
+<rect x="560" y="232" width="250" height="56" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 3"/><text x="685" y="249" font-size="9" font-weight="700" fill="#475569">built at make / modules_install</text><text x="685" y="264" font-size="8" fill="#475569">MODULE_DEVICE_TABLE &#8594; modpost (file2alias)</text><text x="685" y="277" font-size="8" fill="#475569">&#8594; MODULE_ALIAS in .modinfo &#8594; depmod</text>
+<rect x="180" y="306" width="500" height="66" rx="8" fill="#fef3c7" stroke="#ca8a04"/><text x="430" y="325" font-weight="700">user space resolves the name or alias</text><text x="430" y="342" font-size="9" fill="#475569">/etc/modprobe.d: blacklist, options, softdep, install</text><text x="430" y="358" font-size="9" fill="#475569">modules.alias &#183; modules.builtin(.modinfo) &#183; modules.dep &#183; &lt;mod&gt;.&lt;param&gt;= from /proc/cmdline</text>
+<rect x="230" y="398" width="400" height="48" rx="8" fill="#dcfce7" stroke="#16a34a"/><text x="430" y="417" font-weight="700">finit_module(fd, "param=value &#8230;", flags)</text><text x="430" y="434" font-size="9" fill="#475569">load_module (&#167;4.2): signature, lockdown, taint (&#167;5); parse_args (&#167;6.3)</text>
+</g>
+<g stroke="#334155" stroke-width="1.3" fill="none">
+<line x1="230" y1="134" x2="230" y2="160" marker-end="url(#eb4)"/>
+<line x1="630" y1="134" x2="630" y2="160" marker-end="url(#eb4)"/>
+<line x1="230" y1="216" x2="230" y2="244" marker-end="url(#eb4)"/>
+<line x1="230" y1="280" x2="230" y2="306" marker-end="url(#eb4)"/>
+<path d="M500,216 V306" marker-end="url(#eb4)"/>
+<path d="M640,288 V306" stroke-dasharray="4 3" marker-end="url(#eb4)"/>
+<line x1="430" y1="372" x2="430" y2="398" marker-end="url(#eb4)"/>
+</g>
+<text x="430" y="478" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">the kernel decides what is needed, user space decides which file provides it, and both roads end in the same system call</text>
+</svg>
+<figcaption>Figure B-4. Two roads to an automatic load — Kernel code that finds a feature missing calls request_module, which runs modprobe through the usermode helper. A new device instead announces its MODALIAS in a uevent, and udev loads every matching driver through libkmod, replaying the events at coldplug for devices present at boot. Both consult the same configuration and the same depmod indexes, built from each driver's MODULE_DEVICE_TABLE, and both end in finit_module, so an autoloaded module meets every check a hand-loaded one does.</figcaption>
+</figure>
+
+<h3 id="request-module">request_module and modprobe</h3>
+
+<p>
+When kernel code discovers it needs a module, it calls <code>request_module</code>,
+or <code>request_module_nowait</code> when it cannot afford to block; both are
+macros (<code class="file-path">include/linux/kmod.h</code>) over
+<code>__request_module</code> (<code class="file-path">kernel/module/kmod.c</code>).
+The name is a printf-style format, so callers build it from whatever they know:
+<code>"fs-%.*s"</code> from a filesystem type, <code>"net-pf-%d"</code> from an
+address family. <code>__request_module</code> itself is short. It warns if a waiting
+request comes from an async worker, since the module's initializer may wait for
+async work to drain (&sect;4.2) and so deadlock; it returns <code>-ENOENT</code> at
+once if the modprobe path is empty, which is how autoloading is turned off; it
+formats the name, refusing one longer than <code>MODULE_NAME_LEN</code>; it gives
+security modules a veto through <code>security_kernel_module_request</code>, where
+SELinux checks its <code>module_request</code> permission; and it takes one of 50
+slots in the <code>kmod_concurrent_max</code> semaphore. If all 50 stay busy for
+five seconds, the kernel concludes that modules are requesting one another in a
+loop, logs a warning, and fails the request; 2.6.11 had the same limit but failed
+the excess request immediately. Finally, after the <code>module_request</code>
+tracepoint fires, <code>call_modprobe</code> runs the program named by
+<code class="file-path">/proc/sys/kernel/modprobe</code>—<code class="file-path">/sbin/modprobe</code>
+unless <code>CONFIG_MODPROBE_PATH</code> (5.13) says otherwise—with the arguments
+<code>-q -- </code> and the name, in a fixed minimal environment. A waiting request
+returns modprobe's exit status; a non-waiting one returns as soon as the program has
+started. Either way the answer promises little, because success means only that
+<code>modprobe</code> succeeded, not that the module registered what was wanted, so
+callers always look again—the pattern <code>try_then_request_module</code> packages.
+Its best-known user is <code>symbol_request</code>, which loads whatever module
+exports a named symbol by asking for the alias <code>symbol:</code> plus the
+symbol's name, and which, because <code>symbol_get</code> works only on GPL-only
+exports (&sect;3.1), can reach no others.
+</p>
+
+<p>
+The work is handed to user space not because the kernel cannot read a file—since
+<code>finit_module</code> it reads module files routinely—but because everything
+needed to choose one lives there: where modules are installed, which one provides an
+alias, what must be loaded first, and the administrator's blacklists and options.
+The <span class="key-term">usermode helper</span> that runs <code>modprobe</code> is
+started from a kernel worker thread, so it executes with full root credentials and
+in the initial namespaces, against the host's root filesystem, whatever process or
+container triggered the request. It does not exist early in boot: helpers are
+enabled only when the initramfs is being unpacked (<code>populate_rootfs</code>),
+and are disabled again while tasks are frozen for suspend, so a request made at
+those times fails with <code>-EBUSY</code>. On its side, <code>modprobe</code>
+treats a name listed in <code class="file-path">modules.builtin</code> as already
+satisfied, otherwise resolves it through the alias index, honors the
+<code>blacklist</code>, <code>options</code>, <code>softdep</code>, and
+<code>install</code> lines in <code class="file-path">/etc/modprobe.d</code>, adds
+any matching options it finds on the kernel command line, loads dependencies in
+<code class="file-path">modules.dep</code> order, and calls
+<code>finit_module</code> for each file. Several requests for one module can still
+race into user space; the loader's one-load-per-file rule (&sect;4.1) makes the
+duplicates harmless but not free, and the 6.4 debugging option
+<code>CONFIG_MODULE_DEBUG_AUTOLOAD_DUPS</code> reports them and folds them onto the
+first request. This division of labor—the kernel deciding <em>what</em> is needed,
+user space deciding <em>which file</em> provides it and how to reach it—is the same
+design Linux 2.6 implemented under the name <code>kmod</code>, and it remains
+the heart of automatic module loading.
+</p>
+
+<p>
+This convenience has a security dimension that 2.6-era kernels scarcely had to consider.
+Because a <code>request_module</code> can be triggered by an <em>unprivileged</em>
+action—creating a socket of an unusual address family fires
+<code>request_module("net-pf-%d", family)</code>, mounting an unknown filesystem
+type fires <code>request_module("fs-%.*s", len, name)</code>, opening a character
+device with no driver fires a <code>char-major-</code> request—an ordinary user can
+indirectly coax the kernel into loading obscure, rarely-audited modules, which has
+been a recurring source of attack surface. The first defense is naming. A request an
+unprivileged user can trigger carries a subsystem prefix, so it can match only a
+module that opted in by declaring the matching alias. Mount requests gained the
+<code>fs-</code> prefix in Linux 3.9, matched by <code>MODULE_ALIAS_FS</code>, and
+crypto lookups the <code>crypto-</code> prefix in 3.19, matched by
+<code>MODULE_ALIAS_CRYPTO</code>; before that, a mount or an <code>AF_ALG</code>
+socket could name any module on disk. Since 2.6.38, <code>dev_load</code>, which
+looks up network interfaces by name, lets a <code>CAP_NET_ADMIN</code> caller
+request only <code>netdev-</code> aliases and reserves bare module names for
+<code>CAP_SYS_MODULE</code>. Legacy triggers can be switched off: loading a line
+discipline on demand requires <code>CAP_SYS_MODULE</code> unless
+<code>CONFIG_LDISC_AUTOLOAD</code> or the <code>dev.tty.ldisc_autoload</code> sysctl
+(5.1) allows it, and <code>CONFIG_BLOCK_LEGACY_AUTOLOAD</code> (5.18) controls
+loading a block driver because someone opened a device node by number. In Linux 6.14
+the oldest trigger of all went away: <code>execve</code> no longer requests a
+<code>binfmt-</code> module when it meets an unknown executable format, a leftover
+of the move from a.out to ELF.
+</p>
+
+<p>
+Beyond naming, the kernel constrains autoloading in layers. Loading itself requires
+<code>CAP_SYS_MODULE</code> (<code>may_init_module</code>,
+<code class="file-path">kernel/module/main.c</code>), but that check cannot stop an
+autoload, because the helper's <code>modprobe</code> already runs as root. What does
+stop it is the one-way
+<code class="file-path">/proc/sys/kernel/modules_disabled</code> sysctl, or the
+<code>nomodule</code> boot parameter, after which every load is refused with
+<code>-EPERM</code>; emptying
+<code class="file-path">/proc/sys/kernel/modprobe</code> instead turns off only the
+kernel's own requests, leaving explicit loads working. Because the helper runs with
+full privilege, its inputs are themselves sensitive. The modprobe path is a
+root-only tunable and a well-known target for exploits that have gained a kernel
+memory write; the capabilities any helper receives can be narrowed through
+<code class="file-path">/proc/sys/kernel/usermodehelper/bset</code> and
+<code class="file-path">inheritable</code>; and
+<code>CONFIG_STATIC_USERMODEHELPER</code> routes every helper through one fixed
+program that decides what actually runs. Since 6.17 the <code>modprobe</code> and
+<code>modules_disabled</code> sysctls are registered by the module code itself
+rather than by the central sysctl table.
+</p>
+
+<h3 id="aliases">Aliases, depmod, and Autoloading</h3>
+
+<p>
+The elegant part of autoloading is that a device asks for its driver not by name but
+by <span class="key-term">capability</span>: it describes itself, and something must
+translate that description into a concrete file. The translation starts in the
+driver. A PCI driver, for instance, lists the devices it supports in a
+<code>struct pci_device_id</code> table and declares it with
+<code>MODULE_DEVICE_TABLE(pci, ids)</code>, which costs nothing at run time but
+plants a specially named alias symbol that encodes the module, the bus, and the
+table. At build time <code>modpost</code>, through
+<code class="file-path">scripts/mod/file2alias.c</code>, finds that symbol, reads
+the table out of the object file using field offsets the build computes for each of
+more than fifty bus types, and turns every entry into an alias pattern, written as a
+<code>MODULE_ALIAS</code> line in the module's generated
+<code class="file-path">.mod.c</code> and so into its
+<code class="file-path">.modinfo</code> (&sect;2.3). Fields the driver left as
+wildcards become <code>*</code>, so the xHCI driver's class-based entry becomes
+<code>pci:v*d*sv*sd*bc0Csc03i30*</code>, matching any USB 3 host controller from any
+vendor. At <code>make modules_install</code>, <code>depmod</code> collects every
+module's aliases into <code class="file-path">modules.alias</code> and the
+dependency graph into <code class="file-path">modules.dep</code> under
+<code class="file-path">/lib/modules/$(uname -r)</code>. Built-in drivers had a gap
+here until Linux 6.18: <code>modpost</code> generated no aliases for code linked
+into <code class="file-path">vmlinux</code>, so user space could not tell that a
+device was already served by a built-in driver. Those aliases are now recorded too,
+under the driver's name, in <code class="file-path">modules.builtin.modinfo</code>.
+This alias mechanism is what lets a single distribution kernel support thousands of
+devices while loading only the handful of drivers a given machine actually needs—the
+seamless hardware support Chapter 1 attributed to modules.
+</p>
+
+<p>
+The run-time half is driven by events rather than by <code>request_module</code>.
+When the driver core registers a device, it sends a <code>KOBJ_ADD</code> uevent
+over netlink, and the bus's <code>uevent</code> callback adds a
+<code>MODALIAS</code> variable built from the same fields the build
+used—<code>pci_uevent</code> writes the vendor, device, subsystem, and class codes
+in the <code>pci:v%08Xd%08X</code>&hellip; format—while the device's
+<code class="file-path">modalias</code> file in sysfs holds the same string. The
+kernel calls no helper for this. The user-space device manager,
+<code>systemd-udevd</code> on most systems, receives the event and loads every
+module whose alias pattern matches, normally in-process through <code>libkmod</code>
+rather than by running <code>modprobe</code>. Devices that existed before the
+manager started are handled by <span class="key-term">coldplug</span>:
+<code>udevadm trigger</code> writes <code>add</code> to each device's
+<code class="file-path">uevent</code> file in sysfs, and the kernel sends the event
+again. A newly discovered PCI device therefore does <em>not</em> make the kernel
+call <code>request_module</code>; it is udev, matching <code>MODALIAS</code> against
+<code class="file-path">modules.alias</code>, that loads its driver. The 2.6.11
+kernel still forked <code class="file-path">/sbin/hotplug</code> for every event;
+that path survives only as <code>CONFIG_UEVENT_HELPER</code>, off by default because
+a fork per event could exhaust a small machine during boot. On ARM64 the same
+machinery works from the device tree. A platform device announces an
+<code>of:</code> alias, built from its node's name and <code>compatible</code>
+strings, when it has a device tree node, an <code>acpi:</code> alias when it has an
+ACPI one, and <code>platform:</code> plus its name only otherwise, so on a
+device-tree system it is a driver's <code>of_device_id</code> table that gets it
+loaded.
+</p>
+
+<p>
+The alias strings follow conventions worth recognizing, because they appear
+throughout the kernel and in the index files. Requests the kernel makes itself carry
+a subsystem prefix—<code>fs-</code>, <code>net-pf-</code>, <code>netdev-</code>,
+<code>crypto-</code>, <code>tty-ldisc-</code>—or a device number, as in
+<code>char-major-N-M</code> and <code>block-major-N-M</code>, each retried without
+the minor number for drivers that claim a whole major. Event-driven aliases begin
+with the bus name—<code>pci:</code>, <code>usb:</code>, <code>of:</code>,
+<code>acpi:</code>, <code>platform:</code>, and dozens more—and even processors have
+them: a <code>cpu:</code> alias, generated from an <code>x86cpu</code> table on x86
+or by <code>module_cpu_feature_match</code> on ARM64, autoloads an accelerated
+crypto driver such as <code>aesni-intel</code> or <code>aes-ce-blk</code> on a CPU
+with the matching feature. A third family, <code>devname:</code> aliases such as
+<code>devname:fuse</code>, lets user space create device nodes before any driver is
+loaded: <code>depmod</code> lists them in
+<code class="file-path">modules.devname</code>, a boot-time
+<code>kmod static-nodes</code> step creates the nodes, and opening one triggers the
+<code>char-major-</code> request that loads the driver. Besides the text indexes,
+<code>depmod</code> writes binary forms
+(<code class="file-path">modules.alias.bin</code>,
+<code class="file-path">modules.dep.bin</code>,
+<code class="file-path">modules.builtin.alias.bin</code>) for fast lookup, a
+<code class="file-path">modules.symbols</code> map from each exported symbol to its
+module for <code>symbol_request</code>, and
+<code class="file-path">modules.softdep</code> and
+<code class="file-path">modules.weakdep</code> from the dependency hints of
+&sect;2.3. Its inputs are the build's <code class="file-path">modules.order</code>,
+<code class="file-path">modules.builtin</code>, and
+<code class="file-path">modules.builtin.modinfo</code>, installed alongside the
+modules. The <code>MODULE_DEVICE_TABLE</code> declaration a driver writes is thus
+the single source that the build turns into aliases, that <code>depmod</code>
+indexes, and that <code>udev</code> matches against real hardware.
+</p>
+
+<h3 id="params">Module Parameters</h3>
+
+<p>
+A module often needs configuration—which I/O port to probe, how large a buffer to
+allocate, whether to enable a debug mode—and Linux provides a uniform mechanism for
+this through <span class="key-term">module parameters</span>. A module declares a
+parameter with <code>module_param</code> (or <code>module_param_named</code>,
+<code>module_param_array</code>, <code>module_param_string</code>,
+<code>module_param_cb</code>, and relatives in
+<code class="file-path">include/linux/moduleparam.h</code>), giving its name, type,
+and the permissions of its sysfs file, and documents it with
+<code>MODULE_PARM_DESC</code>; the description and the type land in
+<code class="file-path">.modinfo</code> as <code>parm</code> and
+<code>parmtype</code> entries, which <code>modinfo</code> prints. Each declared
+parameter becomes visible under
+<code class="file-path">/sys/module/&lt;name&gt;/parameters/</code>, where a
+suitably privileged user can read—and, if the permissions allow, write—its value at
+run time. Parameters can be set when the module loads, as <code>name=value</code>
+arguments to <code>insmod</code> or <code>modprobe</code>, or persistently through
+<code>options</code> lines in <code class="file-path">/etc/modprobe.d</code>; in
+parameter names a dash and an underscore are interchangeable. On the kernel command
+line the same parameter is written <code>&lt;module&gt;.&lt;param&gt;=value</code>,
+and who acts on it depends on how the module was built. For built-in code,
+<code>MODULE_PARAM_PREFIX</code> has already prefixed every parameter name with the
+module's name, and <code>start_kernel</code> applies the setting while it parses the
+command line; the sysfs files appear late in boot
+(<code>param_sysfs_builtin</code>), under the name the module would have had. For a
+loadable module, the kernel quietly skips any unrecognized option containing a dot,
+and <code>modprobe</code> later finds it in
+<code class="file-path">/proc/cmdline</code> and passes it along. One declaration
+therefore serves both cases—<code>modprobe some_driver debug=1</code> and
+<code>some_driver.debug=1</code> at boot reach the same variable—giving every module
+a consistent, discoverable configuration surface without each having to invent its
+own.
+</p>
+
+<p>
+Underneath the macros, each parameter is a <code>struct kernel_param</code> placed
+in the module's <code>__param</code> section: its name, owning module, operations,
+permission, an initcall <code>level</code>, flags, and a pointer to the variable (or
+to a string or array descriptor). The operations are a
+<code>struct kernel_param_ops</code> that supplies <code>set</code>,
+<code>get</code>, and an optional <code>free</code> callback, plus a
+<code>KERNEL_PARAM_OPS_FL_NOARG</code> flag for types, such as <code>bool</code>,
+that accept a bare <code>name</code> with no value. The common types come with
+ready-made ops—<code>byte</code>, <code>short</code>, <code>ushort</code>,
+<code>int</code>, <code>uint</code>, <code>long</code>, <code>ulong</code>,
+<code>ullong</code>, <code>hexint</code> (5.10), <code>charp</code>,
+<code>bool</code>, <code>invbool</code>, <code>bint</code>, and the one-way
+<code>bool_enable_only</code> that &sect;5.1 met as <code>sig_enforce</code>—so
+<code>module_param(name, int, 0644)</code> wires a plain integer to sysfs with no
+further code, while a driver that needs validation or a side effect on change
+supplies its own ops through <code>module_param_cb</code>, often built from helpers
+such as <code>param_set_uint_minmax</code>. Array parameters take comma-separated
+values and can report how many were given. The permission argument is exactly the
+mode of the sysfs file, checked at compile time by
+<code>VERIFY_OCTAL_PERMISSIONS</code>, which rejects a world-writable mode or one
+that grants the group or others more than the owner. A value of <code>0</code> is
+meaningful: it creates no sysfs file at all, making the parameter settable only at
+load time or boot. The <code>level</code> matters only for built-in code: ordinary
+parameters are applied as soon as the command line is parsed, while those declared
+with <code>core_param_cb</code>, <code>subsys_param_cb</code>,
+<code>device_param_cb</code>, and their relatives are applied just before the
+initcalls of that level run (Appendix A).
+</p>
+
+<p>
+Two flags mark parameters that need more care. One declared with
+<code>module_param_unsafe</code> (3.18) still works, but setting it logs "Setting
+dangerous option" and taints the kernel with <code>TAINT_USER</code>
+(<code>U</code>), so a bug report shows that someone turned a knob the developers
+consider risky. One declared with <code>module_param_hw</code> (4.12) records what
+the value configures—an I/O port, memory address, IRQ, DMA channel, or DMA
+buffer—and under lockdown <code>param_check_unsafe</code> refuses to set it, with
+<code>-EPERM</code>, at load time or through sysfs (&sect;5.1). Load-time parsing
+happens in <code>load_module</code> (&sect;4.2) after the module is fully formed and
+its <code>MODULE_STATE_COMING</code> notifiers have run, but before its sysfs
+directory exists or its initializer runs, so a module sees its configured values
+from the start; because a custom <code>set</code> callback is module code, this is
+the first point at which the module's own code can run. <code>parse_args</code>
+(<code class="file-path">kernel/params.c</code>) matches each
+<code>name=value</code> against the module's table with the module's parameter lock
+held. A value that fails to parse aborts the load, but an unknown name only logs
+that it was ignored, as does anything after a lone <code>--</code>. Two names are
+accepted from every module without being declared: <code>async_probe</code>, which
+requests asynchronous device probing (&sect;4.2), and <code>dyndbg</code>, which
+enables the module's dynamic debug messages from the moment it loads.
+</p>
+
+<p>
+One subtlety catches newcomers: writing a writable parameter through sysfs calls its
+<code>set</code> operation and updates the underlying variable, but nothing tells
+the module; it notices only if it re-reads that variable or registered ops with a
+side effect—so many parameters are effectively load-time settings even when their
+file is writable, and only those a driver explicitly designed to be live actually
+change behavior on the fly. Such updates are serialized only against one another.
+Sysfs reads and writes and load-time parsing all hold
+<code>kernel_param_lock</code>, a mutex kept per module (built-in parameters share a
+global one), and code that reads a writable string parameter must take it too,
+because setting a <code>charp</code> frees the old string. Rust modules gained
+parameters in Linux 6.19 through a <code>params</code> block in the
+<code>module!</code> macro (Chapter 26); for now they are integers only and have
+permission <code>0</code>, so they can be set at load time or boot but never appear
+in sysfs.
+</p>
+
+<hr>
+<h2 id="infra">Modules as Kernel Infrastructure</h2>
+
+<p class="chapter-intro">
+Modules began almost entirely as a way to package device drivers. They remain that, but in the intervening years the module has also become a
+general vehicle for extending the kernel in ways that have little to do with
+drivers—carrying type information that other subsystems consume, supplying test
+suites, and even delivering live patches to the running kernel's own code. This
+closing section first looks at the general mechanism by which a module contributes
+to subsystems other than the driver core, and then at two such modern roles, both absent from Linux 2.6, that show how central the module mechanism has become
+to the kernel's evolution.
+</p>
+
+<p>
+The common thread is the long tail of optional fields in <code>struct module</code>
+that &sect;2.1 noted, together with the notifier chain of &sect;1.2. The loader
+finds each kind of contribution by section name in <code>find_module_sections</code>
+(<code class="file-path">kernel/module/main.c</code>)—<code>__jump_table</code>,
+<code>.static_call_sites</code>, <code>__tracepoints_ptrs</code>,
+<code>_ftrace_events</code>, <code>_kprobe_blacklist</code>,
+<code>_error_injection_whitelist</code>, <code>__dyndbg</code>,
+<code>.printk_index</code>, <code>.kunit_test_suites</code>, <code>.BTF</code>, and
+more—records where it lies, and leaves acting on it to the subsystem that owns it.
+About twenty subsystems subscribe to <code>module_notify_list</code> in 7.0.12, and
+most need only two events. On <code>COMING</code>, before any of the module's code
+has run, they adopt what it brings: jump labels and static calls patch its call
+sites to match the current state of their keys, tracepoints and trace events
+register its probe points and event definitions, kprobes records which of its
+functions may not be probed and arms probe events that were defined before it
+loaded, and BPF parses its type information. On <code>GOING</code> they let go. A
+few also act on <code>LIVE</code>, once the initializer has succeeded: KUnit runs
+the module's test suites only then, kprobes discards probes placed on its now-freed
+init text, and BPF makes its types available for programs to reference. The
+<code>COMING</code> announcement goes through a <em>robust</em> chain, so a
+subscriber that rejects the module—BPF refusing type information that does not match
+the kernel, for instance—causes every subscriber already notified to hear
+<code>GOING</code>, and the load fails.
+</p>
+
+<p>
+Accepting contributions from loadable code raises the question that dominated
+&sect;4.3: what keeps the module from disappearing while its contribution is in use?
+The answer is the same reference count that protects a driver. A BPF program that
+calls a function a module provides, or uses one of its types, takes a reference on
+that module when the program is verified and drops it only when the program is
+freed, so <code>rmmod</code> reports the module in use for as long as the program is
+loaded; an enabled livepatch holds a reference on its own module. The module, in
+other words, has become the kernel's general unit of pluggable extension, and its
+descriptor has grown a slot for every subsystem that wants to accept contributions
+from loadable code. The two roles below are the most illustrative, but they
+exemplify a broader pattern: if a kernel facility needs to be extensible at run
+time, it is very often a module that extends it.
+</p>
+
+<h3 id="btf">Module BTF</h3>
+
+<p>
+<span class="key-term">BTF</span> (BPF Type Format) is a compact description of the
+kernel's data types—structures, their fields, and their layouts, and the prototypes
+of its functions—that the kernel carries so that BPF programs can be written against
+kernel structures and adjusted automatically to whatever kernel they run on, the
+technique called CO-RE (compile once, run everywhere; Chapter 23). Types defined in
+modules need the same treatment, so since Linux 5.11, when
+<code>CONFIG_DEBUG_INFO_BTF_MODULES</code> is enabled (the default whenever the
+kernel itself has BTF), each module carries its own BTF in a
+<code class="file-path">.BTF</code> section, and the loader records where it lies
+(<code>btf_data</code> in <code>struct module</code>). That section is not one the
+loader keeps—it is not allocated, and the pointer refers into the temporary copy of
+the file, so it is cleared once initialization finishes. The BPF subsystem must
+therefore take what it needs while the module is still loading. Its notifier,
+<code>btf_module_notify</code> (<code class="file-path">kernel/bpf/btf.c</code>),
+copies and validates the BTF at <code>COMING</code>, gives it an ID, and publishes
+it as <code class="file-path">/sys/kernel/btf/&lt;module&gt;</code>, readable by
+everyone, where <code>bpftool</code> and libbpf find it; it marks the BTF usable at
+<code>LIVE</code>, and at <code>GOING</code> it withdraws the ID and the file so
+that no new program can find the module's types. BTF that fails validation makes the
+notifier veto the load, unless <code>CONFIG_MODULE_ALLOW_BTF_MISMATCH</code> (5.18)
+is set, in which case the module loads without BTF. The payoff is that a BPF program
+or a kfunc can resolve types defined in a module just as it resolves types in the
+core kernel—so tracing tools and the growing body of BPF-based functionality extend
+naturally to modular code. Here the module is not adding a driver but supplying
+metadata that another subsystem consumes.
+</p>
+
+<p>
+A little detail about how this BTF is produced and stored explains why it is
+practical, and why it is strict. The type information is not hand-written but
+extracted at build time by the <code>pahole</code> tool from the compiler's DWARF
+debug information and condensed into the compact BTF form; for a module this happens
+at its final link (<code class="file-path">scripts/Makefile.modfinal</code>), driven
+in 7.0 by <code class="file-path">scripts/gen-btf.sh</code>, which runs
+<code>pahole</code> and then <code>resolve_btfids</code> against the just-built
+<code class="file-path">vmlinux</code>. Modules store <span class="key-term">split
+BTF</span>: rather than each module duplicating the thousands of core kernel types
+it references, a module's BTF records only its own types, numbered to follow the
+base kernel's, and refers to the base kernel's BTF for everything else
+(<code>base_btf</code> in the BTF representation,
+<code class="file-path">kernel/bpf/btf.c</code>), so the per-module cost is small.
+The price is that a module's BTF is bound to the exact
+<code class="file-path">vmlinux</code> it was built against, since its references
+are indexes into that kernel's type list; that is why a mismatch is rejected rather
+than trusted. Out-of-tree modules, often built once and loaded into many rebuilds of
+a kernel, get relief from <span class="key-term">distilled base BTF</span> (6.11).
+An external module build also emits a small <code class="file-path">.BTF.base</code>
+section that describes the core types the module references by name and shape, and
+at load the kernel relocates the module's BTF against the running kernel's
+(<code>btf_relocate</code>), so the BTF survives as long as those types have not
+changed; in 7.0 <code>resolve_btfids</code>, not <code>pahole</code>, produces the
+distilled base. Rust code is excluded from <code>pahole</code>'s output
+(<code>--lang_exclude=rust</code>), which is what allows a kernel to enable Rust and
+BTF together, so a Rust module (Chapter 26) contributes no BTF for its own types.
+</p>
+
+<p>
+The most consequential consumer is the growing <span class="key-term">kfunc</span>
+mechanism: a module can register functions that BPF programs may call directly, and
+the verifier uses the module's BTF to type-check those calls and match arguments,
+identifying each function through its <code>BTF_KIND_FUNC</code> entry. A module
+lists its kfuncs between <code>BTF_KFUNCS_START</code> and
+<code>BTF_KFUNCS_END</code>, tagging each with flags the verifier
+enforces—<code>bpf_skb_ct_lookup</code> in the netfilter connection-tracking module
+is marked <code>KF_ACQUIRE | KF_RET_NULL</code>, so a program must check its result
+for <code>NULL</code> and release what it acquired—and <code>resolve_btfids</code>
+fills in each function's BTF ID at build time; the module's initializer then calls
+<code>register_btf_kfunc_id_set</code> for each program type allowed to use the set.
+The TCP BBR congestion-control module, for example, registers its own
+<code>bbr_init</code> and <code>bbr_main</code> so that a congestion-control
+algorithm written in BPF can reuse them. Calls from BPF into module functions
+arrived in Linux 5.16, and since 6.9 a module can go further and define a new
+<code>struct_ops</code> type—a table of operations that BPF programs implement—as
+the SMC protocol module does for its handshake control (6.19). Through split BTF,
+kfuncs, and <code>struct_ops</code>, a module can safely widen the surface that BPF
+programs are allowed to touch, extending the kernel's programmability rather than
+merely its device coverage.
+</p>
+
+<p>
+These contributions carry the lifetime obligations that the section introduction
+described. When the verifier accepts a program that calls a module's kfunc, attaches
+to one of its functions, or implements one of its <code>struct_ops</code> types, it
+takes a reference on the module through <code>btf_try_get_module</code>, and the
+reference lasts until the program is freed. That function succeeds only for a module
+whose BTF has been marked usable at <code>LIVE</code>, so a program can never bind
+to a module whose initializer might still fail—the same precaution
+<code>strong_try_module_get</code> takes for modules that depend on one another
+(&sect;4.3). Conversely, once a module begins going away its BTF is withdrawn from
+the ID table at once, so no new program can find the module's types while it is
+being removed.
+</p>
+
+<h3 id="livepatch">Livepatch</h3>
+
+<p>
+The most striking modern use of modules is <span class="key-term">livepatch</span>
+(<code class="file-path">kernel/livepatch/</code>), the mechanism for fixing bugs in
+a running kernel without rebooting—invaluable for servers that cannot easily be
+taken down for a security update. It arrived in Linux 4.0 for x86-64; ARM64 gained
+it only in 6.17, once its unwinder could produce the reliable stack traces described
+below. A livepatch is delivered <em>as a kernel module</em>: it is an ordinary
+<code class="file-path">.ko</code> that, instead of registering a driver, describes
+a set of replacement functions, and it declares itself with
+<code>MODULE_INFO(livepatch, "Y")</code>. The loader marks such a module, refuses it
+with <code>-ENOEXEC</code> if the kernel lacks <code>CONFIG_LIVEPATCH</code>, and
+taints the kernel with <code>TAINT_LIVEPATCH</code> (<code>K</code>, &sect;5.3),
+recording that the running kernel no longer exactly matches its source. Its
+structures—<code>struct klp_patch</code>, <code>struct klp_object</code>, and
+<code>struct klp_func</code>
+(<code class="file-path">include/linux/livepatch.h</code>)—name the objects to be
+patched (<code class="file-path">vmlinux</code> or a module), the functions to be
+replaced in each, with a position to tell apart static functions that share a name,
+and the new versions to run in their place. The module's initializer passes them to
+<code>klp_enable_patch</code>
+(<code class="file-path">kernel/livepatch/core.c</code>), which since 5.1 both
+registers and enables the patch in one call. It checks that the patch is compatible
+with those already installed, takes a reference on its own module, creates
+<code class="file-path">/sys/kernel/livepatch/&lt;patch&gt;/</code>, with files such
+as <code>enabled</code>, <code>transition</code>, and <code>force</code>, and starts
+switching the system over. Writing <code>0</code> to <code>enabled</code> later
+reverses the process; when that transition completes the reference is dropped, and
+only then can the module be removed.
+</p>
+
+<p>
+The redirection itself reuses the kernel's function tracer. Every traceable function
+begins with a call site that ftrace normally leaves as a no-op; livepatch registers
+an ftrace handler, <code>klp_ftrace_handler</code>
+(<code class="file-path">kernel/livepatch/patch.c</code>), on each patched function
+with the <code>FTRACE_OPS_FL_IPMODIFY</code> flag, which lets it change the saved
+instruction pointer so that when the ftrace trampoline returns, execution continues
+in the replacement rather than in the old body. No caller need be recompiled, and
+the patch takes effect everywhere the old function is reached, through direct calls
+and function pointers alike. Several patches may replace the same function; the
+handler keeps them on a stack and uses the newest. The handler also marks its ftrace
+registration permanent, so function tracing cannot be switched off underneath an
+applied patch. The approach has a cost in reach: a function the compiler inlined, or
+one marked <code>notrace</code>, has no call site of its own, so a patch must
+instead replace the functions that contain it.
+</p>
+
+<p>
+The subtle part is switching a <em>running</em> kernel safely, since a thread might
+be executing inside a function at the moment it is patched, or a coordinated change
+might alter several functions that must not be mixed. Livepatch solves this with a
+<span class="key-term">consistency model</span> (4.12): rather than switching the
+whole system at one instant, it moves each task individually from the old code to
+the new, and does so only at a moment when the task is provably running none of the
+affected functions. Each task carries a <code>patch_state</code>; during a
+transition the ftrace handler consults the current task's state to decide whether to
+run the old function or the new one, so every task sees either the complete old set
+or the complete new set. The transition
+(<code class="file-path">kernel/livepatch/transition.c</code>) begins by setting the
+<code>TIF_PATCH_PENDING</code> thread flag on every task, and a task is switched,
+and its flag cleared, in any of several ways, as Figure B-5 shows. Once a second a
+worker walks the stack of each pending task that is not running, using the
+architecture's reliable unwinder (ORC on x86-64, frame records on ARM64), and
+switches every task whose stack contains no patched function. A task switches itself
+on its way back to user space—the exit work of Chapter 4—when no kernel function can
+be on its stack; the idle tasks switch in the idle loop; and since 6.16 a task about
+to be scheduled out checks itself in <code>__schedule</code>, which lets CPU-bound
+kernel threads converge (6.4 had hooked <code>cond_resched</code> for the same
+purpose). If tasks are still pending after fifteen seconds, livepatch sends a fake
+signal to user tasks to push them through the kernel exit path and wakes sleeping
+kernel threads. When the last task has crossed over the patch is fully in effect and
+<code>transition</code> reads <code>0</code>. Without a reliable unwinder only the
+exit and idle paths remain, and a transition may never finish;
+<code>klp_enable_patch</code> warns about exactly that. An administrator can write
+to <code>force</code> to declare every task switched without proof, at a price:
+since some task might still be running old code, a forced patch module can never be
+removed.
+</p>
+
+<figure>
+<svg viewBox="0 0 860 490" role="img" aria-labelledby="figB-5-title" style="max-width:720px; width:100%; height:auto;">
+<title id="figB-5-title">Figure B-5. A Livepatch Transition</title>
+<defs><marker id="eb5" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/></marker></defs>
+<rect x="20" y="20" width="820" height="450" rx="20" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="430" y="50" text-anchor="middle" font-family="Inter,sans-serif" font-size="20" font-weight="700">Figure B-5. A Livepatch Transition</text>
+
+<g font-family="Inter,sans-serif" font-size="10" text-anchor="middle">
+<text x="230" y="80" font-size="11" font-weight="700" fill="#334155">redirecting a call (ftrace)</text>
+<text x="630" y="80" font-size="11" font-weight="700" fill="#334155">switching every task (consistency model)</text>
+<rect x="60" y="90" width="340" height="40" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="230" y="106" font-weight="700">caller &#8594; old_func()</text><text x="230" y="121" font-size="9" fill="#475569">direct call or function pointer; no caller recompiled</text>
+<rect x="60" y="150" width="340" height="44" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="230" y="168" font-weight="700">entry call site &#8594; ftrace trampoline</text><text x="230" y="184" font-size="9" fill="#475569">the no-op ftrace leaves in every traceable function</text>
+<rect x="60" y="214" width="340" height="70" rx="6" fill="#fef3c7" stroke="#ca8a04"/><text x="230" y="232" font-weight="700">klp_ftrace_handler</text><text x="230" y="247" font-size="9" fill="#475569">newest klp_func on this function's stack</text><text x="230" y="261" font-size="9" fill="#475569">in transition: current-&gt;patch_state picks old or new</text><text x="230" y="275" font-size="9" fill="#475569">rewrites the saved IP (FTRACE_OPS_FL_IPMODIFY)</text>
+<rect x="60" y="304" width="340" height="44" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="230" y="322" font-weight="700">new_func() in the patch module</text><text x="230" y="338" font-size="9" fill="#475569">returns straight to the caller</text>
+<rect x="60" y="368" width="340" height="48" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 3"/><text x="230" y="387" font-size="9" fill="#475569">KLP relocations let new_func reach unexported symbols</text><text x="230" y="402" font-size="9" fill="#475569">(.klp.rela.&lt;object&gt;.*, resolved through kallsyms)</text>
+<rect x="460" y="90" width="340" height="40" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="630" y="106" font-weight="700">klp_enable_patch, or echo 0 &gt; enabled</text><text x="630" y="121" font-size="9" fill="#475569">TIF_PATCH_PENDING set on every task</text>
+<rect x="460" y="150" width="340" height="134" rx="6" fill="#f1f5f9" stroke="#94a3b8"/><text x="630" y="170" font-weight="700">switch points (task provably outside patched code)</text><text x="630" y="192" font-size="9" fill="#475569">every 1 s: reliable stack walk of tasks not running</text><text x="630" y="210" font-size="9" fill="#475569">exit to user mode (exit work, Chapter 4)</text><text x="630" y="228" font-size="9" fill="#475569">idle loop &#183; __schedule() (6.16)</text><text x="630" y="246" font-size="9" fill="#475569">after 15 s: fake signal; sleeping kthreads woken</text><text x="630" y="264" font-size="9" fill="#475569">fork: the child inherits its parent's state</text>
+<rect x="460" y="304" width="340" height="44" rx="6" fill="#dcfce7" stroke="#16a34a"/><text x="630" y="322" font-weight="700">no task pending &#8594; patch complete</text><text x="630" y="338" font-size="9" fill="#475569">transition reads 0 (when disabling, the reference drops)</text>
+<rect x="460" y="368" width="340" height="48" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="4 3"/><text x="630" y="387" font-size="9" fill="#475569">force: declare every task switched without proof</text><text x="630" y="402" font-size="9" fill="#475569">the patch module can then never be removed</text>
+<text x="430" y="242" font-size="8" fill="#475569">patch_state</text>
+</g>
+<g stroke="#334155" stroke-width="1.3" fill="none">
+<line x1="230" y1="130" x2="230" y2="150" marker-end="url(#eb5)"/>
+<line x1="230" y1="194" x2="230" y2="214" marker-end="url(#eb5)"/>
+<line x1="230" y1="284" x2="230" y2="304" marker-end="url(#eb5)"/>
+<line x1="230" y1="368" x2="230" y2="348" stroke-dasharray="4 3" marker-end="url(#eb5)"/>
+<line x1="630" y1="130" x2="630" y2="150" marker-end="url(#eb5)"/>
+<line x1="630" y1="284" x2="630" y2="304" marker-end="url(#eb5)"/>
+<line x1="630" y1="368" x2="630" y2="348" stroke-dasharray="4 3" marker-end="url(#eb5)"/>
+<line x1="460" y1="249" x2="400" y2="249" stroke-dasharray="4 3" marker-end="url(#eb5)"/>
+</g>
+<text x="430" y="450" text-anchor="middle" font-family="Inter,sans-serif" font-size="9" fill="#64748b" font-style="italic">each task runs either the whole old set of functions or the whole new set, never a mix</text>
+</svg>
+<figcaption>Figure B-5. A livepatch transition — Livepatch redirects each patched function through an ftrace handler that rewrites the saved instruction pointer, and during a transition chooses between old and new code by the calling task's patch state. Every task starts with TIF_PATCH_PENDING set and is switched only when it is provably outside every patched function: by a stack check with the reliable unwinder, on exit to user space, in the idle loop, or as it schedules out; stragglers get a fake signal after fifteen seconds. The patch is complete when no task is pending.</figcaption>
+</figure>
+
+<p>
+Several further capabilities distinguish a livepatch module from an ordinary one.
+First, a livepatch must reach kernel symbols that are <em>not</em> exported—the
+whole point is to patch arbitrary internal functions, whose replacements call the
+internals around them—so livepatch modules carry special <span class="key-term">KLP
+relocations</span>. These live in sections named
+<code>.klp.rela.&lt;object&gt;.&lt;section&gt;</code> and refer to symbols named
+<code>.klp.sym.&lt;object&gt;.&lt;symbol&gt;,&lt;position&gt;</code>, which the
+ordinary symbol resolution of &sect;4.2 deliberately leaves alone, granting an
+access that ordinary module linking (&sect;3) denies. They are resolved through
+kallsyms in two stages. Those that refer into <code class="file-path">vmlinux</code>
+are applied while the patch module itself is loading, so that even its own
+initialization can use them. Those that refer into a module can be applied only when
+that module is present—when the patch is enabled if it is already loaded, or later,
+when <code>klp_module_coming</code> runs as it loads, before its notifiers or
+initializer; on x86-64 they are cleared again if it unloads (6.3), so that a reload
+can be relocated afresh. To make this late patching possible, the loader keeps a
+copy of the patch module's section headers and symbol table, described by
+<code>struct klp_modinfo</code> (<code>copy_module_elf</code>,
+<code class="file-path">kernel/module/livepatch.c</code>). Second, because you
+cannot grow an existing structure in a running kernel—the very limitation &sect;1.1
+gave as a reason some code cannot be a module—livepatch offers
+<span class="key-term">shadow variables</span> (<code>klp_shadow_alloc</code>,
+4.15), a side table keyed by an object's address that attaches new fields to
+existing objects without changing their layout. Third, per-object callbacks (4.15)
+run before and after patching and unpatching, and a pre-patch callback can veto the
+patch, so that a fix that must also change data, such as enabling a feature, can be
+applied cleanly.
+</p>
+
+<p>
+Patches also have to coexist over a kernel's lifetime. A patch with the
+<code>replace</code> flag (5.1) is cumulative: it supersedes all previous ones in a
+single transition, reverting any function that it no longer changes, after which the
+older patches are disabled and their modules can be removed—the way distributions
+ship fixes, each patch containing all its predecessors. System-state records
+(<code>struct klp_state</code>, 5.5) let a replacing patch declare which
+modifications of data its predecessors made that it knows how to maintain, and
+<code>klp_enable_patch</code> refuses a cumulative patch that omits a state an
+installed patch introduced, or any patch that carries one at an older version.
+Writing a patch module by hand is laborious, and for years it was done with
+out-of-tree tools; since Linux 6.19 the kernel provides
+<code class="file-path">scripts/livepatch/klp-build</code> on x86-64. Given an
+ordinary source patch, it builds the kernel twice, before and after, with each
+function in its own section, and uses <code>objtool klp diff</code> to extract the
+changed functions and generate the KLP relocations they need, producing a cumulative
+patch module by default. That the same module machinery which loads a mouse driver
+can also rewrite the kernel's own code while it runs, task by task and without a
+reboot, is a measure of how far the mechanism has travelled from its origins as a way of packaging device drivers.
+</p>
+
+<hr>
+
+<h2 id="appendix-summary">Summary</h2>
+
+<p class="chapter-intro">
+This appendix examined how Linux extends a running kernel with loadable modules. A
+module is a relocatable object file that Kbuild and <code>modpost</code> turn into a
+<code class="file-path">.ko</code> already carrying its own
+<code>struct module</code> descriptor, its export table, and a
+<code class="file-path">.modinfo</code> block of metadata; built in instead, the
+same source becomes an ordinary initcall. Supporting it requires the kernel to do
+two things: link the module—resolve each imported symbol against a curated set of
+exports, governed by GPL-only restrictions, symbol namespaces, and version
+checksums, and patch its code to the addresses found—and manage its lifetime through
+four states, a single atomic reference count, and a dependency graph, so that
+nothing is removed while it is still in use. The 7.0 loader does both in a long,
+ordered pipeline behind <code>finit_module</code>. It authenticates the image before
+parsing it, validates the ELF file and the metadata, lays the sections out in seven
+typed memory regions taken from the shared execmem allocator, relocates and patches
+the code, seals each region with the tightest page protections the hardware allows,
+and announces the module to the subsystems that subscribe to its arrival before
+running its initializer; it unwinds cleanly from any failure, and concurrent loads
+of one file collapse into one. Unloading reverses the path, refusing rather than
+waiting while any reference remains.
+</p>
+
+<p>
+Around that core sit the facilities that decide what may be loaded, and when. A
+module's appended PKCS#7 signature—RSA, ECDSA, or, new in 7.0, post-quantum
+ML-DSA—is checked against keyrings that carry Appendix A's Secure Boot chain of
+trust onward to the code the kernel loads. A missing signature is a matter of
+policy, enforced by <code>sig_enforce</code>, lockdown, or IMA's Secure Boot policy,
+but a wrong one is always fatal. Compressed modules are unpacked by the kernel
+itself, before the signature check and without losing the file's identity, and
+whatever the kernel admits but cannot vouch for—proprietary, out-of-tree, unsigned,
+forced, or test code—is recorded indelibly as taint, globally and per module. Most
+modules, though, are loaded without anyone asking. Kernel code that finds a feature
+missing calls <code>request_module</code>, which runs <code>modprobe</code> as a
+usermode helper, limited by subsystem-prefixed names and a pool of 50 slots; a new
+device instead announces a <code>MODALIAS</code> that udev matches against the
+aliases <code>modpost</code> generated from the driver's device table. Both roads
+end in the same system call and the same checks, and module parameters, declared
+once, configure a module from the load command line, the kernel command line, or
+sysfs.
+</p>
+
+<p>
+The larger theme is how much the module system has been
+<span class="key-term">hardened</span> and <span class="key-term">generalized</span>
+since Linux 2.6. What was once a matter of <code>insmod</code> resolving
+symbols and bumping a use count is now a pipeline that authenticates, decompresses,
+version-checks, write-protects, and records through tainting anything it cannot
+fully trust, and the interface it enforces is governed ever more closely, by
+namespaces, per-module exports, and a versioning scheme reworked so that modules
+written in Rust load through the same path as C ones. And the module has outgrown
+its original role. Through the notifier chain it contributes jump labels,
+tracepoints, test suites, and BTF type information to the subsystems that consume
+them; with kfuncs and <code>struct_ops</code> types it can widen what BPF programs
+may call and implement; and as a livepatch it can replace the running kernel's own
+functions, task by task, without a reboot. Table B-4 collects these shifts. The
+essential idea, though, is the one Chapter 1 introduced: modularity lets the kernel
+be small, flexible, and extensible without sacrificing the performance of running
+everything in one address space—and that idea has only grown more central to how
+Linux is built and maintained.
+</p>
+
+<table>
+<caption>Table B-4. Updating the Module Mental Model for Linux 7.0.12</caption>
+<thead>
+<tr><th>Topic</th><th>Linux 2.6.11</th><th>Linux 7.0.12</th></tr>
+</thead>
+<tbody>
+<tr><td>Load system calls</td><td><code>init_module</code>, <code>delete_module</code></td><td>Adds <code>finit_module</code> (fd-based, flags, visible to LSM and IMA); concurrent loads of one file collapse into one</td></tr>
+<tr><td>Unloading</td><td>Per-CPU use counts summed under <code>stop_machine</code>; <code>rmmod</code> could wait for users</td><td>One atomic count, never waits, no <code>stop_machine</code>; tainting modules remembered after unload</td></tr>
+<tr><td>Life cycle</td><td><code>LIVE</code>, <code>COMING</code>, <code>GOING</code>; a notifier chain with two subscribers</td><td>Adds <code>UNFORMED</code> (3.8), listed for duplicate checks but hidden from symbol lookup; about twenty subsystems follow the chain, and any of them can veto a load at <code>COMING</code></td></tr>
+<tr><td>Module memory</td><td>Core section + init section</td><td>Typed regions (<code>mod_mem_type</code>): text, data, rodata, ro-after-init, and their init variants, allocated through execmem</td></tr>
+<tr><td>Memory protection</td><td>None to speak of</td><td>Per-region RO/NX under <code>CONFIG_STRICT_MODULE_RWX</code></td></tr>
+<tr><td>Symbol control</td><td><code>EXPORT_SYMBOL</code> / <code>_GPL</code></td><td>Adds symbol namespaces (<code>EXPORT_SYMBOL_NS</code> / <code>MODULE_IMPORT_NS</code>) and per-module exports (<code>EXPORT_SYMBOL_FOR_MODULES</code>)</td></tr>
+<tr><td>Symbol versioning</td><td><code>genksyms</code> CRCs in <code>__versions</code></td><td><code>genksyms</code> or DWARF-based <code>gendwarfksyms</code>; extended records for long (Rust) names</td></tr>
+<tr><td>Authenticity</td><td>None</td><td>RSA, ECDSA, or post-quantum ML-DSA signatures verified against the built-in, secondary, and machine keyrings; enforced by <code>sig_enforce</code>, lockdown, or IMA's Secure Boot policy; a present but invalid signature is always fatal</td></tr>
+<tr><td>Storage</td><td>Uncompressed <code>.ko</code></td><td>In-kernel decompression of <code>.ko.gz/.xz/.zst</code> (one build-selected algorithm, advertised in <code>/sys/module/compression</code>), done before the signature check</td></tr>
+<tr><td>Tainting</td><td>Six global flags, three of them (<code>P</code>, <code>F</code>, <code>R</code>) set by the module code</td><td>20 flags; module code also sets <code>O</code>, <code>E</code>, <code>C</code>, <code>K</code>, <code>N</code>; per-module record in <code>/sys/module/&lt;name&gt;/taint</code>; verbose oops line; <code>panic_on_taint=</code></td></tr>
+<tr><td>Autoloading</td><td><code>request_module</code> runs <code>modprobe</code> (kmod); <code class="file-path">/sbin/hotplug</code> forked per device event</td><td>Same helper, now waiting for one of 50 slots and subject to an LSM veto; subsystem-prefixed aliases (<code>fs-</code>, <code>crypto-</code>, <code>netdev-</code>) limit what unprivileged triggers can load; drivers loaded by udev from the uevent <code>MODALIAS</code>; built-in drivers' aliases recorded (6.18)</td></tr>
+<tr><td>Parameters</td><td><code>module_param</code> with sysfs files</td><td>Same, plus custom ops, "unsafe" parameters that taint <code>U</code>, hardware parameters refused under lockdown, and Rust parameters (6.19)</td></tr>
+<tr><td>Source layout</td><td>Monolithic <code>kernel/module.c</code></td><td>Split into <code class="file-path">kernel/module/</code> (main, signing, decompress, strict_rwx, kallsyms, kmod, livepatch, …)</td></tr>
+<tr><td>Language</td><td>C</td><td>C or Rust (<code>module!</code> macro, Chapter 26)</td></tr>
+<tr><td>Beyond drivers</td><td>Drivers, filesystems, protocols</td><td>Also contributions to about twenty subsystems through the notifier chain: BTF type information (5.11), kfuncs (5.16) and <code>struct_ops</code> types (6.9) for BPF, KUnit test suites, and livepatches</td></tr>
+<tr><td>Live patching</td><td>None; a fix meant a reboot</td><td>Livepatch modules: ftrace redirection, per-task consistency model, shadow variables, cumulative replacement; x86-64 since 4.0, ARM64 since 6.17; built with <code>klp-build</code> (6.19)</td></tr>
+</tbody>
+</table>
+
+<p>
+With modules covered, the book's two appendices have shown the kernel from its
+edges: Appendix A followed it into existence at boot, and this appendix showed how
+it is extended and maintained thereafter. Between them and the chapters, the tour
+is complete—from the moment power is applied, through every subsystem that makes a
+running Linux system, to the loadable code that lets that system grow and change
+without ever standing still.
+</p>
+
+<p class="source-trail-pointer">The kernel source files this appendix works from are collected by topic in <a href="source-trails.html#appB">Source Trails</a>.</p>
+</main>
+
+<footer class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>v0.1</p>
+  <p>© 2026 Lianwei Wang. All rights reserved.</p>
+</footer>
+
+</div><!-- .book-container -->
+<script src="assets/progress.js" defer></script>
+</body>
+</html>
+
+
+

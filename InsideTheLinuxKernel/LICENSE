@@ -1,0 +1,79 @@
+Inside the Linux Kernel — License
+=================================
+
+Copyright © 2026 Lianwei Wang. All rights reserved.
+
+1. Scope
+
+   This license covers "Inside the Linux Kernel", version 0.1 and later
+   versions, and everything in this repository authored by Lianwei Wang,
+   including:
+
+   - the text, figures, diagrams, and tables of the book;
+   - any PDF or other format generated from these files.
+
+   Together these are "the Work".
+
+2. No license granted
+
+   The Work is proprietary. Except as stated in Section 3, no right or
+   license is granted, whether expressly, by implication, or otherwise.
+   Without the prior written permission of the copyright holder, you may not:
+
+   - copy, reproduce, republish, or redistribute the Work, in whole or in
+     part, in any form or medium;
+   - modify, translate, adapt, or create derivative works from the Work;
+   - sell, license, or otherwise use the Work for any commercial purpose;
+   - remove or alter any copyright notice, credit line, or this license.
+
+3. Permitted use
+
+   If you received a copy of the Work from the copyright holder or an
+   authorized source, you may:
+
+   - read and view it for your own personal, non-commercial use; and
+   - quote brief excerpts in reviews, criticism, or scholarly work, with
+     attribution: "Lianwei Wang, Inside the Linux Kernel".
+
+   These permissions do not apply to excerpts used for any purpose that
+   applicable law does not permit.
+
+4. Third-party material
+
+   The following material is not part of the Work and is not covered by this
+   license. It remains under the terms set by its owners:
+
+   - Linux kernel source code. The book quotes excerpts of the Linux kernel
+     (version 7.0.12) for commentary and explanation. That code is copyright
+     its respective authors and is licensed under the GNU General Public
+     License version 2 (GPL-2.0), or under the license stated in its SPDX
+     identifier. See https://www.kernel.org/doc/html/latest/process/license-rules.html.
+
+   - "Understanding the Linux Kernel" by Daniel P. Bovet and Marco Cesati,
+     O'Reilly Media. The Work is an independent book inspired by it. The Work is not affiliated with or endorsed
+     by its authors or publisher. Any copy of that book, or of its chapters,
+     that is kept for reference (for example under ref/) is copyright
+     O'Reilly Media, Inc. and its authors. It is not licensed for
+     redistribution by this repository.
+
+   - Web fonts (Inter, Merriweather, JetBrains Mono). These are loaded from
+     Google Fonts at view time under the SIL Open Font License 1.1. They are
+     not bundled with the Work.
+
+   - Trademarks. Linux® is the registered trademark of Linus Torvalds in the
+     U.S. and other countries. Other product and company names are
+     trademarks of their respective owners.
+
+5. Disclaimer
+
+   THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF ACCURACY,
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+   The author is not liable for any claim, damages, or other liability
+   arising from the use of the Work or of the information in it, including
+   any use of the techniques or code it describes on real systems.
+
+6. Permissions
+
+   For permission to use the Work beyond what Section 3 allows, contact the
+   copyright holder, Lianwei Wang.

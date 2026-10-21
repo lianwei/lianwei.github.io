@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inside the Linux Kernel – Free Online Book on Linux 7.0 Internals</title>
+  <meta name="description" content="Free online book on how Linux 7.0.12 works: scheduler, memory management, VFS, networking, eBPF, io_uring, KVM and more, traced through the source on x86_64 and ARM64.">
+  <link rel="canonical" href="https://lianwei.github.io/InsideTheLinuxKernel/">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/tables.js" defer></script>
+  <style>
+    .cover {
+      text-align: center;
+      padding: 4rem 2rem;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      color: white;
+      border-radius: 12px;
+      margin-bottom: 3rem;
+    }
+    .cover h1 {
+      font-size: 2.8rem;
+      border: none;
+      color: white;
+      margin: 0;
+    }
+    .cover .version {
+      font-size: 1.1rem;
+      color: #ecf0f1;
+      font-weight: 600;
+      margin-top: 0.8rem;
+    }
+    .cover .kernel-ver {
+      font-size: 1rem;
+      color: #3498db;
+      margin-top: 0.3rem;
+    }
+    .cover .architectures {
+      margin-top: 1.5rem;
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+    }
+    .cover .arch-badge {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.3);
+      padding: 0.4rem 1rem;
+      border-radius: 20px;
+      font-size: 0.85rem;
+    }
+    .part-header {
+      font-family: var(--font-heading);
+      font-size: 1.1rem;
+      color: white;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      margin-top: 2rem;
+      margin-bottom: 0.5rem;
+    }
+    .part-i { background: #3498db; }
+    .part-ii { background: #e74c3c; }
+    .part-iii { background: #f39c12; }
+    .part-iv { background: #8e44ad; }
+    .part-app { background: #5d6d7e; }
+    .chapter-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .chapter-list li {
+      padding: 0.7rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .chapter-list li:hover { background: #f8f9fa; }
+    .ch-num {
+      font-family: var(--font-heading);
+      font-weight: 700;
+      color: var(--text-light);
+      min-width: 2.5rem;
+    }
+    .ch-title a {
+      font-family: var(--font-heading);
+      font-weight: 600;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .ch-title a:hover { color: var(--accent2); }
+    .ch-desc {
+      font-size: 0.82rem;
+      color: var(--text-light);
+    }
+    .badge-new {
+      background: #8e44ad;
+      color: white;
+      font-size: 0.7rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: 10px;
+      font-family: var(--font-heading);
+      font-weight: 700;
+    }
+    .badge-done {
+      background: #27ae60;
+      color: white;
+      font-size: 0.7rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: 10px;
+      font-family: var(--font-heading);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+
+<div class="book-container">
+
+<div class="cover">
+  <h1>Inside the Linux Kernel</h1>
+  <div class="version">Version 0.1</div>
+  <div class="kernel-ver">Based on Linux Kernel 7.0.12</div>
+  <div class="architectures">
+    <span class="arch-badge">x86_64 (AMD64)</span>
+    <span class="arch-badge">ARM64 (AArch64)</span>
+  </div>
+</div>
+
+<h2>Table of Contents</h2>
+
+<!-- Front Matter -->
+<div class="part-header part-i">Front Matter</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">&mdash;</span>
+    <div>
+      <div class="ch-title"><a href="preface.html">Preface</a></div>
+      <div class="ch-desc">Audience, organization, level of description, book overview, background, and conventions</div>
+    </div>
+  </li>
+</ul>
+
+<!-- Part I -->
+<div class="part-header part-i">Part I: Foundations</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">1</span>
+    <div>
+      <div class="ch-title"><a href="chapter-1.html">Introduction</a></div>
+      <div class="ch-desc">Linux history, kernel architecture, OS concepts, hardware dependency, new subsystems overview, build, test, and analysis tools</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">2</span>
+    <div>
+      <div class="ch-title"><a href="chapter-2.html">Memory Addressing</a></div>
+      <div class="ch-desc">5-level page tables, x86_64/ARM64 MMU, TLB management, KPTI</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">3</span>
+    <div>
+      <div class="ch-title"><a href="chapter-3.html">Processes</a></div>
+      <div class="ch-desc">task_struct, kernel lists and core data structures, process creation (clone3), context switching, namespaces</div>
+    </div>
+  </li>
+</ul>
+
+<!-- Part II -->
+<div class="part-header part-ii">Part II: Core Kernel</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">4</span>
+    <div>
+      <div class="ch-title"><a href="chapter-4.html">Interrupts and Exceptions</a></div>
+      <div class="ch-desc">Generic IRQ layer, threaded IRQs, ARM64 GIC-v3, softirqs, workqueues</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">5</span>
+    <div>
+      <div class="ch-title"><a href="chapter-5.html">Kernel Synchronization</a></div>
+      <div class="ch-desc">Qspinlocks, MCS locks, RCU, lockdep, PREEMPT_RT implications</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">6</span>
+    <div>
+      <div class="ch-title"><a href="chapter-6.html">Timing Measurements</a></div>
+      <div class="ch-desc">Clocksource/clockevent, hrtimers, tickless kernel (NO_HZ)</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">7</span>
+    <div>
+      <div class="ch-title"><a href="chapter-7.html">Process Scheduling</a></div>
+      <div class="ch-desc">EEVDF scheduler, sched_ext, SCHED_DEADLINE, energy-aware scheduling</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">8</span>
+    <div>
+      <div class="ch-title"><a href="chapter-8.html">Memory Management</a></div>
+      <div class="ch-desc">Buddy allocator, per-CPU lists, SLUB, folios, compaction, per-CPU allocator, CMA, memcg, THP, HugeTLB, DAMON</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">9</span>
+    <div>
+      <div class="ch-title"><a href="chapter-9.html">Process Address Space</a></div>
+      <div class="ch-desc">Maple tree VMAs, page faults, mmap, userfaultfd, ASLR</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">10</span>
+    <div>
+      <div class="ch-title"><a href="chapter-10.html">System Calls</a></div>
+      <div class="ch-desc">SYSCALL/SYSRET, SVC, vDSO, seccomp-BPF, system call table</div>
+    </div>
+  </li>
+</ul>
+
+<!-- Part III -->
+<div class="part-header part-iii">Part III: Subsystems</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">11</span>
+    <div>
+      <div class="ch-title"><a href="chapter-11.html">Signals</a></div>
+      <div class="ch-desc">Signal generation/delivery, signalfd, pidfd_send_signal, real-time signals</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">12</span>
+    <div>
+      <div class="ch-title"><a href="chapter-12.html">The Virtual Filesystem</a></div>
+      <div class="ch-desc">VFS model, new mount API, idmapped mounts, path lookup, procfs and sysctl, xattrs, fsnotify</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">13</span>
+    <div>
+      <div class="ch-title"><a href="chapter-13.html">I/O Architecture and Device Drivers</a></div>
+      <div class="ch-desc">Device model, device tree, ACPI, devres, regmap, sysfs, SoC clocks and power, firmware, tty, input</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">14</span>
+    <div>
+      <div class="ch-title"><a href="chapter-14.html">Block Device Drivers</a></div>
+      <div class="ch-desc">blk-mq, NVMe, I/O schedulers and priorities, data integrity, inline encryption, zoned storage, io_uring block I/O</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">15</span>
+    <div>
+      <div class="ch-title"><a href="chapter-15.html">The Page Cache</a></div>
+      <div class="ch-desc">Folio-based page cache, XArray, writeback workqueues, large folios, cachestat()</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">16</span>
+    <div>
+      <div class="ch-title"><a href="chapter-16.html">Accessing Files</a></div>
+      <div class="ch-desc">Read/write paths, iov_iter, readahead, mmap, direct I/O, splice and copy offload, AIO and io_uring</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">17</span>
+    <div>
+      <div class="ch-title"><a href="chapter-17.html">Page Frame Reclaiming</a></div>
+      <div class="ch-desc">Multi-Gen LRU (MGLRU), zswap/zram, PSI, proactive reclaim, memory tiering</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">18</span>
+    <div>
+      <div class="ch-title"><a href="chapter-18.html">The Ext4 Filesystem</a></div>
+      <div class="ch-desc">On-disk layout, extents, allocation, jbd2 journaling, fast commit</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">19</span>
+    <div>
+      <div class="ch-title"><a href="chapter-19.html">Process Communication</a></div>
+      <div class="ch-desc">Pipes and splice, System V and POSIX IPC, futexes, eventfd/signalfd/timerfd, memfd sealing, pidfd, and Unix-domain sockets with descriptor passing</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">20</span>
+    <div>
+      <div class="ch-title"><a href="chapter-20.html">Program Execution</a></div>
+      <div class="ch-desc">Executable formats and ELF, the execve/execveat pipeline, memory layout and ASLR, dynamic linking, credentials and capabilities (setresuid, capset, prctl), LSM, seccomp, and Landlock</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">21</span>
+    <div>
+      <div class="ch-title"><a href="chapter-21.html">Power Management</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">System sleep states and the suspend sequence, the freezer and wakeup sources, hibernation, runtime PM and PM domains, cpufreq and schedutil, cpuidle and PM QoS, the Energy Model, thermal management, and powercap</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">22</span>
+    <div>
+      <div class="ch-title"><a href="chapter-22.html">Networking</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">Socket system calls and sockfs, struct socket and struct sock, struct sk_buff, network devices, NAPI, GRO, RPS/RFS, IP input and output, routing and neighbours, qdiscs, BQL, GSO, TCP and UDP internals, netfilter, conntrack, netlink, page_pool, devmem TCP, AF_XDP</div>
+    </div>
+  </li>
+</ul>
+
+<!-- Part IV -->
+<div class="part-header part-iv">Part IV: Advanced Topics (New Chapters)</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">23</span>
+    <div>
+      <div class="ch-title"><a href="chapter-23.html">The eBPF Subsystem</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">BPF VM, verifier, JIT, maps, programs, XDP, CO-RE, BTF, kfuncs</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">24</span>
+    <div>
+      <div class="ch-title"><a href="chapter-24.html">io_uring</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">Submission/completion rings, the life of a request, opcodes and linked chains, SQ polling and io-wq, registered files and buffers, multi-shot, polled and deferred completion, zero-copy, and restrictions</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">25</span>
+    <div>
+      <div class="ch-title"><a href="chapter-25.html">Containers, Namespaces, and Cgroups</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">8 namespace types, cgroups v2, controllers (including rdma, misc, and the dmem GPU-memory controller), PSI, container foundations</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">26</span>
+    <div>
+      <div class="ch-title"><a href="chapter-26.html">Rust in the Kernel</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">Build integration, safe abstractions, kernel crate, example drivers</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">27</span>
+    <div>
+      <div class="ch-title"><a href="chapter-27.html">Kernel Security Infrastructure</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">Security layers, LSM blobs and SELinux/AppArmor/Smack, crypto API and lib/crypto, keys and trusted keyrings, TPM trusted keys, IMA/EVM, fs-verity, dm-verity and IPE, audit, lockdown, kernel hardening</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">28</span>
+    <div>
+      <div class="ch-title"><a href="chapter-28.html">Virtualization: KVM</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">The kernel as hypervisor, /dev/kvm VM and vCPU descriptors, the KVM_RUN loop on VMX, SVM, VHE and pKVM, memslots and stage-2 paging, guest_memfd, virtual interrupts, vhost and VFIO</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">29</span>
+    <div>
+      <div class="ch-title"><a href="chapter-29.html">Tracing, Debugging, and Kernel Diagnostics</a> <span class="badge-new">NEW</span></div>
+      <div class="ch-desc">printk and the lockless printk ring buffer, nbcon consoles, BUG/WARN, oops, taint and panic, pstore and SysRq, lockup and hung-task detectors, ftrace and function_graph, tracepoints and trace events, kprobes, fprobes and uprobes, perf_events and PMU drivers, latency tracers, runtime verification, kgdb</div>
+    </div>
+  </li>
+</ul>
+
+<!-- Appendices -->
+<div class="part-header part-app">Appendices</div>
+<ul class="chapter-list">
+  <li>
+    <span class="ch-num">A</span>
+    <div>
+      <div class="ch-title"><a href="appendix-a.html">System Startup</a></div>
+      <div class="ch-desc">UEFI boot, EFI stub, device tree boot (ARM64), kexec, early console</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">B</span>
+    <div>
+      <div class="ch-title"><a href="appendix-b.html">Kernel Modules</a></div>
+      <div class="ch-desc">Module loading, signing, versioning, livepatch, BTF metadata</div>
+    </div>
+  </li>
+  <li>
+    <span class="ch-num">&sect;</span>
+    <div>
+      <div class="ch-title"><a href="source-trails.html">Source Trails</a></div>
+      <div class="ch-desc">Consolidated index of the Linux 7.0.12 source files each chapter works from</div>
+    </div>
+  </li>
+</ul>
+
+<div class="chapter-footer">
+  <p><strong>Inside the Linux Kernel</strong></p>
+  <p>Version 0.1 | Based on Linux Kernel 7.0.12 | Architectures: x86_64, ARM64</p>
+  <p>&copy; 2026 Lianwei Wang. All rights reserved.</p>
+  <p>No part of this book may be reproduced or distributed without the author&rsquo;s written permission. Excerpts of Linux kernel source code remain under their original licenses (GPL-2.0).</p>
+  <p>Inspired by Daniel P. Bovet and Marco Cesati&rsquo;s <em>Understanding the Linux Kernel</em> (O&rsquo;Reilly)</p>
+</div>
+
+</div><!-- .book-container -->
+</body>
+</html>

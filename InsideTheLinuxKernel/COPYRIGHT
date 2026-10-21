@@ -1,0 +1,16 @@
+Inside the Linux Kernel, version 0.1
+Copyright © 2026 Lianwei Wang. All rights reserved.
+
+No part of this book (the text, figures, and tables in html/ and chapters/)
+may be reproduced, distributed, or transmitted in any form or by any means
+without the prior written permission of the author.
+
+Excerpts of Linux kernel source code quoted in the book remain the property
+of their respective authors and are distributed under their original
+licenses (GPL-2.0, see https://www.kernel.org/doc/html/latest/process/license-rules.html).
+
+This book is inspired by Daniel P. Bovet and Marco Cesati's "Understanding
+the Linux Kernel" (O'Reilly). It is an independent work and is not
+affiliated with or endorsed by its authors or publisher.
+
+The full terms are in the LICENSE file.
