@@ -1,1 +1,639 @@
-Hello, Lianwei
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inside the Linux Kernel – Free Online Book on Linux 7.0 Internals (x86_64 &amp; ARM64)</title>
+  <meta name="description" content="Read “Inside the Linux Kernel” free online: 29 chapters and 2 appendices on how Linux 7.0 works — scheduler, memory management, VFS, networking, eBPF, io_uring, KVM, Rust, containers and more — traced through the source on x86_64 and ARM64.">
+  <meta name="keywords" content="Linux kernel, Linux kernel internals, Linux 7.0, kernel book, EEVDF scheduler, memory management, VFS, ext4, eBPF, io_uring, KVM, Rust for Linux, cgroups, namespaces, x86_64, ARM64, operating systems">
+  <meta name="author" content="Lianwei">
+  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+  <meta name="theme-color" content="#0b1220">
+  <link rel="canonical" href="https://lianwei.github.io/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Lianwei">
+  <meta property="og:title" content="Inside the Linux Kernel – Free Online Book on Linux 7.0 Internals">
+  <meta property="og:description" content="29 chapters on how the Linux kernel works: data structures, algorithms, locking rules and design decisions, traced through the source on x86_64 and ARM64.">
+  <meta property="og:url" content="https://lianwei.github.io/">
+  <meta property="og:locale" content="en_US">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Inside the Linux Kernel – Free Online Book">
+  <meta name="twitter:description" content="How Linux 7.0 really works: scheduler, memory, VFS, networking, eBPF, io_uring, KVM, Rust and more.">
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230b1220'/%3E%3Cpath d='M28 30l-14 20 14 20M72 30l14 20-14 20M56 24L44 76' stroke='%2358a6ff' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "@id": "https://lianwei.github.io/#website",
+        "url": "https://lianwei.github.io/",
+        "name": "Lianwei",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "Book",
+        "@id": "https://lianwei.github.io/InsideTheLinuxKernel/#book",
+        "name": "Inside the Linux Kernel",
+        "url": "https://lianwei.github.io/InsideTheLinuxKernel/",
+        "description": "How the Linux kernel works at the level of its data structures, algorithms, locking rules and design decisions. Covers Linux 7.0.12 on x86_64 and ARM64.",
+        "bookEdition": "0.1",
+        "inLanguage": "en",
+        "isAccessibleForFree": true,
+        "about": ["Linux kernel", "Operating systems"],
+        "author": { "@type": "Person", "name": "Lianwei" },
+        "workExample": {
+          "@type": "Book",
+          "bookFormat": "https://schema.org/EBook",
+          "url": "https://lianwei.github.io/InsideTheLinuxKernel/"
+        }
+      },
+      {
+        "@type": "ItemList",
+        "name": "Inside the Linux Kernel – table of contents",
+        "itemListElement": [
+          {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Preface",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/preface.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Chapter 1: Introduction",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-1.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 3,
+                    "name": "Chapter 2: Memory Addressing",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-2.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 4,
+                    "name": "Chapter 3: Processes",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-3.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 5,
+                    "name": "Chapter 4: Interrupts and Exceptions",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-4.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 6,
+                    "name": "Chapter 5: Kernel Synchronization",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-5.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 7,
+                    "name": "Chapter 6: Timing Measurements",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-6.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 8,
+                    "name": "Chapter 7: Process Scheduling",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-7.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 9,
+                    "name": "Chapter 8: Memory Management",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-8.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 10,
+                    "name": "Chapter 9: Process Address Space",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-9.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 11,
+                    "name": "Chapter 10: System Calls",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-10.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 12,
+                    "name": "Chapter 11: Signals",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-11.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 13,
+                    "name": "Chapter 12: The Virtual Filesystem",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-12.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 14,
+                    "name": "Chapter 13: I/O Architecture and Device Drivers",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-13.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 15,
+                    "name": "Chapter 14: Block Device Drivers",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-14.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 16,
+                    "name": "Chapter 15: The Page Cache",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-15.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 17,
+                    "name": "Chapter 16: Accessing Files",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-16.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 18,
+                    "name": "Chapter 17: Page Frame Reclaiming",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-17.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 19,
+                    "name": "Chapter 18: The Ext4 Filesystem",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-18.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 20,
+                    "name": "Chapter 19: Process Communication",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-19.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 21,
+                    "name": "Chapter 20: Program Execution",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-20.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 22,
+                    "name": "Chapter 21: Power Management",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-21.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 23,
+                    "name": "Chapter 22: Networking",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-22.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 24,
+                    "name": "Chapter 23: The eBPF Subsystem",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-23.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 25,
+                    "name": "Chapter 24: io_uring",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-24.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 26,
+                    "name": "Chapter 25: Containers, Namespaces, and Cgroups",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-25.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 27,
+                    "name": "Chapter 26: Rust in the Kernel",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-26.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 28,
+                    "name": "Chapter 27: Kernel Security Infrastructure",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-27.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 29,
+                    "name": "Chapter 28: Virtualization: KVM",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-28.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 30,
+                    "name": "Chapter 29: Tracing, Debugging, and Kernel Diagnostics",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/chapter-29.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 31,
+                    "name": "Appendix A: System Startup",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/appendix-a.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 32,
+                    "name": "Appendix B: Kernel Modules",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/appendix-b.html"
+          },
+          {
+                    "@type": "ListItem",
+                    "position": 33,
+                    "name": "Source Trails",
+                    "url": "https://lianwei.github.io/InsideTheLinuxKernel/source-trails.html"
+          }
+]
+      }
+    ]
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #0b1220;
+      --bg-2: #111a2e;
+      --card: #141f36;
+      --card-hover: #1a2745;
+      --line: #25334f;
+      --text: #d7e0f0;
+      --muted: #8fa0bf;
+      --head: #f4f7fd;
+      --blue: #58a6ff;
+      --cyan: #39d0d8;
+      --red: #ff7b72;
+      --amber: #f2b84b;
+      --purple: #b392f0;
+      --slate: #8b9bb8;
+      --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 4.5rem; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      line-height: 1.6;
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 85% -5%, rgba(88,166,255,.16), transparent 60%),
+        radial-gradient(700px 400px at 0% 10%, rgba(179,146,240,.12), transparent 60%),
+        var(--bg);
+      background-attachment: fixed;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--blue); }
+    .skip { position: absolute; left: -999px; top: 0; background: var(--blue); color: #000; padding: .5rem 1rem; z-index: 100; }
+    .skip:focus { left: 0; }
+    :focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; border-radius: 4px; }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 50;
+      background: rgba(11,18,32,.82);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+    }
+    .topbar-in {
+      max-width: 72rem; margin: 0 auto; padding: .7rem 1.25rem;
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    }
+    .brand { color: var(--head); font-weight: 700; text-decoration: none; letter-spacing: .01em; }
+    .brand span { color: var(--blue); }
+    nav ul { list-style: none; display: flex; gap: .25rem; margin: 0; padding: 0; flex-wrap: wrap; }
+    nav a {
+      color: var(--text); text-decoration: none; font-size: .92rem;
+      padding: .4rem .75rem; border-radius: 8px;
+    }
+    nav a:hover { background: var(--card); color: var(--head); }
+    nav a.cta { background: var(--blue); color: #06101f; font-weight: 600; }
+    nav a.cta:hover { background: #7ab8ff; }
+
+    .wrap { max-width: 72rem; margin: 0 auto; padding: 0 1.25rem; }
+
+    .hero { padding: 4.5rem 0 3rem; display: grid; gap: 3rem; grid-template-columns: 1.15fr .85fr; align-items: center; }
+    .eyebrow {
+      display: inline-block; font-family: var(--mono); font-size: .8rem; color: var(--cyan);
+      border: 1px solid rgba(57,208,216,.35); background: rgba(57,208,216,.08);
+      padding: .25rem .7rem; border-radius: 999px; margin-bottom: 1.2rem;
+    }
+    h1 {
+      font-size: clamp(2.2rem, 5vw, 3.7rem); line-height: 1.08; margin: 0 0 1.1rem;
+      color: var(--head); letter-spacing: -.02em;
+    }
+    h1 em {
+      font-style: normal;
+      background: linear-gradient(90deg, var(--blue), var(--purple));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .lead { font-size: 1.15rem; color: var(--text); max-width: 38rem; margin: 0 0 1.8rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: .8rem; margin-bottom: 1.6rem; }
+    .btn {
+      display: inline-flex; align-items: center; gap: .5rem;
+      padding: .8rem 1.35rem; border-radius: 10px; font-weight: 600; text-decoration: none;
+      border: 1px solid var(--line); color: var(--head); background: var(--card);
+      transition: transform .15s, background .15s, border-color .15s;
+    }
+    .btn:hover { transform: translateY(-2px); background: var(--card-hover); border-color: var(--blue); }
+    .btn.primary { background: linear-gradient(135deg, #3b82f6, #6d5ae6); border-color: transparent; color: #fff; box-shadow: 0 10px 28px rgba(80,110,240,.35); }
+    .btn.primary:hover { filter: brightness(1.1); }
+    .badges { display: flex; flex-wrap: wrap; gap: .5rem; padding: 0; margin: 0; list-style: none; }
+    .badges li {
+      font-size: .8rem; color: var(--muted); border: 1px solid var(--line);
+      padding: .22rem .7rem; border-radius: 999px; background: rgba(20,31,54,.6);
+    }
+
+    .terminal {
+      background: #070c17; border: 1px solid var(--line); border-radius: 14px;
+      box-shadow: 0 24px 60px rgba(0,0,0,.45); overflow: hidden; font-family: var(--mono); font-size: .82rem;
+    }
+    .terminal-bar { display: flex; gap: .4rem; padding: .65rem .9rem; background: #0e1626; border-bottom: 1px solid var(--line); }
+    .terminal-bar i { width: .7rem; height: .7rem; border-radius: 50%; background: #ff5f57; }
+    .terminal-bar i:nth-child(2) { background: #febc2e; }
+    .terminal-bar i:nth-child(3) { background: #28c840; }
+    .terminal pre { margin: 0; padding: 1rem 1.1rem 1.2rem; overflow-x: auto; color: #c9d6ee; line-height: 1.7; }
+    .c-k { color: var(--purple); } .c-f { color: var(--blue); } .c-c { color: #5d6e8f; } .c-s { color: var(--amber); }
+
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin: 0 0 4rem; }
+    .stat { background: var(--bg-2); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.2rem; }
+    .stat b { display: block; font-size: 1.9rem; color: var(--head); line-height: 1.1; }
+    .stat span { color: var(--muted); font-size: .9rem; }
+
+    section { margin-bottom: 4rem; }
+    h2 { font-size: 1.7rem; color: var(--head); margin: 0 0 .5rem; letter-spacing: -.01em; }
+    .sub { color: var(--muted); margin: 0 0 1.6rem; max-width: 46rem; }
+
+    .start { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+    .start a {
+      display: block; padding: 1.3rem; border-radius: 12px; text-decoration: none;
+      background: var(--bg-2); border: 1px solid var(--line); color: var(--text);
+      transition: border-color .15s, transform .15s;
+    }
+    .start a:hover { border-color: var(--blue); transform: translateY(-2px); }
+    .start strong { display: block; color: var(--head); font-size: 1.05rem; margin: .2rem 0 .3rem; }
+    .start small { color: var(--cyan); font-family: var(--mono); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
+
+    .finder { position: relative; margin-bottom: 1.5rem; }
+    .finder input {
+      width: 100%; font: inherit; font-size: 1.05rem; color: var(--head);
+      background: var(--bg-2); border: 1px solid var(--line); border-radius: 12px;
+      padding: .95rem 1rem .95rem 2.9rem;
+    }
+    .finder input::placeholder { color: var(--muted); }
+    .finder input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(88,166,255,.2); }
+    .finder svg { position: absolute; left: 1rem; top: 50%; transform: translateY(-50%); color: var(--muted); }
+    #count { color: var(--muted); font-size: .9rem; margin: -.8rem 0 1.2rem; min-height: 1.3em; }
+    #none { display: none; padding: 2rem; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; }
+
+    .part { margin-bottom: 2.2rem; --c: var(--blue); }
+    .part.p2 { --c: var(--red); } .part.p3 { --c: var(--amber); } .part.p4 { --c: var(--purple); } .part.p5 { --c: var(--slate); } .part.p0 { --c: var(--cyan); }
+    .part h3 {
+      font-size: 1.05rem; color: var(--head); margin: 0 0 .9rem; padding-left: .8rem;
+      border-left: 4px solid var(--c); display: flex; align-items: center; gap: .6rem;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); gap: .9rem; list-style: none; padding: 0; margin: 0; }
+    .card {
+      display: flex; gap: .9rem; height: 100%; padding: 1rem 1.1rem;
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      text-decoration: none; color: var(--text);
+      transition: transform .15s, border-color .15s, background .15s;
+    }
+    .card:hover { transform: translateY(-3px); border-color: var(--c); background: var(--card-hover); }
+    .num {
+      flex: none; width: 2.4rem; height: 2.4rem; border-radius: 10px; display: grid; place-items: center;
+      font-weight: 700; font-size: .95rem; color: var(--c);
+      background: color-mix(in srgb, var(--c) 14%, transparent);
+      border: 1px solid color-mix(in srgb, var(--c) 40%, transparent);
+    }
+    .card h4 { margin: 0 0 .25rem; font-size: 1rem; color: var(--head); line-height: 1.3; }
+    .card p { margin: 0; font-size: .85rem; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .new { font-size: .62rem; font-weight: 700; letter-spacing: .05em; vertical-align: middle; margin-left: .4rem; padding: .1rem .42rem; border-radius: 999px; background: var(--purple); color: #120a24; }
+    .part[hidden], .grid li[hidden] { display: none; }
+
+    .faq details { background: var(--bg-2); border: 1px solid var(--line); border-radius: 12px; padding: .9rem 1.2rem; margin-bottom: .7rem; }
+    .faq summary { cursor: pointer; font-weight: 600; color: var(--head); }
+    .faq p { margin: .7rem 0 0; color: var(--text); }
+
+    footer { border-top: 1px solid var(--line); padding: 2rem 0 3rem; color: var(--muted); font-size: .9rem; }
+    footer .wrap { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: space-between; }
+    footer a { color: var(--muted); }
+
+    @media (max-width: 860px) {
+      .hero { grid-template-columns: 1fr; padding-top: 2.5rem; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .start { grid-template-columns: 1fr; }
+      nav li:not(:last-child) { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#contents">Skip to table of contents</a>
+
+  <header class="topbar">
+    <div class="topbar-in">
+      <a class="brand" href="/">Lian<span>wei</span></a>
+      <nav aria-label="Main">
+        <ul>
+          <li><a href="#start">Start here</a></li>
+          <li><a href="#contents">Chapters</a></li>
+          <li><a href="#faq">FAQ</a></li>
+          <li><a class="cta" href="InsideTheLinuxKernel/index.html">Read the book →</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <div class="hero">
+        <div>
+          <span class="eyebrow">Free online book · v0.1 · Linux 7.0.12</span>
+          <h1>Inside the <em>Linux Kernel</em></h1>
+          <p class="lead">How the Linux kernel really works — its data structures, algorithms, locking rules and design decisions — with every mechanism traced through the source on <strong>x86_64</strong> and <strong>ARM64</strong>.</p>
+          <div class="actions">
+            <a class="btn primary" href="InsideTheLinuxKernel/index.html">Start reading →</a>
+            <a class="btn" href="InsideTheLinuxKernel/preface.html">Read the preface</a>
+            <a class="btn" href="#contents">Browse chapters</a>
+          </div>
+          <ul class="badges" aria-label="Book facts">
+            <li>29 chapters</li><li>2 appendices</li><li>Inline SVG diagrams</li><li>Static HTML · no sign-up</li><li>Printable</li>
+          </ul>
+        </div>
+        <div class="terminal" aria-hidden="true">
+          <div class="terminal-bar"><i></i><i></i><i></i></div>
+<pre><span class="c-c">// simplified from kernel/sched/fair.c — Chapter 7</span>
+<span class="c-k">static</span> <span class="c-k">struct</span> task_struct *
+<span class="c-f">pick_next_task_fair</span>(<span class="c-k">struct</span> rq *rq, ...)
+{
+    <span class="c-c">/* EEVDF: earliest eligible
+       virtual deadline first */</span>
+    se = <span class="c-f">pick_eevdf</span>(cfs_rq);
+    <span class="c-k">return</span> <span class="c-f">task_of</span>(se);
+}
+
+$ <span class="c-s">grep -r "folio" mm/ | wc -l</span>
+<span class="c-c"># Chapter 8, 15, 17 explain why</span></pre>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><b>29</b><span>chapters in four parts</span></div>
+        <div class="stat"><b>7.0.12</b><span>Linux kernel version covered</span></div>
+        <div class="stat"><b>2</b><span>architectures: x86_64 &amp; ARM64</span></div>
+        <div class="stat"><b>~5,300</b><span>pages when printed</span></div>
+      </div>
+
+      <section id="start" aria-labelledby="start-h">
+        <h2 id="start-h">Where to start</h2>
+        <p class="sub">The book is meant to be read in order, but each chapter stands on its own. Pick the path that fits you.</p>
+        <div class="start">
+          <a href="InsideTheLinuxKernel/chapter-1.html"><small>New to kernel internals</small><strong>Chapter 1 – Introduction</strong>Orientation, vocabulary and the overall architecture of the kernel.</a>
+          <a href="InsideTheLinuxKernel/source-trails.html"><small>Reading the source</small><strong>Source Trails</strong>Which kernel files to open for each chapter, and what to look for in them.</a>
+          <a href="InsideTheLinuxKernel/appendix-a.html"><small>Boot &amp; bring-up</small><strong>Appendix A – System Startup</strong>UEFI, the EFI stub, device-tree boot, kexec and early console.</a>
+        </div>
+      </section>
+
+      <section id="contents" aria-labelledby="contents-h">
+        <h2 id="contents-h">Table of contents</h2>
+        <p class="sub">Every chapter of <em>Inside the Linux Kernel</em>. Type a topic such as “scheduler”, “eBPF”, “page cache” or “KVM” to filter.</p>
+
+        <div class="finder" role="search">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <input id="q" type="search" placeholder="Search chapters and topics…" aria-label="Search chapters and topics" autocomplete="off">
+        </div>
+        <p id="count" aria-live="polite"></p>
+
+        <div class="part p0">
+          <h3>Front Matter</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/preface.html"><span class="num">·</span><span><h4>Preface</h4><p>Audience, organization, level of description, book overview, background, and conventions</p></span></a></li>
+          </ul>
+        </div>
+
+        <div class="part p1">
+          <h3>Part I: Foundations</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-1.html"><span class="num">1</span><span><h4>Introduction</h4><p>Linux history, kernel architecture, OS concepts, hardware dependency, new subsystems overview, build, test, and analysis tools</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-2.html"><span class="num">2</span><span><h4>Memory Addressing</h4><p>5-level page tables, x86_64/ARM64 MMU, TLB management, KPTI</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-3.html"><span class="num">3</span><span><h4>Processes</h4><p>task_struct, kernel lists and core data structures, process creation (clone3), context switching, namespaces</p></span></a></li>
+          </ul>
+        </div>
+
+        <div class="part p2">
+          <h3>Part II: Core Kernel</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-4.html"><span class="num">4</span><span><h4>Interrupts and Exceptions</h4><p>Generic IRQ layer, threaded IRQs, ARM64 GIC-v3, softirqs, workqueues</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-5.html"><span class="num">5</span><span><h4>Kernel Synchronization</h4><p>Qspinlocks, MCS locks, RCU, lockdep, PREEMPT_RT implications</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-6.html"><span class="num">6</span><span><h4>Timing Measurements</h4><p>Clocksource/clockevent, hrtimers, tickless kernel (NO_HZ)</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-7.html"><span class="num">7</span><span><h4>Process Scheduling</h4><p>EEVDF scheduler, sched_ext, SCHED_DEADLINE, energy-aware scheduling</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-8.html"><span class="num">8</span><span><h4>Memory Management</h4><p>Buddy allocator, per-CPU lists, SLUB, folios, compaction, per-CPU allocator, CMA, memcg, THP, HugeTLB, DAMON</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-9.html"><span class="num">9</span><span><h4>Process Address Space</h4><p>Maple tree VMAs, page faults, mmap, userfaultfd, ASLR</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-10.html"><span class="num">10</span><span><h4>System Calls</h4><p>SYSCALL/SYSRET, SVC, vDSO, seccomp-BPF, system call table</p></span></a></li>
+          </ul>
+        </div>
+
+        <div class="part p3">
+          <h3>Part III: Subsystems</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-11.html"><span class="num">11</span><span><h4>Signals</h4><p>Signal generation/delivery, signalfd, pidfd_send_signal, real-time signals</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-12.html"><span class="num">12</span><span><h4>The Virtual Filesystem</h4><p>VFS model, new mount API, idmapped mounts, path lookup, procfs and sysctl, xattrs, fsnotify</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-13.html"><span class="num">13</span><span><h4>I/O Architecture and Device Drivers</h4><p>Device model, device tree, ACPI, devres, regmap, sysfs, SoC clocks and power, firmware, tty, input</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-14.html"><span class="num">14</span><span><h4>Block Device Drivers</h4><p>blk-mq, NVMe, I/O schedulers and priorities, data integrity, inline encryption, zoned storage, io_uring block I/O</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-15.html"><span class="num">15</span><span><h4>The Page Cache</h4><p>Folio-based page cache, XArray, writeback workqueues, large folios, cachestat()</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-16.html"><span class="num">16</span><span><h4>Accessing Files</h4><p>Read/write paths, iov_iter, readahead, mmap, direct I/O, splice and copy offload, AIO and io_uring</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-17.html"><span class="num">17</span><span><h4>Page Frame Reclaiming</h4><p>Multi-Gen LRU (MGLRU), zswap/zram, PSI, proactive reclaim, memory tiering</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-18.html"><span class="num">18</span><span><h4>The Ext4 Filesystem</h4><p>On-disk layout, extents, allocation, jbd2 journaling, fast commit</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-19.html"><span class="num">19</span><span><h4>Process Communication</h4><p>Pipes and splice, System V and POSIX IPC, futexes, eventfd/signalfd/timerfd, memfd sealing, pidfd, and Unix-domain sockets with descriptor passing</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-20.html"><span class="num">20</span><span><h4>Program Execution</h4><p>Executable formats and ELF, the execve/execveat pipeline, memory layout and ASLR, dynamic linking, credentials and capabilities (setresuid, capset, prctl), LSM, seccomp, and Landlock</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-21.html"><span class="num">21</span><span><h4>Power Management <span class="new">NEW</span></h4><p>System sleep states and the suspend sequence, the freezer and wakeup sources, hibernation, runtime PM and PM domains, cpufreq and schedutil, cpuidle and PM QoS, the Energy Model, thermal management, and powercap</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-22.html"><span class="num">22</span><span><h4>Networking <span class="new">NEW</span></h4><p>Socket system calls and sockfs, struct socket and struct sock, struct sk_buff, network devices, NAPI, GRO, RPS/RFS, IP input and output, routing and neighbours, qdiscs, BQL, GSO, TCP and UDP internals, netfilter, conntrack, netlink, page_pool, devmem TCP, AF_XDP</p></span></a></li>
+          </ul>
+        </div>
+
+        <div class="part p4">
+          <h3>Part IV: Advanced Topics</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-23.html"><span class="num">23</span><span><h4>The eBPF Subsystem <span class="new">NEW</span></h4><p>BPF VM, verifier, JIT, maps, programs, XDP, CO-RE, BTF, kfuncs</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-24.html"><span class="num">24</span><span><h4>io_uring <span class="new">NEW</span></h4><p>Submission/completion rings, the life of a request, opcodes and linked chains, SQ polling and io-wq, registered files and buffers, multi-shot, polled and deferred completion, zero-copy, and restrictions</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-25.html"><span class="num">25</span><span><h4>Containers, Namespaces, and Cgroups <span class="new">NEW</span></h4><p>8 namespace types, cgroups v2, controllers (including rdma, misc, and the dmem GPU-memory controller), PSI, container foundations</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-26.html"><span class="num">26</span><span><h4>Rust in the Kernel <span class="new">NEW</span></h4><p>Build integration, safe abstractions, kernel crate, example drivers</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-27.html"><span class="num">27</span><span><h4>Kernel Security Infrastructure <span class="new">NEW</span></h4><p>Security layers, LSM blobs and SELinux/AppArmor/Smack, crypto API and lib/crypto, keys and trusted keyrings, TPM trusted keys, IMA/EVM, fs-verity, dm-verity and IPE, audit, lockdown, kernel hardening</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-28.html"><span class="num">28</span><span><h4>Virtualization: KVM <span class="new">NEW</span></h4><p>The kernel as hypervisor, /dev/kvm VM and vCPU descriptors, the KVM_RUN loop on VMX, SVM, VHE and pKVM, memslots and stage-2 paging, guest_memfd, virtual interrupts, vhost and VFIO</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/chapter-29.html"><span class="num">29</span><span><h4>Tracing, Debugging, and Kernel Diagnostics <span class="new">NEW</span></h4><p>printk and the lockless printk ring buffer, nbcon consoles, BUG/WARN, oops, taint and panic, pstore and SysRq, lockup and hung-task detectors, ftrace and function_graph, tracepoints and trace events, kprobes, fprobes and uprobes, perf_events and PMU drivers, latency tracers, runtime verification, kgdb</p></span></a></li>
+          </ul>
+        </div>
+
+        <div class="part p5">
+          <h3>Appendices</h3>
+          <ul class="grid">
+            <li><a class="card" href="InsideTheLinuxKernel/appendix-a.html"><span class="num">A</span><span><h4>System Startup</h4><p>UEFI boot, EFI stub, device tree boot (ARM64), kexec, early console</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/appendix-b.html"><span class="num">B</span><span><h4>Kernel Modules</h4><p>Module loading, signing, versioning, livepatch, BTF metadata</p></span></a></li>
+            <li><a class="card" href="InsideTheLinuxKernel/source-trails.html"><span class="num">§</span><span><h4>Source Trails</h4><p>Consolidated index of the Linux 7.0.12 source files each chapter works from</p></span></a></li>
+          </ul>
+        </div>
+
+        <p id="none">No chapter matches that search. Try a broader term such as “memory”, “filesystem” or “network”.</p>
+      </section>
+
+      <section id="faq" class="faq" aria-labelledby="faq-h">
+        <h2 id="faq-h">Frequently asked questions</h2>
+        <details>
+          <summary>What is “Inside the Linux Kernel”?</summary>
+          <p>A free, online book that explains how the Linux kernel works at the level of its data structures, algorithms, locking rules and design decisions. It targets Linux 7.0.12 and follows each mechanism through the source on both x86_64 and ARM64.</p>
+        </details>
+        <details>
+          <summary>Which topics does it cover?</summary>
+          <p>Memory addressing, processes, interrupts, synchronization (RCU, qspinlocks), the EEVDF scheduler, memory management, system calls, the VFS, block drivers, the page cache, ext4, IPC, networking, power management, eBPF, io_uring, containers and cgroups, Rust in the kernel, kernel security, KVM virtualization, tracing and debugging, plus boot and kernel modules.</p>
+        </details>
+        <details>
+          <summary>How do I read it?</summary>
+          <p>Open it in your browser — it is plain static HTML with no sign-up. Each chapter opens with its own table of contents, and cross-references between chapters are ordinary links. Use your browser’s search (Ctrl/⌘+F) inside a chapter.</p>
+        </details>
+        <details>
+          <summary>Who is it for?</summary>
+          <p>Systems programmers, driver and platform engineers, students of operating systems, and anyone who wants to read the Linux source with a map in hand.</p>
+        </details>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>© Lianwei · <a href="InsideTheLinuxKernel/COPYRIGHT">Copyright &amp; license</a></span>
+      <span><a href="https://github.com/lianwei/Inside_The_Linux_Kernel">Source on GitHub</a> · <a href="InsideTheLinuxKernel/index.html">Inside the Linux Kernel</a></span>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var q = document.getElementById('q'), count = document.getElementById('count'), none = document.getElementById('none');
+      var items = [].slice.call(document.querySelectorAll('.grid li')), parts = [].slice.call(document.querySelectorAll('.part'));
+      items.forEach(function (li) { li.dataset.t = li.textContent.toLowerCase(); });
+      function run() {
+        var terms = q.value.toLowerCase().split(/\s+/).filter(Boolean), shown = 0;
+        items.forEach(function (li) {
+          var ok = terms.every(function (t) { return li.dataset.t.indexOf(t) > -1; });
+          li.hidden = !ok; if (ok) shown++;
+        });
+        parts.forEach(function (p) { p.hidden = !p.querySelector('li:not([hidden])'); });
+        none.style.display = shown ? 'none' : 'block';
+        count.textContent = terms.length ? shown + ' of ' + items.length + ' entries match' : '';
+      }
+      q.addEventListener('input', run);
+      document.addEventListener('keydown', function (e) {
+        if (e.key === '/' && document.activeElement !== q && !/input|textarea/i.test(document.activeElement.tagName)) { e.preventDefault(); q.focus(); }
+      });
+    })();
+  </script>
+</body>
+</html>
